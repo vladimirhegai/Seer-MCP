@@ -1,0 +1,39 @@
+# Dependency Directories
+node_modules/
+
+# Build Outputs
+dist/
+*.tsbuildinfo
+
+# Local Database Files
+.strata/
+.weaver/
+*.db
+*.db-journal
+*.db-wal
+
+# Development Folders (Local Only)
+Large Codebases/
+Explanations/
+Resources/
+
+# Personal Research & Technical Guides (Local Only)
+README_dev.md
+strata-master-guide.md
+research-codebase.md
+research-papers.md
+
+# Scale-Test Snapshots & DB Cache
+tests/outputs/
+
+# Environment Variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# OS System Files
+.DS_Store
+Thumbs.db
+.claude/
