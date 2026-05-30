@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="docs/logo.png" alt="Seer Logo" width="320" />
-</p>
+<h1 align="center">
+  Seer Core
+  <img src="docs/logo.png" alt="Seer Logo" width="100" align="right" />
+</h1>
 
-# Seer
 
 Give your AI agents a map of your repo before they edit.
 
