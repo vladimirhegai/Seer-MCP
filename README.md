@@ -10,7 +10,15 @@ Seer helps agents find code, follow context, and understand what they are changi
 
 Callers, tests, routes, service links, and git history, all in one local map for your coding agent.
 
-[badges]
+<p align="center">
+  <a href="https://github.com/vladimirhegai/Seer-Core"><img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square" alt="Version" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="License" /></a>
+  <a href="docs/mcp.md"><img src="https://img.shields.io/badge/MCP-Enabled-brightgreen?style=flat-square" alt="MCP Enabled" /></a>
+  <img src="https://img.shields.io/badge/TypeScript-Ready-blue?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Database-SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite" />
+  <img src="https://img.shields.io/badge/Node.js-%3E%3D_18-green?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" />
+</p>
+
 
 [pimage]
 
