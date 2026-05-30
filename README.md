@@ -10,12 +10,11 @@ Seer helps agents find code, follow context, and understand what they are changi
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 [![MCP](https://img.shields.io/badge/MCP-Enabled-brightgreen.svg)](docs/mcp.md)
-[![Symbol History](https://img.shields.io/badge/Symbol%20History-Per--Function%20Blame-orange.svg)](docs/architecture.md)
-[![Engine](https://img.shields.io/badge/Engine-Deterministic%20Fact--Only-blue.svg)](docs/architecture.md)
 [![NodeJS](https://img.shields.io/badge/Node.js-%3E%3D_18-green.svg?logo=nodedotjs)](https://nodejs.org/)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vladimirhegai/Seer-Core/actions)
 <br/>
-[![Benchmarks](https://img.shields.io/badge/Benchmarks-Leaderboard-green.svg)](docs/benchmarks.md)
-[![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen.svg)](docs/testing.md)
+[![Benchmarks](https://img.shields.io/badge/Benchmarks-View_Report-green?style=for-the-badge)](docs/benchmarks.md)
+[![Testing](https://img.shields.io/badge/Testing-View_Specs-brightgreen?style=for-the-badge)](docs/testing.md)
 
 </div>
 
