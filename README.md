@@ -1,6 +1,6 @@
 <div align="center">
 
-# Seer Core
+# Seer
 
 Give your AI agents a map of your repo before they edit.
 
