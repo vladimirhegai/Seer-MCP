@@ -18,6 +18,9 @@ AI agents are good at writing code. However, they are much worse at knowing **wh
 
 Instead of making agents piece together context from repeated searches, Seer compresses callers, tests, routes, service links, boundaries, risk signals, and yes, **even your git history**, into context agents can actually use all whilst **<u>improving</u>** token usage, speed, and accuracy.
 
+Oh, and Seer can absolutely help agents find their way inside large, messy repositories. Using signals like **call graphs**, **Louvain-style module clustering**, **service links**, and **symbol history**, agents can orient toward the right subsystem before they touch code.
+
+
 - **Difference from IDE-style agent tools (e.g. Serena):**  
   Seer is less about symbol editing and refactoring workflows, and more about change understanding. Before an edit, agents get a clearer picture of blast radius, git history, and surrounding behavior.
 
