@@ -44,9 +44,9 @@ One command, from inside the repo you want indexed (needs Node 24+):
 npx seer-mcp init
 ```
 
-*Want Antigravity too? Configure all clients (including user-level files) in one go:*
+*Want Antigravity or specific clients? Target your tools explicitly:*
 ```bash
-npx seer-mcp init --client all
+npx seer-mcp init --client claude,gemini,antigravity
 ```
 
 That writes the MCP config for whatever agents you use (Claude Code, Cursor, VS Code, Codex, Gemini) and drops an `AGENTS.md` so they actually know Seer exists.
