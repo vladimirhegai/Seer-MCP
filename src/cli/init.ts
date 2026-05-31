@@ -188,7 +188,7 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
   antigravity: {
     label: 'Google Antigravity',
     projectPath: null,
-    globalPath: home('.gemini', 'config', 'mcp_config.json'),
+    globalPath: home('.gemini', 'antigravity-ide', 'mcp_config.json'),
     rootKey: 'mcpServers',
   },
 };

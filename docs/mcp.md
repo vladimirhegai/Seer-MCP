@@ -141,7 +141,7 @@ Project-local: `.gemini/settings.json`. User-level: `~/.gemini/settings.json`.
 ### Google Antigravity
 
 User-level only, shared across the Antigravity IDE and CLI:
-`~/.gemini/config/mcp_config.json`. Uses the `mcpServers` key. Because there is
+`~/.gemini/antigravity-ide/mcp_config.json`. Uses the `mcpServers` key. Because there is
 no project-local file, `seer init` only touches this one when you ask for it
 (`--client antigravity` or `--client all`).
 
