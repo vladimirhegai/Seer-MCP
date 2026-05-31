@@ -49,9 +49,12 @@ not run an index step by hand. On a very large repo that first index can take a
 couple of minutes; it is cached afterward, so you only ever pay it once.
 
 You do not need any special command to "start" Seer. Just work as usual and the
-agent will reach for it. If you want to confirm the connection, ask the agent to
-call `seer_health`; a reply with a schema version and role counts means you are
-good.
+agent will reach for it. Seer indexes the workspace automatically on that first
+query. (If you want to avoid any delay on that first query, you can optionally
+pre-build the index manually in your terminal by running `npx seer-mcp index .`).
+
+If you want to confirm the connection, ask the agent to call `seer_health`; a
+reply with a schema version and role counts means you are good.
 
 ---
 
