@@ -22,10 +22,10 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 
 - **Difference from IDE-style agent tools (e.g. Serena):**  
-  Seer is less about symbol editing and refactoring workflows, and more about change understanding. Before an edit, agents get a clearer picture of blast radius, git history, and surrounding behavior.
+  Seer focuses less on editing symbols and refactoring code, and more on helping agents understand the impact of a change before they make it.
 
 - **Difference from graph-first codebase tools (e.g. Codebase-Memory):**  
-  Seer focuses on pre-edit context compression: behavioral tests, risk signals, symbol history, continuity across renames/moves, and compact context packets designed for real agent workflows.
+  Graph-first tools help agents explore structure. Seer focuses on edit-aware context: tests, risk, history, and change impact.
 
 Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).
 
