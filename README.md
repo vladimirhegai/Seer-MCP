@@ -14,17 +14,16 @@ Give your AI agents a map of your repo before they edit.
 
 </div>
 
-Seer **helps agents find code, follow context, and understand what they are changing**. From callers and tests to routes, service links, and git history, Seer gives agents the context they need before making a change.
+Seer helps agents **find code, follow context, and understand what they are changing**. From callers and tests to routes, service links, and git history, Seer gives agents the context they need before making a change.
 
-*Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency.*
+*Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).*
 
 [pimage]
 
-Validated on real agent workflows.*
+Validated on real agent workflows.
 
 [benchmark summary block]
 
-*See [Benchmarks](docs/benchmarks.md)
 
 ---
 
