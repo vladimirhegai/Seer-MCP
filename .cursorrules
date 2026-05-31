@@ -1,0 +1,43 @@
+# Seer-Core Agent Instructions & Workspace Rules
+
+You are an AI coding assistant (Cursor, Codex, Claude Code, etc.) operating in the Seer-Core repository. To make your onboarding fast and successful, follow these structural rules and guidelines.
+
+---
+
+## 1. Quick Onboarding & Environment Setup
+To compile the codebase and initialize the index database in a single step, run:
+```bash
+npm run setup
+```
+This command compiles the TypeScript source to `dist/` and runs the cold indexing pass over this repository, writing the SQLite database to `<repo-root>/.seer/graph.db`.
+
+---
+
+## 2. Document Discovery Map
+Always read these reference documents before analyzing or writing code in this repository:
+*   **Product Spec & Design Philosophy:** [seer-master-guide.md](file:///c:/dev/Coding/Strata/seer-master-guide.md)  
+    *Read this to understand the deterministic, local-first, zero-AI code-intelligence vision, Louvain clustering, SCIP overlays, and preflight contexts.*
+*   **Developer Guide & Architecture Map:** [README_dev.md](file:///c:/dev/Coding/Strata/README_dev.md)  
+    *Read this to understand the SQL schema, lazy PageRank logic, parser worker pooling, and edge resolution passes.*
+*   **CLI & MCP Reference Card:** [seer-cli-docs.md](file:///c:/dev/Coding/Strata/seer-cli-docs.md)  
+    *Read this to learn about the 54 high-fidelity MCP tools, CLI parameters, and recommended agent workflows.*
+
+---
+
+## 3. Testing and Validation Policy
+We enforce a strict zero-regression policy. Before committing any code:
+1.  **Run All Core Tests:** Ensure the full suite is green:
+    ```bash
+    npm test
+    ```
+2.  **Verify MCP Optimizations & Reliability:** Always verify the specialized optimization specs (including token budgeting, fuzzy did-you-mean, skeleton folding, batching, and trace umbrellas):
+    ```bash
+    npm run test:mcp
+    ```
+
+---
+
+## 4. Development Principles
+*   **Zero-AI Integrity:** Seer-Core must remain 100% local, deterministic, and free of external LLM run-time calls.
+*   **Thread Safety:** Keep AST parsing off the main V8 thread via the `WorkerPool` thread registry.
+*   **Freshness:** Ensure any database query first ensures JIT freshness using the hash checks in `freshness.ts`.

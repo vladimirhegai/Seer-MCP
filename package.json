@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "tsx src/cli/index.ts",
+    "setup": "npm run build && node dist/cli/index.js index .",
     "build": "tsc",
     "test": "npm run test:smoke && npm run test:parallel && npm run test:trackcd && npm run test:tracke && npm run test:trackf && npm run test:trackg && npm run test:tracki && npm run test:git && npm run test:regressions && npm run test:query-parity && npm run test:filters && npm run test:parallel-suite && npm run test:mcp && npm run test:bench",
     "test:parallel-suite": "npm run build && tsx tests/worker-parity.ts && tsx tests/worker-pool.ts && tsx tests/parallel-index.ts && tsx tests/parallel-recovery.ts",

@@ -1,0 +1,12 @@
+# Seer-Core Workspace Agent Instructions
+
+Please read the instructions inside `.cursorrules` to orient yourself with this repository.
+
+Key Tasks & Discovery:
+- Setup command: `npm run setup` (runs compilation and builds initial index database).
+- Reference specs:
+  - Architectural & Product Spec: `seer-master-guide.md`
+  - Developer & Testing Spec: `README_dev.md`
+  - CLI & MCP Reference Guide: `seer-cli-docs.md`
+- Run core tests: `npm test`
+- Verify optimizations: `npm run test:mcp` (verifies token budget, did-you-mean suggestions, structural skeletons, batches, and traces).
