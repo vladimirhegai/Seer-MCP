@@ -156,7 +156,7 @@ npm link           # optional: puts `seer` on your PATH
 ### From npm (once published)
 
 ```bash
-npx -y seer-core mcp     # no global install, runs anywhere
+npx -y seer-mcp mcp     # no global install, runs anywhere
 ```
 
 ### Connect your agents

@@ -26,8 +26,8 @@ existing entries alone unless you pass `--force`.
 |---|---|
 | `--client <names>` | Comma-separated subset: `claude,cursor,vscode,codex,gemini,antigravity`, or `all`. |
 | `--global` | Write the user-level config instead of the project-local one. |
-| `--npx` | Emit a portable `npx -y seer-core mcp` launcher (no machine paths). |
-| `--pkg <name>` | Package name for the `--npx` launcher (default `seer-core`). |
+| `--npx` | Emit a portable `npx -y seer-mcp mcp` launcher (no machine paths). |
+| `--pkg <name>` | Package name for the `--npx` launcher (default `seer-mcp`). |
 | `--command <cmd>` | Override the launch command entirely (advanced). |
 | `--no-agents` | Do not write `AGENTS.md`. |
 | `--print` | Show the plan and the exact snippets without writing anything. |
@@ -48,7 +48,7 @@ launcher that any teammate can use as-is (it relies on the client starting the
 server with the repo as its working directory):
 
 ```
-npx -y seer-core mcp
+npx -y seer-mcp mcp
 ```
 
 ---
@@ -69,13 +69,13 @@ Project-local: `.mcp.json` at the repo root. User-level: `~/.claude.json`.
   "mcpServers": {
     "seer": {
       "command": "npx",
-      "args": ["-y", "seer-core", "mcp"]
+      "args": ["-y", "seer-mcp", "mcp"]
     }
   }
 }
 ```
 
-You can also use the CLI: `claude mcp add seer -- npx -y seer-core mcp`.
+You can also use the CLI: `claude mcp add seer -- npx -y seer-mcp mcp`.
 
 ### Cursor
 
@@ -85,7 +85,7 @@ as Claude Code (the `mcpServers` key).
 ```json
 {
   "mcpServers": {
-    "seer": { "command": "npx", "args": ["-y", "seer-core", "mcp"] }
+    "seer": { "command": "npx", "args": ["-y", "seer-mcp", "mcp"] }
   }
 }
 ```
@@ -101,7 +101,7 @@ the required `type`.
     "seer": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "seer-core", "mcp"]
+      "args": ["-y", "seer-mcp", "mcp"]
     }
   }
 }
@@ -115,7 +115,7 @@ is TOML, not JSON.
 ```toml
 [mcp_servers.seer]
 command = "npx"
-args = ["-y", "seer-core", "mcp"]
+args = ["-y", "seer-mcp", "mcp"]
 ```
 
 ### Gemini CLI
@@ -125,7 +125,7 @@ Project-local: `.gemini/settings.json`. User-level: `~/.gemini/settings.json`.
 ```json
 {
   "mcpServers": {
-    "seer": { "command": "npx", "args": ["-y", "seer-core", "mcp"] }
+    "seer": { "command": "npx", "args": ["-y", "seer-mcp", "mcp"] }
   }
 }
 ```
@@ -140,7 +140,7 @@ no project-local file, `seer init` only touches this one when you ask for it
 ```json
 {
   "mcpServers": {
-    "seer": { "command": "npx", "args": ["-y", "seer-core", "mcp"] }
+    "seer": { "command": "npx", "args": ["-y", "seer-mcp", "mcp"] }
   }
 }
 ```

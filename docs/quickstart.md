@@ -34,7 +34,7 @@ Once published, the whole thing collapses to one line that every agent can run
 without a global install:
 
 ```bash
-npx -y seer-core mcp
+npx -y seer-mcp mcp
 ```
 
 ---

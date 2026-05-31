@@ -48,7 +48,7 @@ const ALL_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini'
  *  clean project-local config. Antigravity is user-level only, so it is opt-in. */
 const DEFAULT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini'];
 
-const DEFAULT_PKG = 'seer-core';
+const DEFAULT_PKG = 'seer-mcp';
 const AGENTS_BEGIN = '<!-- seer:begin -->';
 const AGENTS_END = '<!-- seer:end -->';
 

@@ -114,7 +114,7 @@ program
   .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,all (default: claude,cursor,vscode,codex,gemini)')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
-  .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-core')
+  .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-mcp')
   .option('--command <cmd>', 'Override the launch command entirely (advanced)')
   .option('--no-agents', 'Do not write the AGENTS.md guidance block')
   .option('--print', 'Print the plan without writing any files')

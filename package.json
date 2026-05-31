@@ -1,8 +1,8 @@
 {
-  "name": "seer",
+  "name": "seer-mcp",
   "version": "0.1.0",
   "description": "Local-first AI codebase explainer — onboarding from months to days",
-  "private": true,
+  "private": false,
   "type": "commonjs",
   "bin": {
     "seer": "./dist/cli/index.js"
