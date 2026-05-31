@@ -51,10 +51,14 @@ agent to call `seer_health`.)
 
 There is nothing else to run. Seer installs nothing native, and it indexes the
 workspace automatically on the first query, so there is no build or index step
-to do yourself. (Optionally, you can pre-index your repository manually in the
-background by running `npx seer-mcp index .` to avoid any delay on that first query.)
-On a very large repo that first index can take a couple of minutes; after that
-it is cached and you never wait on it again.
+to do yourself. On a very large repo that first index can take a couple of
+minutes; after that it is cached and you never wait on it again.
+
+> [!TIP]
+> **Optional Pre-indexing:** If you are working on a very large repository and want to avoid any first-query latency from your agent, you can pre-index your workspace manually in your terminal before launching the agent:
+> ```bash
+> npx seer-mcp index .
+> ```
 
 Want Antigravity too, or the user-level config, or to paste the snippet by hand?
 Antigravity is one flag away (`npx seer-mcp init --client all`), and every
