@@ -44,14 +44,11 @@ One command, from inside the repo you want indexed (needs Node 24+):
 npx seer-mcp init
 ```
 
-*Want Antigravity or specific clients? Target your tools explicitly:*
-```bash
-npx seer-mcp init --client claude,codex,gemini,antigravity
-```
+### Standard Init vs. Specific Clients
+* **Standard Init (`npx seer-mcp init`)**: Configures all standard project-local clients. It automatically writes local workspace configurations for **Claude Code** (`.mcp.json`), **OpenAI Codex** (`.codex/config.toml`), **Gemini CLI** (`.gemini/settings.json`), **VS Code** (`.vscode/mcp.json`), and **Cursor** (`.cursor/mcp.json`).
+* **With Google Antigravity & Extensions (`npx seer-mcp init --client claude,codex,gemini,antigravity`)**: If you use the Google Antigravity IDE with the Standard Gemini features alongside the Claude and Codex extensions, targeting these clients explicitly configures all of them at once. It writes to your user-level Antigravity settings (`~/.gemini/antigravity-ide/mcp_config.json`) and drops local workspace configurations for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), and Gemini (`.gemini/settings.json`).
 
-That writes the MCP config for whatever agents you use (Claude Code, Cursor, VS Code, Codex, Gemini) and drops an `AGENTS.md` so they actually know Seer exists.
-
-Reload your agent and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.)
+Reload your agent/extensions and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.)
 
 There is nothing else to run. Seer installs nothing native, and it indexes the
 workspace automatically on the first query, so there is no build or index step

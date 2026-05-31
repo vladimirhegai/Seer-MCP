@@ -165,7 +165,7 @@ config as their command-line sibling. You do not configure them separately.
 - The **Codex** IDE extension reads the same `~/.codex/config.toml` as the Codex
   CLI. The `codex` entry covers both.
 - The **Gemini** CLI and Gemini Code Assist share `.gemini/settings.json`.
-- **Antigravity**'s IDE and CLI share `~/.gemini/config/mcp_config.json`.
+- **Antigravity**'s IDE and CLI share `~/.gemini/antigravity-ide/mcp_config.json`.
 - The separate **VS Code** entry (`.vscode/mcp.json`, `servers` key) is for
   VS Code's own native MCP and GitHub Copilot's agent mode, which is a different
   consumer from the Claude/Codex extensions above.
