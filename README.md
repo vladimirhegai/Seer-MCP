@@ -44,10 +44,14 @@ One command, from inside the repo you want indexed (needs Node 24+):
 npx seer-mcp init
 ```
 
-That writes the MCP config for whatever agents you use (Claude Code, Cursor,
-VS Code, Codex, Gemini) and drops an `AGENTS.md` so they actually know Seer
-exists. Reload your agent and you are connected. (Want to confirm it? Ask the
-agent to call `seer_health`.)
+*Want Antigravity too? Configure all clients (including user-level files) in one go:*
+```bash
+npx seer-mcp init --client all
+```
+
+That writes the MCP config for whatever agents you use (Claude Code, Cursor, VS Code, Codex, Gemini) and drops an `AGENTS.md` so they actually know Seer exists.
+
+Reload your agent and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.)
 
 There is nothing else to run. Seer installs nothing native, and it indexes the
 workspace automatically on the first query, so there is no build or index step
@@ -60,9 +64,7 @@ minutes; after that it is cached and you never wait on it again.
 > npx seer-mcp index .
 > ```
 
-Want Antigravity too, or the user-level config, or to paste the snippet by hand?
-Antigravity is one flag away (`npx seer-mcp init --client all`), and every
-client's exact config is in [MCP Setup](docs/mcp.md).
+Want user-level config or to paste config by hand? Read the [MCP Setup](docs/mcp.md) guide.
 
 → [Full Quick Start](docs/quickstart.md)
 
