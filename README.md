@@ -20,8 +20,6 @@ Seer helps agents **find code, follow context, and understand what they are chan
 
 [pimage]
 
-Validated on real agent workflows.
-
 [benchmark summary block]
 
 
