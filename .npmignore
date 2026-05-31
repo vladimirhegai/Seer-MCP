@@ -1,0 +1,22 @@
+# Node modules
+node_modules/
+
+# Local database and cache
+.seer/
+*.db
+*.db-wal
+*.db-shm
+
+# Development and testing folders
+tests/
+Large Codebases/
+LargeCodebases/
+Explanations/
+Resources/
+.stress/
+.claude/
+.vscode/
+
+# Source and configuration (optional to ignore src, but we publish dist)
+tsconfig.json
+src/
