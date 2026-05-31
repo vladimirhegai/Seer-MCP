@@ -14,13 +14,13 @@ Give your AI agents a map of your repo before they edit.
 
 </div>
 
-AI agents are good at writing code. However, they are much worse at knowing _what_ they are about to affect.
+AI agents are good at writing code. However, they are much worse at knowing **what** they are about to affect.
 
-Instead of making agents piece together context from repeated searches, Seer compresses callers, tests, routes, service links, boundaries, history (yes, your git history too!), and risk signals, then compresses it into high-signal context agents can actually use *all whilst improving* token usage, speed, and accuracy.
+Instead of making agents piece together context from repeated searches, Seer compresses callers, tests, routes, service links, boundaries, risk signals, and yes, even your git history, into context agents can actually use **all whilst improving** token usage, speed, and accuracy.
 
-- **Difference from IDE-proxy servers (like Serena)**:
-  Seer is less about symbol editing tools, and more about *change understanding*. Before an edit, agents get a clearer picture of impact, ownership, and surrounding behavior.
-- **Difference from static indexers (like codebase-memory)**:
+- **Difference from IDE-proxy servers (e.g. Serena)**:
+  Seer is less about symbol editing tools, and more about change understanding. Before an edit, agents get a clearer picture of impact, ownership, and surrounding behavior.
+- **Difference from static indexers (e.g. codebase-memory)**:
   Seer goes beyond searchable graphs toward edit-aware context: behavioral tests, risk signals, continuity across renames/moves, and context packets designed for real agent workflows.
 
 Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).
