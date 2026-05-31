@@ -27,7 +27,7 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 - **Difference from graph-first codebase tools (e.g. Codebase-Memory):**  
   Graph-first tools help agents explore structure. Seer focuses on edit-aware context: tests, risk, history, and change impact.
 
-Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).
+*Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).*
 
 [pimage]
 
