@@ -148,10 +148,15 @@ export function computeShapeHash(body: string, minTokens = 8): bigint | null {
     if (ngram.length < NGRAM_SIZE) continue;
     if (ngram.length > NGRAM_SIZE) ngram.shift();
     const h = fnv64(ngram.join('|'));
-    for (let b = 0; b < HASH_BITS; b++) {
-      const bit = (h >> BigInt(b)) & 1n;
-      counters[b] += bit === 1n ? 1 : -1;
-    }
+    // Split the 64-bit hash into two 32-bit halves ONCE, then walk the bits
+    // with plain 32-bit number ops. The previous version did 64 BigInt shifts
+    // per n-gram; BigInt is an order of magnitude slower than number math and
+    // this loop is the hot path. The produced bits are identical, so stored
+    // hashes and duplicate clustering are unchanged.
+    const lo = Number(h & 0xFFFFFFFFn);
+    const hi = Number((h >> 32n) & 0xFFFFFFFFn);
+    for (let b = 0; b < 32; b++) counters[b] += ((lo >>> b) & 1) ? 1 : -1;
+    for (let b = 0; b < 32; b++) counters[b + 32] += ((hi >>> b) & 1) ? 1 : -1;
   }
   let out = 0n;
   for (let b = 0; b < HASH_BITS; b++) {
@@ -227,7 +232,7 @@ export function buildShapeHashes(
   let symbolsHashed = 0;
   let symbolsSkipped = 0;
   let lastFile = '';
-  let lastSource: string | null = null;
+  let lastLines: string[] | null = null;
   // node:sqlite — minor optimization: prepare the update once and reuse.
   const setHash = store.rawDb().prepare(
     'UPDATE symbols SET shape_hash = ? WHERE id = ?',
@@ -238,32 +243,41 @@ export function buildShapeHashes(
     return u > MAX ? u - 0x10000000000000000n : u;
   };
 
-  for (const r of rows) {
-    const filePath = String(r.filePath);
-    if (filePath !== lastFile) {
-      lastFile = filePath;
-      try { lastSource = fs.readFileSync(filePath, 'utf-8') as string; }
-      catch { lastSource = null; }
+  // CRITICAL: wrap every UPDATE in a single transaction. Without this, each
+  // `setHash.run()` auto-commits on its own, and with WAL + synchronous=FULL
+  // that is one disk sync per symbol. On a large repo (or a slow/contended
+  // disk) thousands of individual commits turn a sub-second pass into tens of
+  // seconds — it was the single biggest cost in a fresh index. One BEGIN/COMMIT
+  // collapses all of those syncs into one.
+  const db = store.rawDb();
+  db.exec('BEGIN');
+  try {
+    for (const r of rows) {
+      const filePath = String(r.filePath);
+      if (filePath !== lastFile) {
+        lastFile = filePath;
+        // Split each file into lines ONCE, not once per symbol. The old code
+        // re-split the whole source for every function in the file, which is
+        // quadratic in file size for symbol-dense files.
+        try { lastLines = (fs.readFileSync(filePath, 'utf-8') as string).split(/\r?\n/); }
+        catch { lastLines = null; }
+      }
+      if (lastLines == null) { symbolsSkipped++; continue; }
+      const lineStart = Number(r.lineStart);
+      const lineEnd = Number(r.lineEnd);
+      const body = lastLines.slice(lineStart, lineEnd + 1).join('\n');
+      const hash = computeShapeHash(body);
+      if (hash == null) { symbolsSkipped++; continue; }
+      setHash.run(toSigned(hash), Number(r.id));
+      symbolsHashed++;
     }
-    if (lastSource == null) { symbolsSkipped++; continue; }
-    const lineStart = Number(r.lineStart);
-    const lineEnd = Number(r.lineEnd);
-    const body = sliceLines(lastSource, lineStart, lineEnd);
-    const hash = computeShapeHash(body);
-    if (hash == null) { symbolsSkipped++; continue; }
-    setHash.run(toSigned(hash), Number(r.id));
-    symbolsHashed++;
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* */ }
+    throw err;
   }
   log(`Hashed ${symbolsHashed} symbols (${symbolsSkipped} skipped)`);
   return { symbolsHashed, symbolsSkipped, elapsedMs: Date.now() - start };
-}
-
-function sliceLines(source: string, startLine: number, endLine: number): string {
-  // 0-indexed line span — inclusive end. Naive line slicing is fine for our
-  // sizes; we don't need to worry about trailing-newline edge cases since
-  // tokenize() ignores whitespace anyway.
-  const lines = source.split(/\r?\n/);
-  return lines.slice(startLine, endLine + 1).join('\n');
 }
 
 export interface DuplicateCluster {

@@ -45,12 +45,13 @@ hand) is in [MCP Setup](mcp.md).
 ## First query
 
 Seer indexes the workspace automatically the first time it is queried, so you do
-not run an index step by hand. Ask your agent something like:
+not run an index step by hand. On a very large repo that first index can take a
+couple of minutes; it is cached afterward, so you only ever pay it once.
 
-> Call seer_health, then give me the architecture overview.
-
-If `seer_health` comes back with a schema version and some role counts, you are
-connected.
+You do not need any special command to "start" Seer. Just work as usual and the
+agent will reach for it. If you want to confirm the connection, ask the agent to
+call `seer_health`; a reply with a schema version and role counts means you are
+good.
 
 ---
 

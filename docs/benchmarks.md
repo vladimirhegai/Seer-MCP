@@ -14,17 +14,14 @@ model in the loop and are being measured now.
   round-trips. In progress.
 
 Accuracy and token-usage numbers are measured with **GPT-5.5, Claude Opus 4.8,
-Gemini 3.5 Flash (High), and Gemini 3.1 Pro**. See
-[methodology](benchmarks/methodology.md) for exactly how, and
-[raw-results](benchmarks/raw-results.md) for the full tables.
+Gemini 3.5 Flash (High), and Gemini 3.1 Pro**, by running each model on the same
+tasks twice (once with only grep/file tools, once with Seer added) and scoring
+against an independently verified answer key. Full speed numbers are in
+[raw-results](benchmarks/raw-results.md).
 
 ---
 
 ## Speed (measured)
-
-Indexing throughput and cache speedup across the large-codebase suite. See
-[raw-results](benchmarks/raw-results.md) for the full table, hardware, and the
-determinism guarantees that ride along with these runs.
 
 From one `npm run scale-test` session on a consumer laptop (Node v26.1.0,
 win32). Full per-repo detail, cold-start figures, and the reproduce command are
@@ -85,4 +82,4 @@ round-trips to reach a correct answer.
 
 ---
 
-→ [Methodology](benchmarks/methodology.md) · [Raw results](benchmarks/raw-results.md)
+→ [Raw results](benchmarks/raw-results.md)

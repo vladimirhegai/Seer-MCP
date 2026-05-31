@@ -20,7 +20,7 @@ import { importBundle, readBundleManifest } from '../bundle/import.js';
 import { importExternalBundle } from '../bundle/external.js';
 import { contractDiff } from '../bundle/contract.js';
 import { preflight } from '../indexer/preflight.js';
-import { getContinuityForSymbol } from '../indexer/continuity.js';
+import { getContinuityForSymbol, buildContinuity } from '../indexer/continuity.js';
 import { importScip } from '../scip/import.js';
 import { findDuplicates, buildShapeHashes } from '../indexer/shapehash.js';
 import { buildSkeleton } from '../indexer/skeleton.js';
@@ -204,7 +204,7 @@ export class SeerMcpServer {
   // index) the dependent tools used to silently return nothing until the agent
   // hand-ran a *_build tool. These guards extend the JIT-freshness philosophy
   // to those passes: build on first dependent query, once per process.
-  private autoBuilt = { modules: false, shapes: false, history: false };
+  private autoBuilt = { modules: false, shapes: false, history: false, continuity: false };
 
   private ensureModules(): void {
     if (this.autoBuilt.modules) return;
@@ -237,6 +237,19 @@ export class SeerMcpServer {
         });
       }
     } catch (err) { process.stderr.write(`[seer-mcp] auto symbol-history build skipped: ${err}\n`); }
+  }
+
+  private ensureContinuity(): void {
+    if (this.autoBuilt.continuity) return;
+    this.autoBuilt.continuity = true;
+    try {
+      if (!this.store.hasV10()) return;
+      this.ensureShapeHashes(); // continuity compares shape hashes
+      const row = this.store.rawDb()
+        .prepare('SELECT COUNT(*) AS c FROM symbol_history_continuity')
+        .get() as { c: number };
+      if (Number(row.c) === 0) buildContinuity(this.store, {});
+    } catch (err) { process.stderr.write(`[seer-mcp] auto continuity build skipped: ${err}\n`); }
   }
 
   private registerTools(): void {
@@ -955,6 +968,7 @@ export class SeerMcpServer {
     }, async ({ symbol, limit, since, file }) => {
       await this.ensureFresh();
       await this.ensureSymbolHistory();
+      this.ensureContinuity();
       const candidates = this.store.getDefinition(symbol, { filePath: file });
       const items: any[] = [];
       for (const c of candidates.slice(0, 5)) {
@@ -1289,7 +1303,7 @@ export class SeerMcpServer {
       },
     }, async ({ symbol, file }) => {
       await this.ensureFresh();
-      this.ensureShapeHashes();
+      this.ensureContinuity();
       const defs = this.store.getDefinition(symbol, { filePath: file });
       if (defs.length === 0) {
         const didYouMean = this.suggestSymbols(symbol);

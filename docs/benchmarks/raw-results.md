@@ -2,7 +2,7 @@
 
 Full numbers behind the [benchmark summary](../benchmarks.md). Speed is measured
 and reproducible. Accuracy and token usage are model-in-the-loop and are filled
-in as those runs complete; see [methodology](methodology.md).
+in as those runs complete.
 
 ---
 
@@ -62,9 +62,9 @@ It writes a fresh `tests/outputs/latest.md` with your machine's numbers.
 
 ## Accuracy (model-in-the-loop)
 
-A/B over a fixed task suite, scored against deterministic ground truth. Models:
-GPT-5.5, Claude Opus 4.8, Gemini 3.5 Flash (High), Gemini 3.1 Pro. See
-[methodology](methodology.md) for the protocol and the honesty rules.
+A/B over a fixed task suite, scored against an independently verified answer key
+(ground truth is established without Seer, so it does not grade its own work).
+Models: GPT-5.5, Claude Opus 4.8, Gemini 3.5 Flash (High), Gemini 3.1 Pro.
 
 <!-- accuracy-raw-begin -->
 _Runs in progress. Each cell will report mean correctness (and precision/recall

@@ -594,9 +594,24 @@ program
   .option('--db <path>', 'Database path')
   .action(async (symbol: string, opts: { db?: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
-    const store = openStore(dbPath);
+    // Continuity is built lazily (not during indexing). Open mutable so we can
+    // build it on demand the first time it is asked for.
+    const store = openStore(dbPath, true);
     try {
-      const { getContinuityForSymbol } = await import('../indexer/continuity.js');
+      const { getContinuityForSymbol, buildContinuity } = await import('../indexer/continuity.js');
+      // Build the continuity table once if it is empty. Needs shape hashes,
+      // which the index normally produces; if missing, compute them first.
+      try {
+        const hasRows = (store.rawDb().prepare('SELECT COUNT(*) AS c FROM symbol_history_continuity').get() as { c: number }).c > 0;
+        if (!hasRows) {
+          const hashed = (store.rawDb().prepare('SELECT COUNT(*) AS c FROM symbols WHERE shape_hash IS NOT NULL').get() as { c: number }).c;
+          if (hashed === 0) {
+            const { buildShapeHashes } = await import('../indexer/shapehash.js');
+            buildShapeHashes(store, {});
+          }
+          buildContinuity(store, {});
+        }
+      } catch { /* advisory; fall through and show whatever exists */ }
       const defs = store.getDefinition(symbol);
       if (defs.length === 0) { console.log(`No symbol "${symbol}"`); return; }
       for (const d of defs.slice(0, 3)) {

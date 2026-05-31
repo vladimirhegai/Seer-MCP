@@ -134,6 +134,27 @@ function main(): void {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
+  // ── 7. An existing AGENTS.md is never clobbered ────────────────────────────
+  {
+    const ws = freshWs('agents-preserve');
+    const userContent = '# My Project Agents\n\nDo not run migrations without asking.\nUse 2-space indent.\n';
+    fs.writeFileSync(path.join(ws, 'AGENTS.md'), userContent);
+
+    runInit({ workspace: ws, clients: ['claude'] });
+    let after = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
+    check(after.startsWith(userContent), '8.existing AGENTS.md content preserved verbatim at the top');
+    check(after.includes('Do not run migrations without asking.'), '8.user instructions still present');
+    check(after.includes('<!-- seer:begin -->') && after.includes('seer_preflight'), '8.seer block appended below');
+
+    // Re-running must not duplicate the block or touch the user content.
+    runInit({ workspace: ws, clients: ['claude'] });
+    after = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
+    const occurrences = after.split('<!-- seer:begin -->').length - 1;
+    check(occurrences === 1, '8.re-run does not duplicate the seer block', { occurrences });
+    check(after.startsWith(userContent), '8.re-run still preserves user content');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);
 }

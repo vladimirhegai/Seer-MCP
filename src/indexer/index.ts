@@ -10,7 +10,6 @@ import { classifyFile } from './classify.js';
 import { buildModules } from './modules.js';
 import { buildBoundaries } from './boundaries.js';
 import { buildShapeHashes } from './shapehash.js';
-import { buildContinuity } from './continuity.js';
 import { normalizeHttpTarget, resolveServiceLinks } from './serviceLinks.js';
 import { scanProtoFiles } from './protoScanner.js';
 import { scanServiceHosts } from './serviceHostScanner.js';
@@ -1023,17 +1022,13 @@ export class Indexer {
       process.stdout.write('  Skipping shape hashes (graph unchanged, no backfill needed)\n');
     }
 
-    // v10 — rename/move continuity heuristics. Runs whenever shape hashes
-    // were computed; opt-in mode (includeAllSymbols=true) is reserved for
-    // the explicit `seer continuity` CLI. The default pass only attaches
-    // candidates to symbols whose recorded history is shallow (< 1 commit).
-    if (graphChanged && this.store.hasV10()) {
-      try {
-        buildContinuity(this.store, { includeAllSymbols: true });
-      } catch (err) {
-        if (verbose) process.stdout.write(`  ⚠  continuity pass failed: ${err}\n`);
-      }
-    }
+    // v10 — rename/move continuity is NOT built here. It is a quadratic
+    // shape-comparison pass and, crucially, it only produces meaningful results
+    // once per-symbol git history exists (which is a separate opt-in pass, not
+    // part of indexing). Running it inline used to dominate index time on every
+    // repo and made large ones (godot, Unreal) effectively never finish.
+    // Continuity now builds lazily on first `seer continuity` / preflight query,
+    // alongside the other heavy derived passes (modules, shape hashes, history).
 
     const stats = this.store.getStats();
     const elapsedMs = Date.now() - start;

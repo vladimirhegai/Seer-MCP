@@ -155,6 +155,27 @@ no project-local file, `seer init` only touches this one when you ask for it
 
 ---
 
+## What about editor extensions?
+
+MCP config is per-tool, not per-surface, so the editor extensions read the same
+config as their command-line sibling. You do not configure them separately.
+
+- The **Claude Code** extension (VS Code / JetBrains) reads the same `.mcp.json`
+  as the Claude Code CLI. The `claude` entry covers both.
+- The **Codex** IDE extension reads the same `~/.codex/config.toml` as the Codex
+  CLI. The `codex` entry covers both.
+- The **Gemini** CLI and Gemini Code Assist share `.gemini/settings.json`.
+- **Antigravity**'s IDE and CLI share `~/.gemini/config/mcp_config.json`.
+- The separate **VS Code** entry (`.vscode/mcp.json`, `servers` key) is for
+  VS Code's own native MCP and GitHub Copilot's agent mode, which is a different
+  consumer from the Claude/Codex extensions above.
+
+So if you run, say, the Claude Code extension inside VS Code, the `claude` entry
+is what configures it; you do not also need the `vscode` entry. `seer init`
+writes all of them, so whichever surface you switch to is already set up.
+
+---
+
 ## Letting the agent know Seer exists
 
 Configuring the server is half the job. The other half is making sure the agent

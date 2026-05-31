@@ -88,14 +88,25 @@ export function buildContinuity(
   let skipped = 0;
 
   const raw = store.rawDb();
+  // Prepare the history-count probe ONCE and reuse it. Re-preparing this inside
+  // the loop (once per symbol) was needless overhead.
+  const historyCount = raw.prepare(
+    'SELECT COUNT(*) AS c FROM symbol_history WHERE symbol_id = ?',
+  );
+
+  // The close-hash match below is an all-pairs O(n^2) Hamming scan. It is the
+  // speculative, low-confidence half of continuity (the high-value exact-shape
+  // renames go through the O(1) `byHash` map). On a big repo n^2 is ruinous, so
+  // we only run it when the pool is small enough to stay cheap. The exact-shape
+  // path always runs regardless of pool size.
+  const CLOSE_MATCH_POOL_CAP = 4000;
+  const closeMatchEnabled = pool.length <= CLOSE_MATCH_POOL_CAP;
 
   for (const s of pool) {
     // Find the symbol's stored history count. If it's >= historyThreshold
     // AND we're not in includeAllSymbols mode, skip — exact history is fine.
     if (!options.includeAllSymbols) {
-      const cnt = raw.prepare(
-        'SELECT COUNT(*) AS c FROM symbol_history WHERE symbol_id = ?',
-      ).get(s.id) as { c: number } | undefined;
+      const cnt = historyCount.get(s.id) as { c: number } | undefined;
       if (cnt && cnt.c >= historyThreshold) continue;
     }
 
@@ -148,7 +159,8 @@ export function buildContinuity(
       }
     }
 
-    // Close hash match.
+    // Close hash match (speculative; skipped on large repos — see cap above).
+    if (!closeMatchEnabled) { skipped++; continue; }
     let best: { peer: typeof pool[number]; distance: number } | null = null;
     for (const peer of pool) {
       if (peer.id === s.id) continue;

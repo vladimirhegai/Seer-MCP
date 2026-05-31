@@ -46,14 +46,17 @@ npx seer-mcp init
 
 That writes the MCP config for whatever agents you use (Claude Code, Cursor,
 VS Code, Codex, Gemini) and drops an `AGENTS.md` so they actually know Seer
-exists. Reload your agent, ask it to call `seer_health`, and you are connected.
+exists. Reload your agent and you are connected. (Want to confirm it? Ask the
+agent to call `seer_health`.)
 
 There is nothing else to run. Seer installs nothing native, and it indexes the
 workspace automatically on the first query, so there is no build or index step
-to do yourself.
+to do yourself. On a very large repo that first index can take a couple of
+minutes; after that it is cached and you never wait on it again.
 
-Prefer to paste the config by hand, want the user-level config, or using
-Antigravity? Every client's snippet is in [MCP Setup](docs/mcp.md).
+Want Antigravity too, or the user-level config, or to paste the snippet by hand?
+Antigravity is one flag away (`npx seer-mcp init --client all`), and every
+client's exact config is in [MCP Setup](docs/mcp.md).
 
 → [Full Quick Start](docs/quickstart.md)
 
@@ -115,8 +118,6 @@ Antigravity? Every client's snippet is in [MCP Setup](docs/mcp.md).
 [small summary table]
 
 → [Benchmark Summary](docs/benchmarks.md)
-
-→ [Methodology](docs/benchmarks/methodology.md)
 
 → [Raw Results](docs/benchmarks/raw-results.md)
 
