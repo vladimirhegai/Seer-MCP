@@ -7,8 +7,11 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
+import { runInit, ClientId } from './init.js';
 
 const VERSION = '0.1.0';
+
+const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity'];
 
 function resolveDb(repoPath: string, customDb?: string): string {
   if (customDb) return path.resolve(customDb);
@@ -100,6 +103,79 @@ program
     } finally {
       store.close();
     }
+  });
+
+// ── seer init ──────────────────────────────────────────────────────────────
+
+program
+  .command('init [workspace]')
+  .description('Wire Seer in as an MCP server for your AI agents and write an AGENTS.md usage guide')
+  .option('--db <path>', 'Custom database path passed through to the MCP launcher')
+  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,all (default: claude,cursor,vscode,codex,gemini)')
+  .option('--global', 'Write user-level config instead of project-local config')
+  .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
+  .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-core')
+  .option('--command <cmd>', 'Override the launch command entirely (advanced)')
+  .option('--no-agents', 'Do not write the AGENTS.md guidance block')
+  .option('--print', 'Print the plan without writing any files')
+  .option('--force', 'Overwrite an existing seer entry / agents block')
+  .action((workspace: string | undefined, opts: {
+    db?: string; client?: string; global?: boolean; npx?: boolean; pkg?: string;
+    command?: string; agents?: boolean; print?: boolean; force?: boolean;
+  }) => {
+    const ws = path.resolve(workspace ?? process.cwd());
+    if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
+
+    let clients: ClientId[] | undefined;
+    if (opts.client) {
+      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (names.includes('all')) {
+        clients = KNOWN_CLIENTS;
+      } else {
+        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
+        if (bad.length) {
+          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
+          process.exit(1);
+        }
+        clients = names as ClientId[];
+      }
+    }
+
+    const result = runInit({
+      workspace: ws,
+      clients,
+      global: opts.global,
+      npx: opts.npx,
+      pkg: opts.pkg,
+      command: opts.command,
+      agents: opts.agents,
+      print: opts.print,
+      force: opts.force,
+      db: opts.db,
+    });
+
+    console.log(`\nSeer Init  ${opts.print ? '(dry run — nothing written)' : ''}`);
+    console.log(`  Workspace: ${ws}`);
+    console.log(`  Launcher:  ${result.launch.command} ${result.launch.args.join(' ')}\n`);
+
+    const mark: Record<string, string> = opts.print
+      ? { wrote: '+ would write ', updated: '~ would update', skipped: '· would skip ', manual: '! manual      ' }
+      : { wrote: '✓ wrote ', updated: '✓ updated', skipped: '· skipped', manual: '! manual ' };
+    for (const e of result.entries) {
+      console.log(`  ${mark[e.action] ?? e.action}  ${e.label.padEnd(28)} ${e.file}`);
+      if (e.note) console.log(`             ${e.note}`);
+      if (e.snippet && (opts.print || e.action === 'manual')) {
+        console.log(e.snippet.split('\n').map((l) => '             ' + l).join('\n'));
+      }
+    }
+    if (result.agents) {
+      console.log(`  ${mark[result.agents.action] ?? result.agents.action}  ${'AGENTS.md (agent guide)'.padEnd(28)} ${result.agents.file}`);
+    }
+
+    console.log(`\n  Next:`);
+    console.log(`    1. Reload / restart your agent so it picks up the new MCP server.`);
+    console.log(`    2. Seer indexes this workspace automatically on first query.`);
+    console.log(`    3. Ask your agent to call seer_health to confirm it is connected.\n`);
   });
 
 // ── seer callers / callees / symbols / stats / health ──────────────────────────

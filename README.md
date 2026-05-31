@@ -38,11 +38,21 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 ## Quick Start
 
-[very short install]
+```bash
+# 1. Get the engine (Node 18+; 26+ recommended)
+git clone https://github.com/vladimirhegai/Seer-Core.git
+cd Seer-Core && npm install && npm run build
 
-[very short MCP setup]
+# 2. Wire it into your AI agents, from inside the repo you want indexed
+seer init        # writes MCP config for Claude Code, Cursor, VS Code, Codex, Gemini
+                 # and drops an AGENTS.md so the agent knows Seer exists
 
-[first successful command]
+# 3. Reload your agent and ask it to call seer_health
+```
+
+Seer indexes the workspace automatically on the first query, so there is no
+separate build step. Prefer to paste the config yourself, or use Codex /
+Antigravity? Every client's snippet is in [MCP Setup](docs/mcp.md).
 
 → [Full Quick Start](docs/quickstart.md)
 
@@ -129,13 +139,60 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 ## Installation
 
-### npm
+Seer is a local MCP server with zero native dependencies, so install is mostly
+"point your agent at it." The one command that does this for every agent is
+`seer init`.
 
-### from source
+### From source (works today)
 
-### MCP configuration
+```bash
+git clone https://github.com/vladimirhegai/Seer-Core.git
+cd Seer-Core
+npm install
+npm run build      # produces dist/cli/index.js
+npm link           # optional: puts `seer` on your PATH
+```
 
-### CI bundles / prebuilt bundles
+### From npm (once published)
+
+```bash
+npx -y seer-core mcp     # no global install, runs anywhere
+```
+
+### Connect your agents
+
+From inside the repo you want indexed:
+
+```bash
+seer init                      # Claude Code, Cursor, VS Code, Codex, Gemini (project-local)
+seer init --client all         # also Antigravity and the user-level configs
+seer init --print              # dry run: show the snippets, write nothing
+seer init --npx                # emit a portable npx launcher instead of a local path
+```
+
+`seer init` is idempotent and merges into existing config files without clobbering
+them. It also writes an `AGENTS.md` block so the agent actually reaches for Seer
+instead of grepping. Supported clients and their exact config formats:
+
+| Client | Config file | Root key |
+|---|---|---|
+| Claude Code | `.mcp.json` | `mcpServers` |
+| Cursor | `.cursor/mcp.json` | `mcpServers` |
+| VS Code (Copilot) | `.vscode/mcp.json` | `servers` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.seer]` |
+| Gemini CLI | `.gemini/settings.json` | `mcpServers` |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers` |
+
+### Prebuilt / CI bundles
+
+To share a prebuilt index (for example across a team or in CI), export a portable
+bundle and import it elsewhere:
+
+```bash
+seer ci bundle                 # fresh-index and emit a .seerbundle (for CI)
+seer ci workflow               # print a ready-to-paste GitHub Actions workflow
+seer bundle import repo.seerbundle --external --alias upstream
+```
 
 → [Full Installation Guide](docs/quickstart.md)
 
