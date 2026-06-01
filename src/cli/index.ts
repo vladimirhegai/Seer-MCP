@@ -9,7 +9,7 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.8';
+const VERSION = '0.1.9';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
@@ -202,7 +202,7 @@ program
     if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
 
     const clients = parseClientList(opts.client);
-    const inferred = clients ?? detectConfiguredClients(ws, { global: opts.global });
+    const inferred = clients ?? detectConfiguredClients(ws, { global: opts.global, includePinnedOther: opts.force });
     const result = runUpdate({
       workspace: ws,
       clients: inferred,

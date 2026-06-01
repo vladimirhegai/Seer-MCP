@@ -142,7 +142,7 @@ function resolveLaunch(
 
 function readJsonTolerant(file: string): { ok: true; data: any } | { ok: false } {
   try {
-    const raw = fs.readFileSync(file, 'utf8');
+    const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
     if (!raw.trim()) return { ok: true, data: {} };
     // Tolerate JSONC (// and /* */ comments, trailing commas) so we do not
     // choke on a hand-edited VS Code mcp.json.
@@ -251,6 +251,28 @@ function targetPath(workspace: string, target: string): string {
   return path.isAbsolute(target) ? target : path.join(workspace, target);
 }
 
+function pruneEmptyParents(file: string, stopDir: string): void {
+  const stop = path.resolve(stopDir);
+  let dir = path.resolve(path.dirname(file));
+  while (dir !== stop && dir.startsWith(stop + path.sep)) {
+    try {
+      if (fs.readdirSync(dir).length !== 0) return;
+      fs.rmdirSync(dir);
+    } catch {
+      return;
+    }
+    dir = path.dirname(dir);
+  }
+}
+
+function pruneStopDir(file: string, workspace: string, targetIsGlobal: boolean): string {
+  if (!targetIsGlobal) return workspace;
+  const homeDir = os.homedir();
+  const relative = path.relative(homeDir, path.resolve(file));
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return path.dirname(file);
+  return homeDir;
+}
+
 function clientTargets(client: ClientId, workspace: string, scope: 'init' | 'all' | 'global'): TargetSpec[] {
   const spec = CLIENTS[client];
   const targets: TargetSpec[] = [];
@@ -273,6 +295,23 @@ function pathExistsAny(paths: Array<string | null | undefined>): boolean {
   return paths.some((p) => !!p && fs.existsSync(p));
 }
 
+function commandExists(names: string[]): boolean {
+  const pathValue = process.env.PATH;
+  if (!pathValue) return false;
+  const dirs = pathValue.split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')
+    : [''];
+  for (const dir of dirs) {
+    for (const name of names) {
+      for (const ext of extensions) {
+        if (fs.existsSync(path.join(dir, name + ext))) return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function detectAutoClients(workspace: string): ClientId[] {
   const selected = new Set<ClientId>(DEFAULT_CLIENTS);
   const antigravityApp = localAppData('Programs', 'Antigravity IDE');
@@ -282,13 +321,17 @@ export function detectAutoClients(workspace: string): ClientId[] {
     home('.gemini', 'antigravity-ide'),
     path.join(workspace, '.agents'),
     antigravityApp,
-  ])) {
+    '/Applications/Antigravity.app',
+    '/Applications/Antigravity IDE.app',
+    '/opt/antigravity',
+    '/opt/antigravity-ide',
+  ]) || commandExists(['agy', 'antigravity', 'antigravity-ide'])) {
     selected.add('antigravity');
   }
   if (pathExistsAny([
     home('.codeium', 'windsurf'),
     home('.windsurf'),
-  ])) {
+  ]) || commandExists(['windsurf'])) {
     selected.add('windsurf');
   }
   return ALL_CLIENTS.filter((c) => selected.has(c));
@@ -315,11 +358,21 @@ function hasSeerEntry(client: ClientId, file: string): boolean | null {
   return spec.toml ? tomlHasSeer(file) : jsonHasSeer(spec, file);
 }
 
-export function detectConfiguredClients(workspace: string, opts: { global?: boolean } = {}): ClientId[] {
+export function detectConfiguredClients(
+  workspace: string,
+  opts: { global?: boolean; includePinnedOther?: boolean } = {},
+): ClientId[] {
   const scope = opts.global ? 'global' : 'all';
-  return ALL_CLIENTS.filter((client) =>
-    clientTargets(client, workspace, scope).some((target) => hasSeerEntry(client, target.file) === true),
-  );
+  const resolvedWorkspace = path.resolve(workspace);
+  return ALL_CLIENTS.filter((client) => {
+    const spec = CLIENTS[client];
+    return clientTargets(client, resolvedWorkspace, scope).some((target) => {
+      if (hasSeerEntry(client, target.file) !== true) return false;
+      if (!target.isGlobal || opts.includePinnedOther) return true;
+      const pinnedWorkspace = entryWorkspace(spec, target.file);
+      return pinnedWorkspace === undefined || pinnedWorkspace === null || sameResolvedPath(pinnedWorkspace, resolvedWorkspace);
+    });
+  });
 }
 
 function jsonEntry(launch: LaunchSpec, stdioType: boolean): Record<string, any> {
@@ -519,26 +572,31 @@ function agentsBlock(): string {
     AGENTS_BEGIN,
     '## Seer',
     '',
-    'Use Seer before text search for code structure in this repo. Seer is a',
-    'local MCP server (`seer_*` tools) backed by a SQLite index of symbols,',
-    'callers, callees, routes, tests, dependencies, boundaries, risk, and git',
+    'Seer is the first stop for code structure in this repo. Use the `seer_*`',
+    'MCP tools before `rg`, file reads, or broad manual search when the task',
+    'involves symbols, callers, tests, dependencies, boundaries, risk, or git',
     'history.',
     '',
-    'Start here:',
-    '1. `seer_health` - confirm the MCP server is indexing this workspace.',
-    '2. `seer_search` or `seer_definition` - find the symbol/file.',
-    '3. `seer_preflight { symbol }` - get definition, callers, tests, risk,',
-    '   history, and blast radius before editing.',
+    'Required workflow before editing code:',
+    '1. Call `seer_health` once and confirm `workspace` is this repo.',
+    '2. If you know the target symbol, call `seer_context { symbol }` or',
+    '   `seer_preflight { symbol }` before reading files.',
+    '3. If you do not know the symbol, call `seer_search` first, then',
+    '   `seer_definition` or `seer_file_symbols` on the best hit.',
+    '4. For changes already in the working tree, call `seer_preflight` with',
+    '   `fromRef`/`toRef` or the target symbol before summarizing impact.',
     '',
-    'Useful tools:',
-    '- `seer_callers` / `seer_callees` for call graph questions.',
-    '- `seer_behavior` for tests that cover a symbol.',
-    '- `seer_history` for recent commits touching a symbol.',
-    '- `seer_skeleton { file }` to inspect a large file cheaply.',
-    '- `seer_architecture` / `seer_boundaries` to orient in a repo.',
+    'Common follow-ups:',
+    '- `seer_callers` / `seer_callees`: direct call graph.',
+    '- `seer_trace`: transitive callers/callees, file, module, or service paths.',
+    '- `seer_behavior`: tests that describe expected behavior.',
+    '- `seer_history`: commits that touched a symbol.',
+    '- `seer_skeleton { file }`: cheap file shape before a full read.',
+    '- `seer_architecture` / `seer_modules` / `seer_boundaries`: repo orientation.',
     '',
-    'Use `rg` or manual file reads after Seer when you need comments, docs,',
-    'literal text, or when Seer returns no useful hit.',
+    'Use `rg` or manual file reads after Seer for literal strings, comments,',
+    'docs, config values, unsupported languages, or when Seer returns no',
+    'useful hit.',
     AGENTS_END,
   ].join('\n');
 }
@@ -669,6 +727,7 @@ function removeJsonClient(
   const remaining = Object.keys(data);
   if (remaining.length === 0) {
     fs.unlinkSync(file);
+    pruneEmptyParents(file, pruneStopDir(file, opts.workspace, targetIsGlobal));
     return { ...base, action: 'deleted' };
   }
 
@@ -720,6 +779,7 @@ function removeTomlClient(
 
   if (!result.trim()) {
     fs.unlinkSync(file);
+    pruneEmptyParents(file, pruneStopDir(file, opts.workspace, targetIsGlobal));
     return { ...base, action: 'deleted' };
   }
 
@@ -778,6 +838,7 @@ function removeContextFile(
 
   if (!result.trim()) {
     fs.unlinkSync(file);
+    pruneEmptyParents(file, opts.workspace);
     return { ...base, action: 'deleted' };
   }
 
@@ -872,7 +933,10 @@ function refreshClient(client: ClientId, opts: UpdateOptions): PlanEntry[] {
 
 export function runUpdate(opts: UpdateOptions): InitResult {
   const workspace = path.resolve(opts.workspace);
-  const detected = detectConfiguredClients(workspace, { global: opts.global });
+  const detected = detectConfiguredClients(workspace, {
+    global: opts.global,
+    includePinnedOther: opts.force,
+  });
   const clients = (opts.clients && opts.clients.length ? opts.clients : detected)
     .filter((c) => ALL_CLIENTS.includes(c));
 

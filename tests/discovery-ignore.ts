@@ -44,6 +44,9 @@ async function main(): Promise<void> {
   write(root, 'packages/api/src/ignored-by-seer.ts');
   write(root, 'packages/api/.gitignore', 'src/ignored-by-git.ts\n');
   write(root, 'packages/api/.seerignore', 'src/ignored-by-seer.ts\n');
+  write(root, 'Large Codebases/godot/engine.cpp', 'int heavy() { return 1; }\n');
+  write(root, 'Large Codebases/godot/.gitignore', '!engine.cpp\n');
+  write(root, '.seerignore', 'Large Codebases/**\n');
 
   const files = (await discoverFiles(root)).map(f => f.relativePath.replace(/\\/g, '/')).sort();
 
@@ -53,6 +56,7 @@ async function main(): Promise<void> {
   check(!files.some(f => f.includes('/dist/')), 'skips dist at every depth', files);
   check(!files.includes('packages/api/src/ignored-by-git.ts'), 'honors nested .gitignore', files);
   check(!files.includes('packages/api/src/ignored-by-seer.ts'), 'honors nested .seerignore', files);
+  check(!files.some(f => f.startsWith('Large Codebases/')), 'root .seerignore wins over nested ignore files', files);
 
   fs.rmSync(root, { recursive: true, force: true });
 

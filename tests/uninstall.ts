@@ -56,6 +56,10 @@ function main(): void {
     check(!fs.existsSync(path.join(ws, '.codex', 'config.toml')), '1.codex config.toml deleted');
     // .gemini/settings.json same.
     check(!fs.existsSync(path.join(ws, '.gemini', 'settings.json')), '1.gemini settings.json deleted');
+    check(!fs.existsSync(path.join(ws, '.cursor')), '1.empty .cursor directory pruned');
+    check(!fs.existsSync(path.join(ws, '.vscode')), '1.empty .vscode directory pruned');
+    check(!fs.existsSync(path.join(ws, '.codex')), '1.empty .codex directory pruned');
+    check(!fs.existsSync(path.join(ws, '.gemini')), '1.empty .gemini directory pruned');
 
     // Context files: AGENTS.md, CLAUDE.md, GEMINI.md all stripped.
     const cfActed = r.contextFiles.filter((e) => e.action !== 'skipped');
@@ -72,7 +76,7 @@ function main(): void {
     const ws = freshWs('partial');
     // Pre-populate configs with another server alongside seer.
     fs.writeFileSync(path.join(ws, '.mcp.json'),
-      JSON.stringify({ mcpServers: { other: { command: 'foo', args: [] }, seer: { command: 'node', args: [] } } }, null, 2));
+      '\uFEFF' + JSON.stringify({ mcpServers: { other: { command: 'foo', args: [] }, seer: { command: 'node', args: [] } } }, null, 2));
     fs.mkdirSync(path.join(ws, '.codex'), { recursive: true });
     fs.writeFileSync(path.join(ws, '.codex', 'config.toml'),
       '[model]\nname = "gpt-5"\n\n[mcp_servers.other]\ncommand = "foo"\nargs = []\n\n[mcp_servers.seer]\ncommand = "node"\nargs = []\n');
@@ -82,7 +86,7 @@ function main(): void {
     // .mcp.json still exists, other server intact, seer gone.
     check(fs.existsSync(path.join(ws, '.mcp.json')), '2.claude .mcp.json still present (has other server)');
     const mcp = JSON.parse(fs.readFileSync(path.join(ws, '.mcp.json'), 'utf8'));
-    check('other' in (mcp.mcpServers ?? {}), '2.other server preserved in .mcp.json');
+    check('other' in (mcp.mcpServers ?? {}), '2.BOM-tolerant JSON removal preserves other server in .mcp.json');
     check(!('seer' in (mcp.mcpServers ?? {})), '2.seer removed from .mcp.json');
 
     // config.toml: [model] and [mcp_servers.other] stay, [mcp_servers.seer] gone.
@@ -175,6 +179,7 @@ function main(): void {
     check(extraEntry !== undefined, '7.antigravity extra project path (.agents/mcp_config.json) targeted');
     check(extraEntry?.action === 'deleted', '7.antigravity extra project path deleted when seer-only',
       extraEntry?.action);
+    check(!fs.existsSync(agentsDir), '7.empty .agents directory pruned');
 
     fs.rmSync(ws, { recursive: true, force: true });
   }

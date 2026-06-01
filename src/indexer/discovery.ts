@@ -167,6 +167,7 @@ async function loadIgnoreLayers(absRoot: string, skip: string[]): Promise<Ignore
   for (const rel of nested.sort()) {
     const normRel = normalizeRelPath(rel);
     if (normRel === '.gitignore' || normRel === '.seerignore') continue;
+    if (isIgnoredByLayers(normRel, layers)) continue;
     addLayer(normRel);
   }
 

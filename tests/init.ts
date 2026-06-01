@@ -63,6 +63,8 @@ function main(): void {
     const agents = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
     check(agents.includes('<!-- seer:begin -->') && agents.includes('<!-- seer:end -->'),
       '1.AGENTS.md written with seer markers');
+    check(agents.includes('seer_context') && agents.includes('Required workflow before editing code'),
+      '1.AGENTS.md gives a direct Seer-first edit workflow');
     check(agents.includes('seer_preflight'), '1.AGENTS.md mentions seer_preflight workflow');
 
     // gemini is in PROJECT_CLIENTS, so a GEMINI.md import shim must be written too.
@@ -133,7 +135,7 @@ function main(): void {
   {
     const ws = freshWs('merge');
     fs.writeFileSync(path.join(ws, '.mcp.json'),
-      JSON.stringify({ mcpServers: { other: { command: 'foo', args: ['bar'] } } }, null, 2));
+      '\uFEFF' + JSON.stringify({ mcpServers: { other: { command: 'foo', args: ['bar'] } } }, null, 2));
     fs.mkdirSync(path.join(ws, '.codex'), { recursive: true });
     fs.writeFileSync(path.join(ws, '.codex', 'config.toml'),
       '[model]\nname = "gpt-5.5"\n\n[mcp_servers.other]\ncommand = "foo"\nargs = []\n');
@@ -141,7 +143,7 @@ function main(): void {
     runInit({ workspace: ws, clients: ['claude', 'codex'] });
 
     const mcp = JSON.parse(fs.readFileSync(path.join(ws, '.mcp.json'), 'utf8'));
-    check(!!mcp.mcpServers.other && !!mcp.mcpServers.seer, '4.json merge keeps existing "other" server + adds seer', mcp.mcpServers);
+    check(!!mcp.mcpServers.other && !!mcp.mcpServers.seer, '4.json merge tolerates BOM and keeps existing "other" server + adds seer', mcp.mcpServers);
 
     const toml = fs.readFileSync(path.join(ws, '.codex', 'config.toml'), 'utf8');
     check(/\[model\]/.test(toml) && /\[mcp_servers\.other\]/.test(toml) && /\[mcp_servers\.seer\]/.test(toml),

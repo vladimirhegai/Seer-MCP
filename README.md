@@ -38,21 +38,50 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 ## Quick Start
 
-From inside the repo you want indexed (Node 24+):
+Run from the repo you want Seer to index. Requires Node.js 24+ on Windows,
+macOS, or Linux.
 
 ```bash
 npx seer-mcp init --auto
 ```
 
-That writes repo-local MCP config, adds detected editor-global clients such as Antigravity/Windsurf, and pins global launchers to this repo with `--workspace`.
-
-Prefer zero global changes?
+From another directory, pass the repo path:
 
 ```bash
-npx seer-mcp init
+npx seer-mcp init C:\path\to\repo --auto
 ```
 
-Reload your agent and ask it to call `seer_health`. Seer indexes this repo on the first query.
+Use this when you want Seer set up for your normal agent/editor. It writes
+repo-local MCP config where possible, and detected editor-wide config for tools
+like Antigravity. Editor-wide configs are pinned to this repo with
+`--workspace`.
+
+Common installs:
+
+```bash
+npx seer-mcp init --auto                 # recommended
+npx seer-mcp init                        # repo-local only, no editor-wide files
+npx seer-mcp init --client antigravity   # Antigravity IDE / CLI
+npx seer-mcp init --client claude        # Claude Code CLI
+npx seer-mcp init --client codex         # Codex only
+npx seer-mcp init --client all           # every supported client
+```
+
+Useful flags:
+
+- `--auto`: repo-local setup plus detected editor-wide clients.
+- `--client <name>`: target one client, or use `all`.
+- `--print`: preview files before writing.
+- `--force`: replace an existing `seer` entry.
+
+Restart/reload your agent, then ask it to call:
+
+```text
+seer_health
+```
+
+The first query builds `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore`
+if it is not already ignored.
 
 Update existing installs:
 
@@ -60,15 +89,8 @@ Update existing installs:
 npx seer-mcp update
 ```
 
-Avoid first-query latency:
+More detail: [Full Quick Start](docs/quickstart.md) and [MCP Setup](docs/mcp.md).
 
-```bash
-npx seer-mcp index .
-```
-
-More clients and uninstall details: [MCP Setup](docs/mcp.md).
-
--> [Full Quick Start](docs/quickstart.md)
 ---
 
 ## Docs

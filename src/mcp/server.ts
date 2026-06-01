@@ -63,11 +63,12 @@ export interface McpServerOptions {
 
 function mcpInstructions(): string {
   return [
-    'Use Seer before grep for structural code navigation in this workspace.',
-    'Start with seer_health, then use seer_search or seer_definition to locate symbols.',
-    'Before editing unfamiliar code, call seer_preflight for the target symbol or diff range.',
-    'Use seer_callers, seer_callees, seer_behavior, seer_history, and seer_skeleton to gather focused context.',
-    'Fall back to text search for comments, string literals, config values, docs, or unsupported languages.',
+    'Use Seer first for structural code navigation in this workspace.',
+    'Before editing code, call seer_health once and confirm the workspace.',
+    'If you know the target symbol, call seer_context or seer_preflight before reading files.',
+    'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
+    'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
+    'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit.',
   ].join(' ');
 }
 
