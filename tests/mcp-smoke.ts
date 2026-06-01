@@ -106,7 +106,7 @@ async function main(): Promise<void> {
       });
       if (r.result) {
         initOk = true;
-        if (r.result.instructions?.includes('seer_preflight')) ok('initialize advertises Seer workflow instructions');
+        if (r.result.instructions?.includes('seer_preflight') && r.result.instructions?.includes('stale/mispointed')) ok('initialize advertises Seer workflow instructions');
         else bad('initialize missing Seer workflow instructions', r.result);
         break;
       }

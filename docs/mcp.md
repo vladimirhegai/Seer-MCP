@@ -59,12 +59,16 @@ npx -y seer-mcp mcp --workspace C:/path/to/repo
 Antigravity workspace config also includes `--workspace` because the IDE may
 launch MCP from its own install directory.
 
-If `seer_health` shows your editor directory instead of your repo, rerun setup
-from the repo:
+If `seer_health` shows your editor directory or another repo instead of the
+active repo, the agent is using a stale/mispointed MCP process. Rerun setup from
+the repo:
 
 ```bash
 npx seer-mcp init --auto --force
 ```
+
+Then restart/reload the agent. Do not trust Seer query results until
+`seer_health.workspace` is the active repo.
 
 Project A and Project B can both have Seer when each repo has its own local MCP
 file. For Antigravity, that file is `.agents/mcp_config.json`.

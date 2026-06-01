@@ -9,7 +9,7 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.11';
+const VERSION = '0.1.12';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 

@@ -65,11 +65,12 @@ function mcpInstructions(): string {
   return [
     'Use Seer first for structural code navigation in this workspace.',
     'Before editing code, call seer_health once and confirm the workspace.',
+    'If seer_health.workspace is not the active repo, report the stale/mispointed MCP session and ask the user to restart/reload after rerunning init; do not use stale Seer results for the task.',
     'If you know the target symbol, call seer_context or seer_preflight before reading files.',
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
-    'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit.',
+    'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
   ].join(' ');
 }
 

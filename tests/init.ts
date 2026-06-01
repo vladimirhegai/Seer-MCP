@@ -71,6 +71,8 @@ function main(): void {
     check(agents.includes('seer_context') && agents.includes('Required workflow before editing code'),
       '1.AGENTS.md gives a direct Seer-first edit workflow');
     check(agents.includes('seer_preflight'), '1.AGENTS.md mentions seer_preflight workflow');
+    check(agents.includes('not this repo') && agents.includes('restart/reload the agent'),
+      '1.AGENTS.md tells agents to stop on stale/mispointed workspace');
 
     // gemini is in PROJECT_CLIENTS, so a GEMINI.md import shim must be written too.
     check(fs.existsSync(path.join(ws, 'GEMINI.md')), '1.GEMINI.md shim written for gemini client');

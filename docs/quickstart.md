@@ -72,7 +72,9 @@ seer_health
 ```
 
 The `workspace`/`DB path` should point at the repo you installed from, not at
-your editor install directory.
+your editor install directory or another repo. If it is wrong, the active MCP
+process is stale or loaded from a different workspace; restart/reload the agent
+after rerunning setup.
 
 Terminal check:
 
@@ -229,6 +231,9 @@ Useful uninstall flags:
 ```bash
 npx seer-mcp init --auto --force
 ```
+
+Then restart/reload the agent. If `seer_health` still reports another repo, the
+agent is still using an old MCP process.
 
 ### Noisy Callers
 
