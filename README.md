@@ -54,6 +54,8 @@ npx seer-mcp init C:\path\to\repo --auto
 Use this when you want Seer set up for the current repo. It writes
 workspace-local MCP config only. If you have Project A and Project B, run the
 same command in each repo; both keep their own Seer config and index.
+Antigravity's repo-local config includes `--workspace` because the IDE can
+launch MCP from the Antigravity install directory.
 
 Common installs:
 

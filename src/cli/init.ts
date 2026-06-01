@@ -123,8 +123,10 @@ function resolveLaunch(
   // entry lives inside a node_modules tree whose path is unstable across
   // machines and cache evictions. In that case the portable `npx` launcher is
   // the right default, which is what makes `npx seer-mcp init` produce
-  // zero-tinkering, shareable config. From a source checkout we keep the
-  // absolute node path so it works without publishing.
+  // zero-tinkering config. A few editor-hosted clients still need an explicit
+  // --workspace because they launch MCP from the editor process directory.
+  // From a source checkout we keep the absolute node path so it works without
+  // publishing.
   const installed = entry.includes(`${path.sep}node_modules${path.sep}`);
   if (opts.npx || installed) {
     const args = ['-y', opts.pkg || DEFAULT_PKG, 'mcp'];
@@ -178,6 +180,8 @@ interface ClientSpec {
   stdioType?: boolean;
   /** Codex is TOML, not JSON. */
   toml?: boolean;
+  /** Some workspace-local clients launch MCP from the editor process cwd. */
+  projectWorkspaceArg?: boolean;
 }
 
 function home(...p: string[]): string {
@@ -227,6 +231,7 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
       home('.gemini', 'antigravity-ide', 'mcp_config.json'),
     ],
     rootKey: 'mcpServers',
+    projectWorkspaceArg: true,
   },
   windsurf: {
     label: 'Windsurf',
@@ -485,7 +490,7 @@ function configureClient(
   const spec = CLIENTS[client];
   const useGlobal = opts.global || spec.projectPath === null;
   const rel = useGlobal ? spec.globalPath : spec.projectPath;
-  const projectLaunch = resolveLaunch(opts.workspace, opts, false);
+  const projectLaunch = resolveLaunch(opts.workspace, opts, !!spec.projectWorkspaceArg);
   const globalLaunch = resolveLaunch(opts.workspace, opts, true);
 
   const writeTarget = (target: string, targetIsGlobal: boolean): PlanEntry => {
@@ -538,7 +543,9 @@ function agentsBlock(): string {
     '   `seer_preflight { symbol }` before reading files.',
     '3. If you do not know the symbol, call `seer_search` first, then',
     '   `seer_definition` or `seer_file_symbols` on the best hit.',
-    '4. For changes already in the working tree, call `seer_preflight` with',
+    '4. For common method names, pass `file` to `seer_context`, `seer_callers`,',
+    '   or `seer_trace` callers so Seer uses the exact symbol definition.',
+    '5. For changes already in the working tree, call `seer_preflight` with',
     '   `fromRef`/`toRef` or the target symbol before summarizing impact.',
     '',
     'Common follow-ups:',
@@ -823,7 +830,7 @@ export function runUninstall(opts: UninstallOptions): UninstallResult {
 function refreshClient(client: ClientId, opts: UpdateOptions): PlanEntry[] {
   const spec = CLIENTS[client];
   const scope = opts.global ? 'global' : 'all';
-  const projectLaunch = resolveLaunch(opts.workspace, { ...opts, npx: true }, false);
+  const projectLaunch = resolveLaunch(opts.workspace, { ...opts, npx: true }, !!spec.projectWorkspaceArg);
   const globalLaunch = resolveLaunch(opts.workspace, { ...opts, npx: true }, true);
   const results: PlanEntry[] = [];
 
@@ -899,7 +906,7 @@ export function runUpdate(opts: UpdateOptions): InitResult {
   const launch = resolveLaunch(
     workspace,
     { ...opts, workspace, npx: true },
-    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null),
+    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null || CLIENTS[c].projectWorkspaceArg),
   );
 
   let agents: ContextFileResult | undefined;
@@ -942,7 +949,7 @@ export function runInit(opts: InitOptions): InitResult {
   const launch = resolveLaunch(
     workspace,
     { ...opts, workspace },
-    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null),
+    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null || CLIENTS[c].projectWorkspaceArg),
   );
 
   const entries = clients.flatMap((c) => configureClient(c, { ...opts, workspace }));

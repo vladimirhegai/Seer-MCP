@@ -31,7 +31,9 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_symbols` (`query?`, `top?`) BM25 search, or top symbols by PageRank.
 - `seer_definition` (`name`, `file?`) exact definition lookup.
 - `seer_file_symbols` (`file`) symbols in a file, in line order.
-- `seer_callers` / `seer_callees` (`symbol`) direct neighbors, with a true count.
+- `seer_callers` (`symbol`, `file?`) direct callers, with a true count. Use
+  `file` to disambiguate common or qualified method names.
+- `seer_callees` (`symbol`) direct callees.
 - `seer_search` (`query`) combined symbol + file-path search.
 - `seer_skeleton` (`file`, `focusSymbol?`) render a file as signatures only, with
   bodies collapsed to `{ ... N lines ... }`. Read a 2,000-line file for the cost
@@ -49,8 +51,8 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_behavior` (`symbol`) tests that exercise the symbol, ranked by how
   directly they hit it.
 - `seer_trace_path` (`from`, `to`) shortest call path between two symbols.
-- `seer_trace_callers` / `seer_trace_callees` (`symbol`, `maxDepth?`) transitive
-  reachability.
+- `seer_trace_callers` (`symbol`, `file?`, `maxDepth?`) transitive callers.
+- `seer_trace_callees` (`symbol`, `maxDepth?`) transitive callees.
 - `seer_detect_changes` (`fromRef?`, `toRef?`) blast radius for a diff.
 
 ## Modules and boundaries

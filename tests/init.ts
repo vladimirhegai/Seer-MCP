@@ -58,6 +58,8 @@ function main(): void {
 
     const ag = JSON.parse(fs.readFileSync(path.join(ws, '.agents', 'mcp_config.json'), 'utf8'));
     check(!!ag.mcpServers?.seer, '1.antigravity .agents/mcp_config.json has mcpServers.seer');
+    check(ag.mcpServers.seer.args.includes('--workspace') && ag.mcpServers.seer.args.includes(ws),
+      '1.antigravity workspace config pins workspace because IDE cwd can be outside repo', ag.mcpServers.seer.args);
 
     const toml = fs.readFileSync(path.join(ws, '.codex', 'config.toml'), 'utf8');
     check(/\[mcp_servers\.seer\]/.test(toml), '1.codex config.toml has [mcp_servers.seer]');
@@ -92,6 +94,10 @@ function main(): void {
       '6b.antigravity workspace config planned', files);
     check(!files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
       '6b.antigravity default does not plan user-level config', files);
+    const snippet = r.entries.find((e) => e.file.endsWith(path.join('.agents', 'mcp_config.json')))?.snippet ?? '';
+    const args = JSON.parse(snippet).mcpServers.seer.args as string[];
+    check(args.includes('--workspace') && args.includes(ws),
+      '6b.antigravity workspace config includes --workspace', args);
     check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
       '6b.--print does not write antigravity workspace config');
     fs.rmSync(ws, { recursive: true, force: true });

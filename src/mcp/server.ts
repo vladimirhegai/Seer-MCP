@@ -67,6 +67,7 @@ function mcpInstructions(): string {
     'Before editing code, call seer_health once and confirm the workspace.',
     'If you know the target symbol, call seer_context or seer_preflight before reading files.',
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
+    'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
     'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit.',
   ].join(' ');
@@ -469,27 +470,44 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'Direct callers of a symbol, bounded preview + true total.',
+      description: 'Direct callers of a symbol, bounded preview + true total. Pass file to disambiguate common names or qualified names such as Class.method.',
       inputSchema: {
         symbol: z.string(),
+        file: z.string().optional(),
         limit: z.number().int().positive().max(500).optional(),
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims the (already limit-bounded) caller list.'),
       },
-    }, async ({ symbol, limit, tokenBudget }) => {
+    }, async ({ symbol, file, limit, tokenBudget }) => {
       await this.ensureFresh();
-      const total = this.store.countCallers(symbol);
-      const items = this.store.findCallers(symbol, limit ?? 40).map(c => ({
+      const target = file ? this.store.getDefinition(symbol, { filePath: file })[0] : null;
+      if (file && !target) {
+        const didYouMean = this.suggestSymbols(symbol);
+        return this.text({ symbol, file, found: false, total: 0, returned: 0, items: [], source: 'tree-sitter',
+          reason: `no symbol "${symbol}" in ${file}`,
+          ...(didYouMean.length > 0 ? { didYouMean } : {}) });
+      }
+      const total = target ? this.store.countCallersById(target.id) : this.store.countCallers(symbol);
+      const rows = target
+        ? this.store.findCallersById(target.id, limit ?? 40)
+        : this.store.findCallers(symbol, limit ?? 40);
+      const items = rows.map(c => ({
         callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
         callerKind: c.callerKind, file: c.callerFile, line: c.callerLine,
         edgeKind: c.edgeKind,
       }));
       if (total === 0) {
         const didYouMean = this.suggestSymbols(symbol);
-        return this.text({ symbol, total: 0, returned: 0, items: [], source: 'tree-sitter',
+        return this.text({ symbol, file, target: target ? {
+          id: target.id, name: target.name, qualifiedName: target.qualifiedName,
+          kind: target.kind, file: target.filePath, lineStart: target.lineStart,
+        } : undefined, total: 0, returned: 0, items: [], source: 'tree-sitter',
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
-      return this.budgetedText({ symbol, total, source: 'tree-sitter' }, items, tokenBudget);
+      return this.budgetedText({ symbol, file, target: target ? {
+        id: target.id, name: target.name, qualifiedName: target.qualifiedName,
+        kind: target.kind, file: target.filePath, lineStart: target.lineStart,
+      } : undefined, total, source: 'tree-sitter' }, items, tokenBudget);
     });
 
     this.registerTool('seer_callees', {
@@ -914,23 +932,27 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_trace_callers', {
-      description: 'Bounded reverse-reachable callers of a symbol (transitive blast radius). Returns each caller with the BFS depth at which it was found.',
+      description: 'Bounded reverse-reachable callers of a symbol (transitive blast radius). Pass file to disambiguate common names or qualified names. Returns each caller with the BFS depth at which it was found.',
       inputSchema: {
         symbol: z.string(),
+        file: z.string().optional(),
         maxDepth: z.number().int().positive().max(8).optional(),
         maxNodes: z.number().int().positive().max(50000).optional(),
         limit: z.number().int().positive().max(500).optional(),
       },
-    }, async ({ symbol, maxDepth, maxNodes, limit }) => {
+    }, async ({ symbol, file, maxDepth, maxNodes, limit }) => {
       await this.ensureFresh();
-      const defs = this.store.getDefinition(symbol);
-      if (defs.length === 0) return this.text({ found: false, reason: `no symbol "${symbol}"` });
+      const defs = this.store.getDefinition(symbol, { filePath: file });
+      if (defs.length === 0) return this.text({
+        found: false,
+        reason: file ? `no symbol "${symbol}" in ${file}` : `no symbol "${symbol}"`,
+      });
       const target = defs[0];
       const hits = this.store.reverseReachableWithDepth(target.id, maxDepth ?? 4, maxNodes ?? 20000);
       const lim = Math.min(hits.length, limit ?? 100);
       const ids = hits.slice(0, lim).map(h => h.id);
       if (ids.length === 0) {
-        return this.text({ symbol: { id: target.id, name: target.name }, maxDepth: maxDepth ?? 4, total: 0, items: [] });
+        return this.text({ symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath }, maxDepth: maxDepth ?? 4, total: 0, items: [] });
       }
       const ph = ids.map(() => '?').join(',');
       const rows = (this.store as any).rawDb().prepare(`
@@ -951,7 +973,7 @@ export class SeerMcpServer {
       });
       items.sort((a, b) => a.depth - b.depth || b.pagerank - a.pagerank);
       return this.text({
-        symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName },
+        symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
         maxDepth: maxDepth ?? 4, total: hits.length, returned: items.length,
         items, source: 'tree-sitter',
       });
@@ -1657,7 +1679,7 @@ export class SeerMcpServer {
     this.registerTool('seer_trace', {
       description:
         'Unified graph-trace entry point. Set `scope` and pass the matching `args`:\n' +
-        '• callers {symbol, maxDepth?, maxNodes?, limit?} — transitive reverse callers (blast radius)\n' +
+        '• callers {symbol, file?, maxDepth?, maxNodes?, limit?} — transitive reverse callers (blast radius)\n' +
         '• callees {symbol, maxDepth?, maxNodes?, limit?} — transitive forward callees\n' +
         '• path {from, to, maxDepth?} — shortest call path A→B\n' +
         '• file {file, maxDepth?, maxNodes?} — import-graph closure from a file\n' +

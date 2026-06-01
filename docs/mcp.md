@@ -56,6 +56,9 @@ the repo:
 npx -y seer-mcp mcp --workspace C:/path/to/repo
 ```
 
+Antigravity workspace config also includes `--workspace` because the IDE may
+launch MCP from its own install directory.
+
 If `seer_health` shows your editor directory instead of your repo, rerun setup
 from the repo:
 
@@ -75,7 +78,7 @@ file. For Antigravity, that file is `.agents/mcp_config.json`.
 | VS Code native MCP / Copilot | `.vscode/mcp.json` | `servers.seer` | repo |
 | Codex | `.codex/config.toml` | `mcp_servers.seer` | repo |
 | Gemini CLI | `.gemini/settings.json` | `mcpServers.seer` | repo |
-| Antigravity workspace | `.agents/mcp_config.json` | `mcpServers.seer` | repo |
+| Antigravity workspace | `.agents/mcp_config.json` | `mcpServers.seer` | repo, pinned |
 | Antigravity user with `--global` | `~/.gemini/antigravity/mcp_config.json` | `mcpServers.seer` | user |
 | Antigravity compatibility with `--global` | `~/.gemini/antigravity-cli/mcp_config.json`, `~/.gemini/config/mcp_config.json`, `~/.gemini/antigravity-ide/mcp_config.json` | `mcpServers.seer` | user |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers.seer` | user |
@@ -100,6 +103,19 @@ Repo-local JSON clients:
     "seer": {
       "command": "npx",
       "args": ["-y", "seer-mcp", "mcp"]
+    }
+  }
+}
+```
+
+Antigravity workspace JSON:
+
+```json
+{
+  "mcpServers": {
+    "seer": {
+      "command": "npx",
+      "args": ["-y", "seer-mcp", "mcp", "--workspace", "C:/path/to/repo"]
     }
   }
 }
@@ -141,7 +157,8 @@ args = ["-y", "seer-mcp", "mcp"]
 ```
 
 Add `--workspace <repo>` to `args` whenever the config is user-level. Do not
-add it to repo-local config unless the client requires it.
+add it to repo-local config unless the client requires it. Antigravity requires
+it.
 
 Codex fallback:
 

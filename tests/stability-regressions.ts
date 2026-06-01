@@ -242,13 +242,55 @@ function globalNpxLaunchersCarryWorkspace(): void {
 
     const ag = runInit({ workspace: ws, clients: ['antigravity'], npx: true, print: true });
     const projectEntry = ag.entries.find(e => e.file.endsWith(path.join('.agents', 'mcp_config.json')));
+    const projectArgs = JSON.parse(projectEntry?.snippet ?? '{}').mcpServers?.seer?.args as string[] | undefined;
     const agGlobal = runInit({ workspace: ws, clients: ['antigravity'], npx: true, global: true, print: true });
     const globalEntries = agGlobal.entries.filter(e => path.isAbsolute(e.file) && !e.file.startsWith(ws));
-    check(Boolean(projectEntry && !(projectEntry.snippet ?? '').includes('--workspace')), 'Antigravity default stays workspace-local and portable', projectEntry?.snippet);
+    check(Boolean(projectArgs?.includes('--workspace') && projectArgs.includes(ws)),
+      'Antigravity workspace-local entry pins workspace because IDE cwd can be outside repo', projectArgs);
     check(globalEntries.every(e => (e.snippet ?? '').includes('--workspace')), 'Antigravity --global entries pin workspace', globalEntries.map(e => e.snippet));
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
   }
+}
+
+async function callersFileDisambiguation(): Promise<void> {
+  console.log('\n-- callers --file disambiguation --');
+  await withIndexedRepo('callers-file', root => {
+    write(path.join(root, 'src', 'alpha.ts'), [
+      'export class Alpha {',
+      '  run(): number { return 1; }',
+      '}',
+      'export function alphaOnly(): number {',
+      '  const a = new Alpha();',
+      '  return a.run();',
+      '}',
+      '',
+    ].join('\n'));
+    write(path.join(root, 'src', 'beta.ts'), [
+      'export class Beta {',
+      '  run(): number { return 2; }',
+      '}',
+      'export function betaOnly(): number {',
+      '  const b = new Beta();',
+      '  return b.run();',
+      '}',
+      '',
+    ].join('\n'));
+  }, async (root) => {
+    const cli = path.join(__dirname, '..', 'dist', 'cli', 'index.js');
+    const db = path.join(root, '.seer', 'graph.db');
+    const broad = spawnSync(process.execPath, [cli, 'callers', 'run', '--db', db, '--limit', '20'], {
+      encoding: 'utf8',
+    });
+    check(broad.status === 0 && broad.stdout.includes('alphaOnly') && broad.stdout.includes('betaOnly'),
+      'name-only callers remain broad for shared short method names', broad.stderr || broad.stdout);
+
+    const scoped = spawnSync(process.execPath, [
+      cli, 'callers', 'Alpha.run', '--file', 'src/alpha.ts', '--db', db, '--limit', '20',
+    ], { encoding: 'utf8' });
+    check(scoped.status === 0 && scoped.stdout.includes('alphaOnly') && !scoped.stdout.includes('betaOnly'),
+      'callers --file resolves qualified name to the exact symbol id', scoped.stderr || scoped.stdout);
+  });
 }
 
 async function run(): Promise<void> {
@@ -261,6 +303,7 @@ async function run(): Promise<void> {
   await skeletonLineMath();
   await deepCliDbLookup();
   globalNpxLaunchersCarryWorkspace();
+  await callersFileDisambiguation();
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);

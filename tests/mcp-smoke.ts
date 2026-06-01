@@ -32,6 +32,26 @@ async function main(): Promise<void> {
   for (const f of fs.readdirSync(FIXTURES)) {
     fs.copyFileSync(path.join(FIXTURES, f), path.join(TMP_WS, f));
   }
+  fs.writeFileSync(path.join(TMP_WS, 'alpha.ts'), [
+    'export class Alpha {',
+    '  run(): number { return 1; }',
+    '}',
+    'export function alphaOnly(): number {',
+    '  const a = new Alpha();',
+    '  return a.run();',
+    '}',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(TMP_WS, 'beta.ts'), [
+    'export class Beta {',
+    '  run(): number { return 2; }',
+    '}',
+    'export function betaOnly(): number {',
+    '  const b = new Beta();',
+    '  return b.run();',
+    '}',
+    '',
+  ].join('\n'));
   console.log(`  Workspace: ${TMP_WS}`);
 
   // Spawn the MCP server. Disable JIT/watcher for deterministic tests.
@@ -146,6 +166,26 @@ async function main(): Promise<void> {
   const callersParsed = JSON.parse(callers.result?.content?.[0]?.text ?? '{}');
   if (callersParsed.total >= 1) ok(`seer_callers(AuthService) total=${callersParsed.total}`);
   else bad('seer_callers(AuthService) no callers', callersParsed);
+
+  const exactCallers = await call('tools/call', {
+    name: 'seer_callers',
+    arguments: { symbol: 'Alpha.run', file: 'alpha.ts' },
+  });
+  const exactCallersParsed = JSON.parse(exactCallers.result?.content?.[0]?.text ?? '{}');
+  const exactNames = (exactCallersParsed.items ?? []).map((i: any) => i.callerName);
+  if (exactCallersParsed.total === 1 && exactNames.includes('alphaOnly') && !exactNames.includes('betaOnly')) {
+    ok('seer_callers with file disambiguates qualified method names');
+  } else bad('seer_callers with file leaked or missed callers', exactCallersParsed);
+
+  const exactTrace = await call('tools/call', {
+    name: 'seer_trace_callers',
+    arguments: { symbol: 'Alpha.run', file: 'alpha.ts', maxDepth: 2 },
+  });
+  const exactTraceParsed = JSON.parse(exactTrace.result?.content?.[0]?.text ?? '{}');
+  const traceNames = (exactTraceParsed.items ?? []).map((i: any) => i.name);
+  if (exactTraceParsed.total === 1 && traceNames.includes('alphaOnly') && !traceNames.includes('betaOnly')) {
+    ok('seer_trace_callers with file disambiguates qualified method names');
+  } else bad('seer_trace_callers with file leaked or missed callers', exactTraceParsed);
 
   // seer_callees
   const callees = await call('tools/call', { name: 'seer_callees', arguments: { symbol: 'process_payment' } });

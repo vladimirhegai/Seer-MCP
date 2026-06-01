@@ -64,12 +64,12 @@ references are hidden. Opt in with the `--include-*` flags.
 ## Call graph
 
 ```bash
-seer callers <symbol> [--limit n]    # who calls this (name-based, broad)
+seer callers <symbol> [--file path] [--limit n]  # who calls this
 seer callees <symbol> [--limit n]    # what this calls
 ```
 
-For precise, id-scoped call graphs, prefer `seer preflight` / `seer context`,
-which resolve to exact symbol IDs.
+Without `--file`, callers is intentionally broad for shared short names. Use
+`--file` for exact, id-scoped callers of a common or qualified method name.
 
 ---
 

@@ -143,7 +143,7 @@ This is the normal flow for:
 
 | Client | Default Seer scope |
 |---|---|
-| Antigravity IDE / CLI | Workspace-local `.agents/mcp_config.json` |
+| Antigravity IDE / CLI | Workspace-local `.agents/mcp_config.json`, pinned with `--workspace` |
 | Claude Code CLI | Workspace-local `.mcp.json` |
 | Cursor | Workspace-local `.cursor/mcp.json` |
 | VS Code native MCP / Copilot | Workspace-local `.vscode/mcp.json` |
@@ -160,6 +160,10 @@ npx seer-mcp init --client windsurf --force
 
 If a user-level entry points to the wrong repo, `seer_health` will show it.
 Re-run the explicit command from the repo you want active.
+
+Antigravity's config is still stored in the repo, but Seer pins `--workspace`
+inside that file because the IDE can launch MCP from the Antigravity install
+directory instead of the repo.
 
 ## Update
 
@@ -220,25 +224,33 @@ Useful uninstall flags:
 
 ## Common Fixes
 
-### ➡️ **Wrong workspace in `seer_health`**
+### Wrong Workspace
 
 ```bash
 npx seer-mcp init --auto --force
 ```
 
-### ➡️ **First query is slow**
+### Noisy Callers
+
+```bash
+npx seer-mcp callers Node.add_child --file scene/main/node.cpp
+```
+
+In MCP, pass the same `file` field to `seer_callers` or `seer_trace` callers.
+
+### First Query Is Slow
 
 ```bash
 npx seer-mcp index .
 ```
 
-### ➡️ **Need to see exactly what would change**
+### Preview Changes
 
 ```bash
 npx seer-mcp init --auto --print
 ```
 
-### ➡️ **Codex does not show Seer**
+### Codex Does Not Show Seer
 
 ```bash
 npx seer-mcp init --client codex --global --force
@@ -247,7 +259,7 @@ npx seer-mcp init --client codex --global --force
 Some Codex versions only load project-local `.codex/config.toml` for trusted
 projects. The global fallback uses `~/.codex/config.toml`.
 
-### ➡️ **Antigravity IDE does not show Seer**
+### Antigravity IDE Does Not Show Seer
 
 ```bash
 npx seer-mcp init --client antigravity --global --force

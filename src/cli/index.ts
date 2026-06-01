@@ -9,7 +9,7 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.10';
+const VERSION = '0.1.11';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
@@ -307,19 +307,26 @@ program
   .command('callers <symbol>')
   .description('Find all callers of a symbol')
   .option('--db <path>', 'Database path')
+  .option('--file <path>', 'Disambiguate the target symbol by definition file')
   .option('-n, --limit <n>', 'Max results', '40')
   // Callers query is keyed by `edges.to_name`, not by symbol_role / vendor /
   // test flags. The include-* options are accepted for surface consistency
   // with the rest of the CLI but don't currently change results.
-  .action((symbol: string, opts: { db?: string; limit: string }) => {
+  .action((symbol: string, opts: { db?: string; file?: string; limit: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
     try {
-      const total = store.countCallers(symbol);
+      const target = opts.file ? store.getDefinition(symbol, { filePath: opts.file })[0] : null;
+      if (opts.file && !target) {
+        console.log(`No symbol "${symbol}" found in ${opts.file}`);
+        return;
+      }
+      const total = target ? store.countCallersById(target.id) : store.countCallers(symbol);
       if (total === 0) { console.log(`No callers found for "${symbol}"`); return; }
       const limit = Math.max(1, parseInt(opts.limit, 10) || 40);
-      const callers = store.findCallers(symbol, limit);
-      console.log(`\nCallers of '${symbol}'  (${total} found)\n`);
+      const callers = target ? store.findCallersById(target.id, limit) : store.findCallers(symbol, limit);
+      const label = target ? `${target.qualifiedName ?? target.name} in ${target.filePath}` : symbol;
+      console.log(`\nCallers of '${label}'  (${total} found)\n`);
       for (const c of callers) {
         const loc = `${c.callerFile}:${c.callerLine + 1}`;
         console.log(`  ${c.callerName.padEnd(32)} ${c.callerKind.padEnd(12)} ${loc}`);
