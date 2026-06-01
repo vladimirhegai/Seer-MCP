@@ -7,8 +7,8 @@
   "type": "commonjs",
   "main": "dist/cli/index.js",
   "bin": {
-    "seer": "./dist/cli/index.js",
-    "seer-mcp": "./dist/cli/index.js"
+    "seer": "dist/cli/index.js",
+    "seer-mcp": "dist/cli/index.js"
   },
   "engines": {
     "node": ">=24"
