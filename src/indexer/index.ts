@@ -234,7 +234,34 @@ class ByteSemaphore {
 export class Indexer {
   constructor(private store: Store) {}
 
+  /**
+   * Serializes index passes. The MCP server shares ONE Indexer (and one
+   * SQLite connection) between the background watcher and the per-query JIT
+   * freshness pass. If those two ever ran `indexDirectory` concurrently they
+   * would interleave `BEGIN`/`COMMIT` on the same connection — node:sqlite
+   * would throw "cannot start a transaction within a transaction", or worse,
+   * one pass would commit the other's half-written batch. We funnel every
+   * call through this promise chain so at most one index pass is ever in
+   * flight; the second caller simply awaits the first, then runs.
+   */
+  private indexChain: Promise<unknown> = Promise.resolve();
+
   async indexDirectory(
+    repoRoot: string,
+    options: IndexOptions = {},
+  ): Promise<IndexResult> {
+    // Queue behind any in-flight pass (ignoring its outcome — each pass is
+    // independent and reports its own errors), then become the in-flight pass.
+    const run = this.indexChain
+      .catch(() => { /* prior pass's failure is its own caller's problem */ })
+      .then(() => this.indexDirectoryImpl(repoRoot, options));
+    // Keep the chain alive even if this run rejects, so a failure doesn't wedge
+    // every future pass.
+    this.indexChain = run.catch(() => { /* swallow for the chain only */ });
+    return run;
+  }
+
+  private async indexDirectoryImpl(
     repoRoot: string,
     options: IndexOptions = {},
   ): Promise<IndexResult> {

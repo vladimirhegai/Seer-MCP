@@ -64,7 +64,7 @@ app.get('/api/get', getHandler);
   proc.stderr.on('data', d => process.stderr.write(`[mcp-stderr] ${d}`));
 
   let buf = '';
-  const pending = new Map<number, (msg: any) => void>();
+  const pending = new Map<number, { resolve: (msg: any) => void; timer: NodeJS.Timeout }>();
   proc.stdout.on('data', (chunk: Buffer) => {
     buf += chunk.toString('utf8');
     let nl: number;
@@ -74,9 +74,11 @@ app.get('/api/get', getHandler);
       if (!line) continue;
       let msg: any;
       try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id != null && pending.has(msg.id)) {
-        pending.get(msg.id)!(msg);
+      const pendingCall = msg.id != null ? pending.get(msg.id) : undefined;
+      if (pendingCall) {
+        clearTimeout(pendingCall.timer);
         pending.delete(msg.id);
+        pendingCall.resolve(msg);
       }
     }
   });
@@ -85,11 +87,11 @@ app.get('/api/get', getHandler);
   const call = (method: string, params: any): Promise<any> => {
     const id = nextId++;
     return new Promise((resolve, reject) => {
-      pending.set(id, resolve);
-      proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (pending.has(id)) { pending.delete(id); reject(new Error(`timeout ${method}`)); }
       }, 60_000);
+      pending.set(id, { resolve, timer });
+      proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   };
 

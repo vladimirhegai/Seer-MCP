@@ -52,8 +52,13 @@ export async function scanProtoFiles(
   const entries = await glob(['**/*.proto'], {
     cwd: absRoot,
     ignore: [
-      'node_modules/**', '.git/**', 'dist/**', 'build/**', 'out/**',
-      'vendor/**', '**/vendor/**', '**/__pycache__/**', '.next/**',
+      'node_modules/**', '**/node_modules/**',
+      '.git/**', '**/.git/**',
+      'dist/**', '**/dist/**',
+      'build/**', '**/build/**',
+      'out/**', '**/out/**',
+      'vendor/**', '**/vendor/**', '**/__pycache__/**',
+      '.next/**', '**/.next/**',
     ],
     onlyFiles: true, followSymbolicLinks: false, dot: false,
   });

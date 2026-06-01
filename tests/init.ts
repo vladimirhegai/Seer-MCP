@@ -1,10 +1,10 @@
 /**
  * Tests for `seer init` — the cross-agent MCP installer.
  *
- * These exercise only the project-local clients (claude, cursor, vscode,
- * codex, gemini), which write inside a throwaway workspace. We never touch the
- * user-level clients (antigravity) here, so the test cannot scribble on a real
- * home config.
+ * Most cases exercise project-local clients (claude, cursor, vscode, codex,
+ * gemini), which write inside a throwaway workspace. User-level-only clients
+ * are covered through --print plans so the test cannot scribble on a real home
+ * config.
  *
  * Run: npx tsx tests/init.ts
  */
@@ -65,6 +65,53 @@ function main(): void {
       '1.AGENTS.md written with seer markers');
     check(agents.includes('seer_preflight'), '1.AGENTS.md mentions seer_preflight workflow');
 
+    // gemini is in PROJECT_CLIENTS, so a GEMINI.md mirror must be written too.
+    check(fs.existsSync(path.join(ws, 'GEMINI.md')), '1.GEMINI.md mirror written for gemini client');
+    const gem = fs.existsSync(path.join(ws, 'GEMINI.md')) ? fs.readFileSync(path.join(ws, 'GEMINI.md'), 'utf8') : '';
+    check(gem.includes('<!-- seer:begin -->') && gem.includes('seer_preflight'),
+      '1.GEMINI.md carries the managed seer block');
+
+    check(fs.existsSync(path.join(ws, 'CLAUDE.md')), '1.CLAUDE.md written for claude client');
+    const claudeMd = fs.existsSync(path.join(ws, 'CLAUDE.md')) ? fs.readFileSync(path.join(ws, 'CLAUDE.md'), 'utf8') : '';
+    check(claudeMd.includes('@AGENTS.md') && claudeMd.includes('<!-- seer:begin -->'),
+      '1.CLAUDE.md imports AGENTS.md inside managed block');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('user-level-print');
+    const r = runInit({ workspace: ws, clients: ['antigravity', 'windsurf'], print: true });
+    const files = r.entries.map((e) => e.file.replace(/\\/g, '/'));
+    check(files.some((f) => f.endsWith('/.gemini/antigravity/mcp_config.json')),
+      '6b.antigravity current IDE config planned', files);
+    check(files.some((f) => f.endsWith('/.gemini/antigravity-cli/mcp_config.json')),
+      '6b.antigravity CLI config planned', files);
+    check(files.some((f) => f.endsWith('/.agents/mcp_config.json')),
+      '6b.antigravity workspace config planned', files);
+    check(files.some((f) => f.endsWith('/.codeium/windsurf/mcp_config.json')),
+      '6b.windsurf config planned', files);
+    check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
+      '6b.--print does not write antigravity workspace config');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 1b. No Gemini-family client ⇒ no GEMINI.md ────────────────────────────
+  {
+    const ws = freshWs('nogemini');
+    runInit({ workspace: ws, clients: ['claude', 'cursor'] });
+    check(fs.existsSync(path.join(ws, 'AGENTS.md')), '1b.AGENTS.md still written');
+    check(!fs.existsSync(path.join(ws, 'GEMINI.md')), '1b.no GEMINI.md when no gemini/antigravity client');
+    check(fs.existsSync(path.join(ws, 'CLAUDE.md')), '1b.CLAUDE.md written when claude client is present');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 1c. No Claude client ⇒ no CLAUDE.md ───────────────────────────────────
+  {
+    const ws = freshWs('noclaude');
+    runInit({ workspace: ws, clients: ['cursor', 'gemini'] });
+    check(fs.existsSync(path.join(ws, 'AGENTS.md')), '1c.AGENTS.md still written');
+    check(!fs.existsSync(path.join(ws, 'CLAUDE.md')), '1c.no CLAUDE.md when no claude client');
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
@@ -120,6 +167,8 @@ function main(): void {
     const r = runInit({ workspace: ws, clients: PROJECT_CLIENTS, print: true });
     check(!fs.existsSync(path.join(ws, '.mcp.json')), '6.--print does not write .mcp.json');
     check(!fs.existsSync(path.join(ws, 'AGENTS.md')), '6.--print does not write AGENTS.md');
+    check(!fs.existsSync(path.join(ws, 'CLAUDE.md')), '6.--print does not write CLAUDE.md');
+    check(!fs.existsSync(path.join(ws, 'GEMINI.md')), '6.--print does not write GEMINI.md');
     check(r.entries.length === PROJECT_CLIENTS.length, '6.--print still returns a full plan');
     check(r.entries.every((e) => !!e.snippet), '6.--print plan carries snippets to preview');
     fs.rmSync(ws, { recursive: true, force: true });
@@ -131,6 +180,7 @@ function main(): void {
     const r = runInit({ workspace: ws, clients: ['claude'], agents: false });
     check(r.agents === undefined, '7.--no-agents returns no agents plan');
     check(!fs.existsSync(path.join(ws, 'AGENTS.md')), '7.--no-agents writes no AGENTS.md');
+    check(!fs.existsSync(path.join(ws, 'CLAUDE.md')), '7.--no-agents writes no CLAUDE.md');
     fs.rmSync(ws, { recursive: true, force: true });
   }
 

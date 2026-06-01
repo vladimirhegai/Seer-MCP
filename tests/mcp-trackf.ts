@@ -41,7 +41,7 @@ async function main(): Promise<void> {
   proc.stderr.on('data', (d) => process.stderr.write(`[mcp-stderr] ${d}`));
 
   let buf = '';
-  const pending = new Map<number, (msg: any) => void>();
+  const pending = new Map<number, { resolve: (msg: any) => void; timer: NodeJS.Timeout }>();
   proc.stdout.on('data', (chunk: Buffer) => {
     buf += chunk.toString('utf8');
     let nl: number;
@@ -51,9 +51,11 @@ async function main(): Promise<void> {
       if (!line) continue;
       let msg: any;
       try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id != null && pending.has(msg.id)) {
-        pending.get(msg.id)!(msg);
+      const pendingCall = msg.id != null ? pending.get(msg.id) : undefined;
+      if (pendingCall) {
+        clearTimeout(pendingCall.timer);
         pending.delete(msg.id);
+        pendingCall.resolve(msg);
       }
     }
   });
@@ -62,11 +64,11 @@ async function main(): Promise<void> {
   const call = (method: string, params: any): Promise<any> => {
     const id = nextId++;
     return new Promise((resolve, reject) => {
-      pending.set(id, resolve);
-      proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (pending.has(id)) { pending.delete(id); reject(new Error(`timeout ${method}`)); }
       }, 30_000);
+      pending.set(id, { resolve, timer });
+      proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
   };
 
@@ -251,7 +253,7 @@ async function main(): Promise<void> {
     proc2.stderr.on('data', (d) => process.stderr.write(`[mcp2-stderr] ${d}`));
 
     let buf2 = '';
-    const pending2 = new Map<number, (msg: any) => void>();
+    const pending2 = new Map<number, { resolve: (msg: any) => void; timer: NodeJS.Timeout }>();
     proc2.stdout.on('data', (chunk: Buffer) => {
       buf2 += chunk.toString('utf8');
       let nl: number;
@@ -261,9 +263,11 @@ async function main(): Promise<void> {
         if (!line) continue;
         let msg: any;
         try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.id != null && pending2.has(msg.id)) {
-          pending2.get(msg.id)!(msg);
+        const pendingCall = msg.id != null ? pending2.get(msg.id) : undefined;
+        if (pendingCall) {
+          clearTimeout(pendingCall.timer);
           pending2.delete(msg.id);
+          pendingCall.resolve(msg);
         }
       }
     });
@@ -271,9 +275,11 @@ async function main(): Promise<void> {
     const call2 = (method: string, params: any): Promise<any> => {
       const id = id2++;
       return new Promise((resolve, reject) => {
-        pending2.set(id, resolve);
+        const timer = setTimeout(() => {
+          if (pending2.has(id)) { pending2.delete(id); reject(new Error(`timeout ${method}`)); }
+        }, 30_000);
+        pending2.set(id, { resolve, timer });
         proc2.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-        setTimeout(() => { if (pending2.has(id)) { pending2.delete(id); reject(new Error(`timeout ${method}`)); } }, 30_000);
       });
     };
     let init2Ok = false;

@@ -65,8 +65,9 @@ history, the monorepo boundaries, and the rename/move continuity all have their
 own suites with concrete expected values.
 
 **Install.** Confirms `seer init` writes valid, mergeable config for Claude
-Code, Cursor, VS Code, Codex, and Gemini, that re-running is safe, and that it
-never clobbers your existing settings.
+Code, Cursor, VS Code, Codex, Gemini, Antigravity, and Windsurf, writes the
+right guidance files, that re-running is safe, and that it never clobbers your
+existing settings.
 
 **Regressions.** Every real bug found, including during the pre-release stress
 pass, is pinned with a test in `tests/bug-regressions.ts`, so it cannot quietly

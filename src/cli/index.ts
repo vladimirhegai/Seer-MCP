@@ -9,9 +9,9 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, ClientId } from './init.js';
 
-const VERSION = '0.1.5';
+const VERSION = '0.1.6';
 
-const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity'];
+const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
 function resolveDb(repoPath: string, customDb?: string): string {
   if (customDb) return path.resolve(customDb);
@@ -109,14 +109,14 @@ program
 
 program
   .command('init [workspace]')
-  .description('Wire Seer in as an MCP server for your AI agents and write an AGENTS.md usage guide')
+  .description('Wire Seer in as an MCP server for your AI agents and write guidance files')
   .option('--db <path>', 'Custom database path passed through to the MCP launcher')
-  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,all (default: claude,cursor,vscode,codex,gemini)')
+  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (default: claude,cursor,vscode,codex,gemini)')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
   .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-mcp')
   .option('--command <cmd>', 'Override the launch command entirely (advanced)')
-  .option('--no-agents', 'Do not write the AGENTS.md guidance block')
+  .option('--no-agents', 'Do not write agent guidance files')
   .option('--print', 'Print the plan without writing any files')
   .option('--force', 'Overwrite an existing seer entry / agents block')
   .action((workspace: string | undefined, opts: {
@@ -169,7 +169,10 @@ program
       }
     }
     if (result.agents) {
-      console.log(`  ${mark[result.agents.action] ?? result.agents.action}  ${'AGENTS.md (agent guide)'.padEnd(28)} ${result.agents.file}`);
+      console.log(`  ${mark[result.agents.action] ?? result.agents.action}  ${result.agents.label.padEnd(28)} ${result.agents.file}`);
+    }
+    for (const cf of result.contextFiles ?? []) {
+      console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(28)} ${cf.file}`);
     }
 
     console.log(`\n  Next:`);

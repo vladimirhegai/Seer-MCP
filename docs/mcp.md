@@ -15,10 +15,10 @@ From inside the repo you want indexed:
 npx seer-mcp init
 ```
 
-This writes a project-local MCP config for Claude Code, Cursor, VS Code, Codex,
-and Gemini, and drops an `AGENTS.md` guidance block so the agent knows Seer
-exists and when to call it. It is idempotent: run it again and it leaves
-existing entries alone unless you pass `--force`.
+This writes project-local MCP config for Claude Code, Cursor, VS Code, Codex,
+and Gemini, then drops the agent guidance files each client actually reads:
+`AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` as needed. It is idempotent: run it
+again and it leaves existing entries alone unless you pass `--force`.
 
 (If you installed Seer globally with `npm install -g seer-mcp`, the command is
 just `seer init`. From a source checkout it is `node dist/cli/index.js init`.)
@@ -27,14 +27,14 @@ just `seer init`. From a source checkout it is `node dist/cli/index.js init`.)
 
 | Flag | What it does |
 |---|---|
-| `--client <names>` | Comma-separated subset: `claude,cursor,vscode,codex,gemini,antigravity`, or `all`. |
+| `--client <names>` | Comma-separated subset: `claude,cursor,vscode,codex,gemini,antigravity,windsurf`, or `all`. |
 | `--global` | Write the user-level config instead of the project-local one. |
 | `--npx` | Emit a portable `npx -y seer-mcp mcp` launcher (no machine paths). |
 | `--pkg <name>` | Package name for the `--npx` launcher (default `seer-mcp`). |
 | `--command <cmd>` | Override the launch command entirely (advanced). |
-| `--no-agents` | Do not write `AGENTS.md`. |
+| `--no-agents` | Do not write agent guidance files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`). |
 | `--print` | Show the plan and the exact snippets without writing anything. |
-| `--force` | Overwrite an existing `seer` entry / `AGENTS.md` block. |
+| `--force` | Overwrite an existing `seer` entry / managed guidance block. |
 | `--db <path>` | Use a custom database path in the launcher. |
 
 ### What the launcher looks like
@@ -71,6 +71,8 @@ the `npx` form.
 ### Claude Code
 
 Project-local: `.mcp.json` at the repo root. User-level: `~/.claude.json`.
+Claude Code project instructions are read from `CLAUDE.md`, so `seer init`
+also creates a managed `CLAUDE.md` block that imports `AGENTS.md`.
 
 ```json
 {
@@ -140,10 +142,26 @@ Project-local: `.gemini/settings.json`. User-level: `~/.gemini/settings.json`.
 
 ### Google Antigravity
 
-User-level only, shared across the Antigravity IDE and CLI:
-`~/.gemini/antigravity-ide/mcp_config.json`. Uses the `mcpServers` key. Because there is
-no project-local file, `seer init` only touches this one when you ask for it
-(`--client antigravity` or `--client all`).
+Antigravity uses dedicated MCP config files with the `mcpServers` key.
+`seer init --client antigravity` writes the current editor path
+`~/.gemini/antigravity/mcp_config.json`, the CLI path
+`~/.gemini/antigravity-cli/mcp_config.json`, the workspace path
+`.agents/mcp_config.json`, and legacy compatibility paths used by older
+Antigravity/Gemini migrations. Because several of these are user-level files,
+Antigravity is opt-in (`--client antigravity` or `--client all`).
+
+```json
+{
+  "mcpServers": {
+    "seer": { "command": "npx", "args": ["-y", "seer-mcp", "mcp"] }
+  }
+}
+```
+
+### Windsurf
+
+User-level: `~/.codeium/windsurf/mcp_config.json`. Uses the `mcpServers` key.
+Windsurf is also opt-in because it does not have a project-local MCP file.
 
 ```json
 {
@@ -165,7 +183,10 @@ config as their command-line sibling. You do not configure them separately.
 - The **Codex** IDE extension reads the same `~/.codex/config.toml` as the Codex
   CLI. The `codex` entry covers both.
 - The **Gemini** CLI and Gemini Code Assist share `.gemini/settings.json`.
-- **Antigravity**'s IDE and CLI share `~/.gemini/antigravity-ide/mcp_config.json`.
+- **Antigravity** has split editor, CLI, and workspace MCP files; the
+  `antigravity` entry writes all supported locations Seer knows about.
+- **Windsurf** Cascade reads `~/.codeium/windsurf/mcp_config.json`; the
+  `windsurf` entry covers it.
 - The separate **VS Code** entry (`.vscode/mcp.json`, `servers` key) is for
   VS Code's own native MCP and GitHub Copilot's agent mode, which is a different
   consumer from the Claude/Codex extensions above.
@@ -180,8 +201,11 @@ writes all of them, so whichever surface you switch to is already set up.
 
 Configuring the server is half the job. The other half is making sure the agent
 actually reaches for it instead of grepping. `seer init` writes an `AGENTS.md`
-block (the cross-agent convention that Codex, Cursor, Gemini, and Claude Code
-all read) describing what Seer is and the recommended workflow:
+block for agents that read it (Codex, Cursor, Windsurf, and recent
+Antigravity), a `CLAUDE.md` import for Claude Code, and a `GEMINI.md` mirror
+for Gemini-family clients. The MCP server also sends concise Seer usage
+instructions during `initialize`, so clients that surface server instructions
+get the same nudge even before reading repo files:
 
 1. `seer_health` to confirm the index is live.
 2. `seer_architecture` or `seer_boundaries` to orient.
@@ -190,8 +214,9 @@ all read) describing what Seer is and the recommended workflow:
 5. `seer_behavior` / `seer_history` for tests and blame.
 6. `seer_skeleton { file }` to read a big file cheaply.
 
-The block is wrapped in `<!-- seer:begin -->` / `<!-- seer:end -->` markers so a
-re-run updates it cleanly without clobbering the rest of your `AGENTS.md`.
+The managed block is wrapped in `<!-- seer:begin -->` / `<!-- seer:end -->`
+markers so a re-run updates it cleanly without clobbering the rest of your
+existing instruction files.
 
 ---
 

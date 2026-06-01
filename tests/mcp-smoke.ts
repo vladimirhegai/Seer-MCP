@@ -42,7 +42,7 @@ async function main(): Promise<void> {
 
   // Buffer responses and dispatch by id.
   let buf = '';
-  const pending = new Map<number, (msg: any) => void>();
+  const pending = new Map<number, { resolve: (msg: any) => void; timer: NodeJS.Timeout }>();
   proc.stdout.on('data', (chunk: Buffer) => {
     buf += chunk.toString('utf8');
     let nl: number;
@@ -52,9 +52,11 @@ async function main(): Promise<void> {
       if (!line) continue;
       let msg: any;
       try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id != null && pending.has(msg.id)) {
-        pending.get(msg.id)!(msg);
+      const pendingCall = msg.id != null ? pending.get(msg.id) : undefined;
+      if (pendingCall) {
+        clearTimeout(pendingCall.timer);
         pending.delete(msg.id);
+        pendingCall.resolve(msg);
       }
     }
   });
@@ -63,12 +65,12 @@ async function main(): Promise<void> {
   function call(method: string, params: any): Promise<any> {
     const id = nextId++;
     return new Promise((resolve, reject) => {
-      pending.set(id, resolve);
-      const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
-      proc.stdin.write(msg);
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (pending.has(id)) { pending.delete(id); reject(new Error(`timeout: ${method}`)); }
       }, 30_000);
+      pending.set(id, { resolve, timer });
+      const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+      proc.stdin.write(msg);
     });
   }
 
@@ -82,7 +84,12 @@ async function main(): Promise<void> {
         capabilities: {},
         clientInfo: { name: 'mcp-smoke', version: '0.1.0' },
       });
-      if (r.result) { initOk = true; break; }
+      if (r.result) {
+        initOk = true;
+        if (r.result.instructions?.includes('seer_preflight')) ok('initialize advertises Seer workflow instructions');
+        else bad('initialize missing Seer workflow instructions', r.result);
+        break;
+      }
     } catch { /* not ready */ }
     await new Promise(r => setTimeout(r, 500));
   }

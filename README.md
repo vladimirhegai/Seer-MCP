@@ -44,12 +44,12 @@ One command, from inside the repo you want indexed (needs Node 24+):
 npx seer-mcp init
 ```
 
-If you use **Google Antigravity** (Standard Gemini + Claude & Codex extensions), run this instead:
+If you use **Google Antigravity** or **Windsurf** (user-level MCP config), run this instead:
 ```bash
-npx seer-mcp init --client claude,codex,gemini,antigravity
+npx seer-mcp init --client all
 ```
 
-Reload your agent/extensions and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.)
+Reload your agent/extensions and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.) The init command also writes the agent guidance files each tool reads, including `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` where applicable.
 
 Seer indexes your workspace automatically on the first query.
 

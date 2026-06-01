@@ -267,6 +267,16 @@ export class Store {
       this.db.exec(SCHEMA_SQL);
       try { this.db.exec(`PRAGMA busy_timeout = ${busyMs};`); }
       catch { /* best effort */ }
+      // WAL gives us concurrent readers alongside the single writer (so a CLI
+      // `seer symbols` against a DB the MCP server holds open no longer blocks),
+      // and replaces the per-commit rollback-journal fsync with a much cheaper
+      // append. On Windows in particular the rollback journal + antivirus file
+      // scanning made every batched commit expensive; WAL removes that cost.
+      // `synchronous=NORMAL` is the WAL-recommended setting: durable across
+      // application crashes, only at risk on OS/power loss, which for a
+      // rebuildable code index is an acceptable trade for the speed.
+      try { this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;'); }
+      catch { /* best effort — falls back to the default rollback journal */ }
       this.runMigrations();
       this.prepare();
     }

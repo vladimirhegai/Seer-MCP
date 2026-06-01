@@ -19,18 +19,20 @@ From inside the repo you want indexed:
 npx seer-mcp init
 ```
 
-That is the whole install. It writes the MCP config for whatever agents you use
-(Claude Code, Cursor, VS Code, Codex, Gemini) and drops an `AGENTS.md` so the
-agent knows Seer exists and when to call it. Because it ran via `npx`, the config
-it writes uses a portable `npx -y seer-mcp mcp` launcher, so it works the same on
-any machine and is safe to commit.
+That is the whole install. It writes project-local MCP config for Claude Code,
+Cursor, VS Code, Codex, and Gemini, then drops the right guidance files
+(`AGENTS.md`, `CLAUDE.md`, and/or `GEMINI.md`) so the agent knows Seer exists
+and when to call it. Because it ran via `npx`, the config it writes uses a
+portable `npx -y seer-mcp mcp` launcher, so it works the same on any machine and
+is safe to commit.
 
 Then reload (or restart) your agent so it picks up the new server.
 
 ### Useful variations
 
 ```bash
-npx seer-mcp init --client all     # also Antigravity and the user-level configs
+npx seer-mcp init --client all     # also Antigravity, Windsurf, and user-level configs
+npx seer-mcp init --client windsurf
 npx seer-mcp init --print          # dry run: show the snippets, write nothing
 npx seer-mcp init --client claude  # just one agent
 ```

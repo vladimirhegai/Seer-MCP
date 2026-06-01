@@ -43,11 +43,19 @@ export interface DiscoveryOptions {
 
 // Globally-skipped paths that are never source code (build outputs, IDE
 // state, VCS metadata). These are unconditional — `includeVendor` /
-// `includeGenerated` do NOT re-enable them. The user can override by adding
-// a `!pattern` line in `.seerignore`.
+// `includeGenerated` do NOT re-enable them.
 const BUILD_AND_META_IGNORE = [
-  'node_modules', '.git', '.hg', '.svn',
-  'dist', 'build', 'out', '.next', '.nuxt', '__pycache__',
+  'node_modules/**', '**/node_modules/**',
+  '.git/**', '**/.git/**', '.hg/**', '**/.hg/**', '.svn/**', '**/.svn/**',
+  'dist/**', '**/dist/**',
+  'build/**', '**/build/**',
+  'out/**', '**/out/**',
+  '.next/**', '**/.next/**',
+  '.nuxt/**', '**/.nuxt/**',
+  '.svelte-kit/**', '**/.svelte-kit/**',
+  '.turbo/**', '**/.turbo/**',
+  'coverage/**', '**/coverage/**',
+  '__pycache__/**', '**/__pycache__/**',
   '*.min.js', '*.min.css', '*.bundle.js',
   '*.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
   // Build outputs across other ecosystems. `target/` is universally Rust
@@ -59,13 +67,14 @@ const BUILD_AND_META_IGNORE = [
   'cmake-build-*/**', '**/cmake-build-*/**',
   '_build/**', '**/_build/**',
   '.gradle/**', '**/.gradle/**',
-  '.cache/**',
-  '.idea/**', '.vs/**',
+  '.cache/**', '**/.cache/**',
+  '.idea/**', '**/.idea/**',
+  '.vs/**', '**/.vs/**',
   // Unreal-specific build outputs (won't exist in a clean checkout but cheap
   // to add defensively for users who built before indexing).
   'Intermediate/**', '**/Intermediate/**',
   'Saved/**', '**/Saved/**',
-  'DerivedDataCache/**',
+  'DerivedDataCache/**', '**/DerivedDataCache/**',
 ];
 
 // Vendored dependency roots — discovery-time skip by default, but classified
@@ -107,6 +116,76 @@ const FAST_MODE_EXTRA_IGNORE = [
   'migrations/**', '**/migrations/**',
 ];
 
+interface IgnoreLayer {
+  dir: string;
+  file: string;
+  ig: ReturnType<typeof ignore>;
+}
+
+function normalizeRelPath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+function ignoreLayerDepth(layer: IgnoreLayer): number {
+  return layer.dir ? layer.dir.split('/').length : 0;
+}
+
+async function loadIgnoreLayers(absRoot: string, skip: string[]): Promise<IgnoreLayer[]> {
+  const layers: IgnoreLayer[] = [];
+  const addLayer = (relFile: string): void => {
+    const normRel = normalizeRelPath(relFile);
+    const absFile = path.join(absRoot, ...normRel.split('/'));
+    if (!fs.existsSync(absFile)) return;
+    const raw = fs.readFileSync(absFile, 'utf8');
+    if (!raw.trim()) return;
+    const dir = path.posix.dirname(normRel);
+    const ig = ignore();
+    ig.add(raw);
+    layers.push({
+      dir: dir === '.' ? '' : dir,
+      file: path.posix.basename(normRel),
+      ig,
+    });
+  };
+
+  addLayer('.gitignore');
+  addLayer('.seerignore');
+
+  const nested = await glob(['**/.gitignore', '**/.seerignore'], {
+    cwd: absRoot,
+    ignore: skip,
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: true,
+  });
+
+  for (const rel of nested.sort()) {
+    const normRel = normalizeRelPath(rel);
+    if (normRel === '.gitignore' || normRel === '.seerignore') continue;
+    addLayer(normRel);
+  }
+
+  return layers.sort((a, b) =>
+    ignoreLayerDepth(a) - ignoreLayerDepth(b)
+    || a.dir.localeCompare(b.dir)
+    || a.file.localeCompare(b.file),
+  );
+}
+
+function isIgnoredByLayers(rel: string, layers: IgnoreLayer[]): boolean {
+  const normRel = normalizeRelPath(rel);
+  let ignored = false;
+  for (const layer of layers) {
+    if (layer.dir && normRel !== layer.dir && !normRel.startsWith(`${layer.dir}/`)) continue;
+    const subPath = layer.dir ? normRel.slice(layer.dir.length + 1) : normRel;
+    if (!subPath) continue;
+    const result = layer.ig.test(subPath);
+    if (result.ignored) ignored = true;
+    if (result.unignored) ignored = false;
+  }
+  return ignored;
+}
+
 export async function discoverFiles(repoRoot: string, options: DiscoveryOptions = {}): Promise<DiscoveredFile[]> {
   const absRoot = path.resolve(repoRoot);
   const mode: DiscoveryMode = options.mode ?? 'standard';
@@ -122,20 +201,9 @@ export async function discoverFiles(repoRoot: string, options: DiscoveryOptions 
   if (!includeGenerated) skip.push(...GENERATED_IGNORE);
   if (mode === 'fast')   skip.push(...FAST_MODE_EXTRA_IGNORE);
 
-  // Build ignore rules from .gitignore + optional .seerignore. The two are
-  // separate intentionally — .gitignore controls what's committed (often
-  // includes build outputs that we ALSO want hidden) while .seerignore is
-  // for repo-specific tweaks that don't belong in version control rules
-  // (e.g. "don't index our `examples/` folder").
-  const ig = ignore();
-  const gitignorePath = path.join(absRoot, '.gitignore');
-  if (fs.existsSync(gitignorePath)) {
-    ig.add(fs.readFileSync(gitignorePath, 'utf8'));
-  }
-  const seerignorePath = path.join(absRoot, '.seerignore');
-  if (fs.existsSync(seerignorePath)) {
-    ig.add(fs.readFileSync(seerignorePath, 'utf8'));
-  }
+  // Build ignore rules from root and nested .gitignore / .seerignore files.
+  // Nested rules are evaluated relative to their own directory.
+  const ignoreLayers = await loadIgnoreLayers(absRoot, skip);
 
   // Glob for source files in supported languages
   const entries = await glob(
@@ -167,7 +235,7 @@ export async function discoverFiles(repoRoot: string, options: DiscoveryOptions 
   // downstream stage — the byte semaphore window, parser-worker dispatch,
   // SQLite inserts — sees the same sequence on every invocation.
   return entries
-    .filter(rel => !ig.ignores(rel))
+    .filter(rel => !isIgnoredByLayers(rel, ignoreLayers))
     .sort()
     .map(rel => ({
       absolutePath: path.join(absRoot, rel),

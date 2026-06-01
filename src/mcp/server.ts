@@ -61,6 +61,16 @@ export interface McpServerOptions {
   jit?: boolean;
 }
 
+function mcpInstructions(): string {
+  return [
+    'Use Seer before grep for structural code navigation in this workspace.',
+    'Start with seer_health, then use seer_search or seer_definition to locate symbols.',
+    'Before editing unfamiliar code, call seer_preflight for the target symbol or diff range.',
+    'Use seer_callers, seer_callees, seer_behavior, seer_history, and seer_skeleton to gather focused context.',
+    'Fall back to text search for comments, string literals, config values, docs, or unsupported languages.',
+  ].join(' ');
+}
+
 export class SeerMcpServer {
   private store!: Store;
   private indexer!: Indexer;
@@ -72,6 +82,16 @@ export class SeerMcpServer {
   private jitEnabled: boolean;
   private watchEnabled: boolean;
   private jitPromise: Promise<void> | null = null;
+  private lastReconcileMs = 0;
+  /**
+   * How long a watcher-confirmed-clean index is trusted before the per-query
+   * JIT pass pays for another full-workspace re-discovery. The background
+   * chokidar watcher marks files dirty on OS events, so within this window a
+   * clean watcher means the workspace probably cannot have drifted, so we skip
+   * the walk and keep normal queries cheap. The periodic full reconcile is a
+   * fallback for missed filesystem events; override with SEER_JIT_FULL_RECONCILE_MS.
+   */
+  private static readonly DEFAULT_RECONCILE_THROTTLE_MS = 30_000;
 
   constructor(options: McpServerOptions) {
     this.workspace = path.resolve(options.workspace);
@@ -79,7 +99,10 @@ export class SeerMcpServer {
     this.jitEnabled = options.jit ?? true;
     this.watchEnabled = options.watch ?? true;
 
-    this.mcp = new McpServer({ name: 'seer', version: '0.1.0' });
+    this.mcp = new McpServer(
+      { name: 'seer', version: '0.1.0' },
+      { instructions: mcpInstructions() },
+    );
     this.registerTools();
   }
 
@@ -95,6 +118,20 @@ export class SeerMcpServer {
       process.stderr.write(`[seer-mcp] empty index; running initial index...\n`);
       const r = await this.indexer.indexDirectory(this.workspace, { quiet: true });
       process.stderr.write(`[seer-mcp] initial index: ${r.filesIndexed} files, ${r.symbols} symbols, ${r.elapsedMs}ms\n`);
+      // Freshly indexed — the workspace is current as of now, so the first
+      // query can take the cheap throttled path instead of re-walking.
+      this.lastReconcileMs = Date.now();
+    } else {
+      // A pre-existing index may have drifted while the server was down. Trust
+      // it for the first queries (cheap path) but kick ONE reconcile in the
+      // background so any offline edits heal without blocking startup or the
+      // first tool call. The Indexer serializes this against the watcher.
+      this.lastReconcileMs = Date.now();
+      void (async () => {
+        try { await jitSync(this.store, this.indexer, this.workspace, { maxDirty: 200 }); }
+        catch (err) { process.stderr.write(`[seer-mcp] startup reconcile failed: ${err}\n`); }
+        finally { this.lastReconcileMs = Date.now(); }
+      })();
     }
 
     if (this.watchEnabled) {
@@ -114,13 +151,48 @@ export class SeerMcpServer {
     try { this.store.close(); } catch { /* */ }
   }
 
+  private reconcileThrottleMs(): number {
+    const raw = Number(process.env.SEER_JIT_FULL_RECONCILE_MS);
+    if (Number.isFinite(raw) && raw >= 1000) return raw;
+    return SeerMcpServer.DEFAULT_RECONCILE_THROTTLE_MS;
+  }
+
   private async ensureFresh(): Promise<void> {
     if (!this.jitEnabled) return;
+    // Coalesce concurrent queries onto a single in-flight reconcile.
     if (this.jitPromise) { await this.jitPromise; return; }
+
+    // Fast path: when the background watcher is running it marks files dirty on
+    // OS file events. If it reports nothing pending AND a watcher/JIT pass
+    // recently reconciled, we trust that signal and skip the full-workspace
+    // discovery walk. This keeps steady-state queries close to seer_health
+    // cost while a periodic full reconcile still catches missed events.
+    // This is the fix for `seer_stats` (and every other
+    // JIT-gated tool) taking many seconds while `seer_health` stayed instant:
+    // the walk + any cascading reindex used to run on EVERY query. Without a
+    // watcher (`--no-watch`) there is no background freshness signal, so we
+    // always reconcile to preserve per-query correctness.
+    const watcherStatus = this.watcher?.syncStatus() ?? null;
+    const watcherClean = this.watcher != null && !this.watcher.isDirty();
+    const lastKnownCleanMs = Math.max(this.lastReconcileMs, watcherStatus?.lastSyncMs ?? 0);
+    if (watcherClean &&
+        (Date.now() - lastKnownCleanMs) < this.reconcileThrottleMs()) {
+      return;
+    }
+
+    const trace = process.env.SEER_JIT_TRACE === '1';
+    const t0 = Date.now();
     this.jitPromise = (async () => {
-      try { await jitSync(this.store, this.indexer, this.workspace, { maxDirty: 200 }); }
-      catch (err) { process.stderr.write(`[seer-mcp] JIT failed: ${err}\n`); }
-      finally { this.jitPromise = null; }
+      try {
+        const r = await jitSync(this.store, this.indexer, this.workspace, { maxDirty: 200 });
+        if (trace) {
+          process.stderr.write(
+            `[seer-mcp] JIT reconcile: dirty=${r.dirtyReindexed} added=${r.added} ` +
+            `removed=${r.removed} in ${Date.now() - t0}ms\n`,
+          );
+        }
+      } catch (err) { process.stderr.write(`[seer-mcp] JIT failed: ${err}\n`); }
+      finally { this.lastReconcileMs = Date.now(); this.jitPromise = null; }
     })();
     await this.jitPromise;
   }
