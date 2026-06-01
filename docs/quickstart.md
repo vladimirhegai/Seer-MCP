@@ -220,25 +220,25 @@ Useful uninstall flags:
 
 ## Common Fixes
 
-Wrong workspace in `seer_health`:
+### ➡️ **Wrong workspace in `seer_health`**
 
 ```bash
 npx seer-mcp init --auto --force
 ```
 
-First query is slow:
+### ➡️ **First query is slow**
 
 ```bash
 npx seer-mcp index .
 ```
 
-Need to see exactly what would change:
+### ➡️ **Need to see exactly what would change**
 
 ```bash
 npx seer-mcp init --auto --print
 ```
 
-Codex does not show Seer:
+### ➡️ **Codex does not show Seer**
 
 ```bash
 npx seer-mcp init --client codex --global --force
@@ -247,7 +247,7 @@ npx seer-mcp init --client codex --global --force
 Some Codex versions only load project-local `.codex/config.toml` for trusted
 projects. The global fallback uses `~/.codex/config.toml`.
 
-Antigravity IDE does not show Seer:
+### ➡️ **Antigravity IDE does not show Seer**
 
 ```bash
 npx seer-mcp init --client antigravity --global --force
