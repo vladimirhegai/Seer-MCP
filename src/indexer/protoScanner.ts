@@ -38,7 +38,7 @@ export interface ProtoScanResult {
   rpcsFound: number;
 }
 
-const PROTO_SERVICE_RE = /service\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{([\s\S]*?)\}/g;
+const PROTO_SERVICE_START_RE = /\bservice\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{/g;
 const PROTO_RPC_RE = /rpc\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(?:stream\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*\)\s*returns\s*\(\s*(?:stream\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*\)/g;
 
 const PROTO_CLASSIFICATION: FileClassification = {
@@ -73,7 +73,7 @@ export async function scanProtoFiles(
     let src: string;
     try { src = fs.readFileSync(abs, 'utf8'); }
     catch { continue; }
-    const sha = crypto.createHash('sha1').update(src).digest('hex');
+    const sha = crypto.createHash('sha256').update(src, 'utf8').digest('hex').slice(0, 16);
     const stripped = stripProtoComments(src);
     const lines = src.split('\n').length;
     const classification = classifyFile(rel) ?? PROTO_CLASSIFICATION;
@@ -86,12 +86,15 @@ export async function scanProtoFiles(
       continue;
     }
     indexed++;
-    PROTO_SERVICE_RE.lastIndex = 0;
+    PROTO_SERVICE_START_RE.lastIndex = 0;
     let svcMatch: RegExpExecArray | null;
-    while ((svcMatch = PROTO_SERVICE_RE.exec(stripped)) !== null) {
+    while ((svcMatch = PROTO_SERVICE_START_RE.exec(stripped)) !== null) {
       const serviceName = svcMatch[1];
-      const body = svcMatch[2];
-      const bodyOffset = svcMatch.index + svcMatch[0].indexOf('{') + 1;
+      const openBrace = PROTO_SERVICE_START_RE.lastIndex - 1;
+      const closeBrace = findMatchingBrace(stripped, openBrace);
+      if (closeBrace === -1) continue;
+      const bodyOffset = openBrace + 1;
+      const body = stripped.slice(bodyOffset, closeBrace);
       services++;
       PROTO_RPC_RE.lastIndex = 0;
       let rpcMatch: RegExpExecArray | null;
@@ -121,6 +124,7 @@ export async function scanProtoFiles(
         );
         rpcs++;
       }
+      PROTO_SERVICE_START_RE.lastIndex = closeBrace + 1;
     }
   }
   return {
@@ -131,6 +135,35 @@ export async function scanProtoFiles(
     servicesFound: services,
     rpcsFound: rpcs,
   };
+}
+
+function findMatchingBrace(src: string, openIndex: number): number {
+  let depth = 0;
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  for (let i = openIndex; i < src.length; i++) {
+    const ch = src[i];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
 }
 
 /** Strip // and /* * / comments while preserving line offsets. */

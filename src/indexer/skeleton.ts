@@ -87,7 +87,7 @@ function buildForest(rows: SymbolRow[]): Node[] {
 function headerFor(row: SymbolRow, lines: string[]): string {
   const sig = row.signature?.trim();
   if (sig) return sig.replace(/\s*\{\s*$/, '').trim();
-  const raw = lines[row.lineStart - 1] ?? '';
+  const raw = lines[row.lineStart] ?? '';
   return raw.trim().replace(/\s*\{\s*$/, '').trim();
 }
 
@@ -100,7 +100,7 @@ function render(
 ): void {
   const { row } = node;
   const indent = '  '.repeat(depth);
-  const span = `[L${row.lineStart}-${row.lineEnd}]`;
+  const span = `[L${row.lineStart + 1}-${row.lineEnd + 1}]`;
   const header = headerFor(row, lines);
   const isFocus =
     focus != null && (row.name === focus || row.qualifiedName === focus);
@@ -108,7 +108,7 @@ function render(
   if (isFocus) {
     // Expanded: show the real source slice verbatim (the agent asked for it).
     out.push(`${indent}${header}  ${span}  ◀ focus`);
-    const body = lines.slice(row.lineStart - 1, row.lineEnd);
+    const body = lines.slice(row.lineStart, row.lineEnd + 1);
     for (const l of body) out.push(`${indent}  ${l}`);
     return;
   }

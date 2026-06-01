@@ -111,8 +111,8 @@ const SKIP_FILENAME_PATTERNS = [
   /\.pb\.h$/,
 ];
 
-function shouldSkipFilename(relativePath: string): boolean {
-  return SKIP_FILENAME_PATTERNS.some(re => re.test(relativePath));
+function shouldSkipFilename(relativePath: string, includeGenerated: boolean): boolean {
+  return !includeGenerated && SKIP_FILENAME_PATTERNS.some(re => re.test(relativePath));
 }
 
 export interface IndexResult {
@@ -279,6 +279,7 @@ export class Indexer {
       includeGenerated: options.includeGenerated,
       mode: options.mode,
     });
+    const includeGenerated = options.includeGenerated ?? (options.mode === 'full');
     const total = files.length;
     const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     const ioConcurrency = Math.max(1, options.ioConcurrency ?? DEFAULT_IO_CONCURRENCY);
@@ -300,7 +301,7 @@ export class Indexer {
     const work: WorkItem[] = [];
     for (const file of files) {
       const language = detectLanguage(file.absolutePath) as Language | null;
-      if (!language || shouldSkipFilename(file.relativePath)) {
+      if (!language || shouldSkipFilename(file.relativePath, includeGenerated)) {
         skipped++;
         continue;
       }
@@ -948,12 +949,23 @@ export class Indexer {
       if (verbose) process.stdout.write(`  ⚠  service-link resolution failed: ${err}\n`);
     }
 
-    // External dependency extraction from manifests/lockfiles. Gated behind
-    // graphChanged so we skip the glob scan on cached re-indexes (it costs
-    // ~400ms on Windows for Rust monorepos like godot/Unreal). Trade-off: if
-    // a user edits only package.json/Cargo.toml with no source change, deps
-    // update on the next source-file change rather than immediately. Acceptable
-    // given that dependency changes almost always coincide with code changes.
+    // Metadata-only edits (package.json/Cargo.toml/etc.) do not change the
+    // source graph, but they do change dependency facts. Keep cached re-indexes
+    // truthful by refreshing the manifest-derived table even when graphChanged
+    // is false; the existing graphChanged branch below handles changed graphs.
+    if (!graphChanged) {
+      try {
+        const { extractExternalDependencies } = await import('./externaldeps.js');
+        await extractExternalDependencies(absRoot, this.store);
+      } catch (err) {
+        if (verbose) {
+          process.stdout.write(`  !  external dep extraction failed: ${err}\n`);
+        }
+      }
+    }
+
+    // Changed source graphs take this branch; cached source graphs refresh
+    // dependency facts through the metadata-only branch above.
     if (graphChanged) {
       try {
         const { extractExternalDependencies } = await import('./externaldeps.js');
@@ -1008,6 +1020,12 @@ export class Indexer {
     // an existing DB to v10).
     let boundariesRecomputed = false;
     try {
+      if (!graphChanged && this.store.hasBoundariesData()) {
+        if (!quiet) process.stdout.write('  Detecting boundaries...\n');
+        const r = buildBoundaries(absRoot, this.store);
+        this.store.replaceBoundaries(r.boundaries, r.edges);
+        boundariesRecomputed = true;
+      }
       if (graphChanged || !this.store.hasBoundariesData()) {
         if (!quiet) process.stdout.write('  Detecting boundaries...\n');
         const r = buildBoundaries(absRoot, this.store);

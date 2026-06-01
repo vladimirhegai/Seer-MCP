@@ -92,8 +92,13 @@ const VENDOR_IGNORE = [
 // Generated-code patterns that don't earn a place in default indexing. Same
 // "skip-by-default, classify-when-included" model as vendored code.
 const GENERATED_IGNORE = [
-  '*.pb.go', '*.pb.ts', '*.pb.h', '*.pb.cc',
-  '*.generated.h', '*.gen.cpp', '*.gen.h',
+  '*.pb.go', '**/*.pb.go',
+  '*.pb.ts', '**/*.pb.ts',
+  '*.pb.h', '**/*.pb.h',
+  '*.pb.cc', '**/*.pb.cc',
+  '*.generated.h', '**/*.generated.h',
+  '*.gen.cpp', '**/*.gen.cpp',
+  '*.gen.h', '**/*.gen.h',
 ];
 
 // Extra skips active only under `--mode fast`. These directories rarely

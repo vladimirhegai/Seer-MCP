@@ -38,31 +38,37 @@ Oh, and Seer can absolutely help agents find their way inside large, messy repos
 
 ## Quick Start
 
-One command, from inside the repo you want indexed (needs Node 24+):
+From inside the repo you want indexed (Node 24+):
+
+```bash
+npx seer-mcp init --auto
+```
+
+That writes repo-local MCP config, adds detected editor-global clients such as Antigravity/Windsurf, and pins global launchers to this repo with `--workspace`.
+
+Prefer zero global changes?
 
 ```bash
 npx seer-mcp init
 ```
 
-If you use **Google Antigravity** or **Windsurf** (user-level MCP config), run this instead:
+Reload your agent and ask it to call `seer_health`. Seer indexes this repo on the first query.
+
+Update existing installs:
+
 ```bash
-npx seer-mcp init --client all
+npx seer-mcp update
 ```
 
-Reload your agent/extensions and you are connected. (Want to confirm it? Ask the agent to call `seer_health`.) The init command also writes the agent guidance files each tool reads, including `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` where applicable.
+Avoid first-query latency:
 
-Seer indexes your workspace automatically on the first query.
+```bash
+npx seer-mcp index .
+```
 
-> [!TIP]
-> **Optional Pre-indexing:** Avoid any first-query latency by manually pre-indexing:
-> ```bash
-> npx seer-mcp index .
-> ```
+More clients and uninstall details: [MCP Setup](docs/mcp.md).
 
-Want user-level config? Read the [MCP Setup](docs/mcp.md) guide.
-
-→ [Full Quick Start](docs/quickstart.md)
-
+-> [Full Quick Start](docs/quickstart.md)
 ---
 
 ## Docs

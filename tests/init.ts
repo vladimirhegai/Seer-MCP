@@ -11,7 +11,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { runInit, ClientId } from '../src/cli/init';
+import { runInit, runUpdate, ClientId } from '../src/cli/init';
 
 let passed = 0;
 let failed = 0;
@@ -65,11 +65,11 @@ function main(): void {
       '1.AGENTS.md written with seer markers');
     check(agents.includes('seer_preflight'), '1.AGENTS.md mentions seer_preflight workflow');
 
-    // gemini is in PROJECT_CLIENTS, so a GEMINI.md mirror must be written too.
-    check(fs.existsSync(path.join(ws, 'GEMINI.md')), '1.GEMINI.md mirror written for gemini client');
+    // gemini is in PROJECT_CLIENTS, so a GEMINI.md import shim must be written too.
+    check(fs.existsSync(path.join(ws, 'GEMINI.md')), '1.GEMINI.md shim written for gemini client');
     const gem = fs.existsSync(path.join(ws, 'GEMINI.md')) ? fs.readFileSync(path.join(ws, 'GEMINI.md'), 'utf8') : '';
-    check(gem.includes('<!-- seer:begin -->') && gem.includes('seer_preflight'),
-      '1.GEMINI.md carries the managed seer block');
+    check(gem.includes('<!-- seer:begin -->') && gem.includes('@AGENTS.md'),
+      '1.GEMINI.md imports AGENTS.md inside managed block');
 
     check(fs.existsSync(path.join(ws, 'CLAUDE.md')), '1.CLAUDE.md written for claude client');
     const claudeMd = fs.existsSync(path.join(ws, 'CLAUDE.md')) ? fs.readFileSync(path.join(ws, 'CLAUDE.md'), 'utf8') : '';
@@ -202,6 +202,31 @@ function main(): void {
     const occurrences = after.split('<!-- seer:begin -->').length - 1;
     check(occurrences === 1, '8.re-run does not duplicate the seer block', { occurrences });
     check(after.startsWith(userContent), '8.re-run still preserves user content');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // 9. update refreshes existing MCP entries and converts GEMINI.md to a shim.
+  {
+    const ws = freshWs('update');
+    runInit({ workspace: ws, clients: ['claude', 'gemini'], npx: true });
+    fs.writeFileSync(path.join(ws, '.mcp.json'),
+      JSON.stringify({ mcpServers: { seer: { command: 'bad', args: ['old'] } } }, null, 2));
+    fs.writeFileSync(path.join(ws, 'GEMINI.md'), [
+      '<!-- seer:begin -->',
+      'old duplicated seer_preflight guidance',
+      '<!-- seer:end -->',
+      '',
+    ].join('\n'));
+
+    const r = runUpdate({ workspace: ws });
+    const mcp = JSON.parse(fs.readFileSync(path.join(ws, '.mcp.json'), 'utf8'));
+    const gem = fs.readFileSync(path.join(ws, 'GEMINI.md'), 'utf8');
+    check(r.entries.some(e => e.client === 'claude' && e.action === 'updated'),
+      '9.update refreshes existing MCP config entries', r.entries);
+    check(mcp.mcpServers.seer.command === 'npx' && mcp.mcpServers.seer.args.join(' ') === '-y seer-mcp mcp',
+      '9.update rewrites stale project launcher to current npx form', mcp.mcpServers.seer);
+    check(gem.includes('@AGENTS.md') && !gem.includes('old duplicated'),
+      '9.update converts GEMINI.md duplicate guidance to import shim', gem);
     fs.rmSync(ws, { recursive: true, force: true });
   }
 

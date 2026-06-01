@@ -28,6 +28,7 @@ export type ClientId =
 export interface InitOptions {
   workspace: string;
   clients?: ClientId[];   // explicit subset; default = the project-local set
+  auto?: boolean;          // include detected editor-global clients
   global?: boolean;       // write user-level config instead of project-local
   command?: string;       // override the launch command line entirely
   npx?: boolean;          // emit the portable `npx -y <pkg> mcp` launcher
@@ -36,6 +37,14 @@ export interface InitOptions {
   print?: boolean;        // dry run: report the plan, write nothing
   force?: boolean;        // overwrite an existing seer entry / guidance block
   db?: string;            // custom db path passed through to the launcher
+}
+
+export interface UpdateOptions extends InitOptions {
+  /**
+   * When true, refresh only user-level files. By default update refreshes any
+   * existing Seer entry it can find for the selected clients.
+   */
+  global?: boolean;
 }
 
 interface LaunchSpec {
@@ -90,7 +99,11 @@ export interface InitResult {
  *   - node form: an absolute path to the built CLI. Works today, before the
  *                package is published, but is machine-specific.
  */
-function resolveLaunch(workspace: string, opts: InitOptions): LaunchSpec {
+function resolveLaunch(
+  workspace: string,
+  opts: InitOptions,
+  includeWorkspaceForNpx = false,
+): LaunchSpec {
   if (opts.command && opts.command.trim()) {
     const parts = opts.command.trim().split(/\s+/);
     return { command: parts[0], args: parts.slice(1) };
@@ -115,6 +128,7 @@ function resolveLaunch(workspace: string, opts: InitOptions): LaunchSpec {
   const installed = entry.includes(`${path.sep}node_modules${path.sep}`);
   if (opts.npx || installed) {
     const args = ['-y', opts.pkg || DEFAULT_PKG, 'mcp'];
+    if (includeWorkspaceForNpx) args.push('--workspace', workspace);
     if (opts.db) args.push('--db', opts.db);
     return { command: 'npx', args };
   }
@@ -170,6 +184,11 @@ function home(...p: string[]): string {
   return path.join(os.homedir(), ...p);
 }
 
+function localAppData(...p: string[]): string | null {
+  const base = process.env.LOCALAPPDATA;
+  return base ? path.join(base, ...p) : null;
+}
+
 const CLIENTS: Record<ClientId, ClientSpec> = {
   claude: {
     label: 'Claude Code',
@@ -223,6 +242,86 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
   },
 };
 
+interface TargetSpec {
+  file: string;
+  isGlobal: boolean;
+}
+
+function targetPath(workspace: string, target: string): string {
+  return path.isAbsolute(target) ? target : path.join(workspace, target);
+}
+
+function clientTargets(client: ClientId, workspace: string, scope: 'init' | 'all' | 'global'): TargetSpec[] {
+  const spec = CLIENTS[client];
+  const targets: TargetSpec[] = [];
+  if (scope !== 'global') {
+    if (spec.projectPath) targets.push({ file: targetPath(workspace, spec.projectPath), isGlobal: false });
+    for (const extra of spec.extraProjectPaths ?? []) {
+      targets.push({ file: targetPath(workspace, extra), isGlobal: false });
+    }
+  }
+  if (scope === 'global' || scope === 'all') {
+    if (spec.globalPath) targets.push({ file: spec.globalPath, isGlobal: true });
+    for (const extra of spec.extraGlobalPaths ?? []) {
+      targets.push({ file: extra, isGlobal: true });
+    }
+  }
+  return targets;
+}
+
+function pathExistsAny(paths: Array<string | null | undefined>): boolean {
+  return paths.some((p) => !!p && fs.existsSync(p));
+}
+
+export function detectAutoClients(workspace: string): ClientId[] {
+  const selected = new Set<ClientId>(DEFAULT_CLIENTS);
+  const antigravityApp = localAppData('Programs', 'Antigravity IDE');
+  if (pathExistsAny([
+    home('.gemini', 'antigravity'),
+    home('.gemini', 'antigravity-cli'),
+    home('.gemini', 'antigravity-ide'),
+    path.join(workspace, '.agents'),
+    antigravityApp,
+  ])) {
+    selected.add('antigravity');
+  }
+  if (pathExistsAny([
+    home('.codeium', 'windsurf'),
+    home('.windsurf'),
+  ])) {
+    selected.add('windsurf');
+  }
+  return ALL_CLIENTS.filter((c) => selected.has(c));
+}
+
+function jsonHasSeer(spec: ClientSpec, file: string): boolean | null {
+  const parsed = readJsonTolerant(file);
+  if (!parsed.ok) return null;
+  const root = parsed.data?.[spec.rootKey];
+  return !!(root && typeof root === 'object' && root.seer);
+}
+
+function tomlHasSeer(file: string): boolean {
+  try {
+    return /^[ \t]*\[mcp_servers\.seer\]/m.test(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+function hasSeerEntry(client: ClientId, file: string): boolean | null {
+  if (!fs.existsSync(file)) return false;
+  const spec = CLIENTS[client];
+  return spec.toml ? tomlHasSeer(file) : jsonHasSeer(spec, file);
+}
+
+export function detectConfiguredClients(workspace: string, opts: { global?: boolean } = {}): ClientId[] {
+  const scope = opts.global ? 'global' : 'all';
+  return ALL_CLIENTS.filter((client) =>
+    clientTargets(client, workspace, scope).some((target) => hasSeerEntry(client, target.file) === true),
+  );
+}
+
 function jsonEntry(launch: LaunchSpec, stdioType: boolean): Record<string, any> {
   const entry: Record<string, any> = {};
   if (stdioType) entry.type = 'stdio';
@@ -241,11 +340,53 @@ function tomlBlock(launch: LaunchSpec): string {
   ].join('\n');
 }
 
+function workspaceFromArgs(args: unknown): string | undefined {
+  if (!Array.isArray(args)) return undefined;
+  const idx = args.findIndex((a) => a === '--workspace');
+  const value = idx >= 0 ? args[idx + 1] : undefined;
+  return typeof value === 'string' && value.trim() ? path.resolve(value) : undefined;
+}
+
+function sameResolvedPath(a: string, b: string): boolean {
+  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+
+function jsonEntryWorkspace(spec: ClientSpec, file: string): string | undefined | null {
+  const parsed = readJsonTolerant(file);
+  if (!parsed.ok) return null;
+  const entry = parsed.data?.[spec.rootKey]?.seer;
+  if (!entry || typeof entry !== 'object') return undefined;
+  return workspaceFromArgs(entry.args);
+}
+
+function tomlEntryWorkspace(file: string): string | undefined | null {
+  let raw: string;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch { return undefined; }
+  const lines = raw.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^[ \t]*\[mcp_servers\.seer\]/.test(l));
+  if (start === -1) return undefined;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^[ \t]*\[/.test(lines[i])) { end = i; break; }
+  }
+  const block = lines.slice(start, end).join('\n');
+  const m = block.match(/^[ \t]*args[ \t]*=[ \t]*(\[[\s\S]*?\])/m);
+  if (!m) return undefined;
+  try { return workspaceFromArgs(JSON.parse(m[1])); }
+  catch { return null; }
+}
+
+function entryWorkspace(spec: ClientSpec, file: string): string | undefined | null {
+  return spec.toml ? tomlEntryWorkspace(file) : jsonEntryWorkspace(spec, file);
+}
+
 function writeJsonClient(
   spec: ClientSpec,
   file: string,
   launch: LaunchSpec,
   opts: InitOptions,
+  updateExisting = false,
 ): PlanEntry {
   const base: PlanEntry = { client: 'claude', label: spec.label, file, action: 'wrote' };
   const entry = jsonEntry(launch, !!spec.stdioType);
@@ -273,7 +414,12 @@ function writeJsonClient(
 
   if (!data[spec.rootKey] || typeof data[spec.rootKey] !== 'object') data[spec.rootKey] = {};
   if (data[spec.rootKey].seer && !opts.force) {
-    return { ...base, action: 'skipped', note: 'seer entry already present (use --force to overwrite)' };
+    if (!updateExisting) {
+      return { ...base, action: 'skipped', note: 'seer entry already present (use --force to overwrite)' };
+    }
+    if (JSON.stringify(data[spec.rootKey].seer) === JSON.stringify(entry)) {
+      return { ...base, action: 'skipped', note: 'seer entry already current' };
+    }
   }
   data[spec.rootKey].seer = entry;
 
@@ -287,6 +433,7 @@ function writeTomlClient(
   file: string,
   launch: LaunchSpec,
   opts: InitOptions,
+  updateExisting = false,
 ): PlanEntry {
   const base: PlanEntry = { client: 'codex', label: spec.label, file, action: 'wrote' };
   const block = tomlBlock(launch);
@@ -298,7 +445,7 @@ function writeTomlClient(
   if (fs.existsSync(file)) {
     const raw = fs.readFileSync(file, 'utf8');
     if (/^[ \t]*\[mcp_servers\.seer\]/m.test(raw)) {
-      if (!opts.force) {
+      if (!opts.force && !updateExisting) {
         return { ...base, action: 'skipped', note: 'mcp_servers.seer already present (use --force to overwrite)' };
       }
       // Replace the existing block: splice out from its header line to the
@@ -325,18 +472,20 @@ function writeTomlClient(
 
 function configureClient(
   client: ClientId,
-  launch: LaunchSpec,
   opts: InitOptions,
 ): PlanEntry[] {
   const spec = CLIENTS[client];
   const useGlobal = opts.global || spec.projectPath === null;
   const rel = useGlobal ? spec.globalPath : spec.projectPath;
+  const projectLaunch = resolveLaunch(opts.workspace, opts, false);
+  const globalLaunch = resolveLaunch(opts.workspace, opts, true);
 
-  const writeTarget = (target: string): PlanEntry => {
-    const file = path.isAbsolute(target) ? target : path.join(opts.workspace, target);
+  const writeTarget = (target: string, targetIsGlobal: boolean): PlanEntry => {
+    const file = targetPath(opts.workspace, target);
+    const launch = targetIsGlobal ? globalLaunch : projectLaunch;
     const result = spec.toml
-      ? writeTomlClient(spec, file, launch, opts)
-      : writeJsonClient(spec, file, launch, opts);
+      ? writeTomlClient(spec, file, launch, opts, targetIsGlobal)
+      : writeJsonClient(spec, file, launch, opts, targetIsGlobal);
     return { ...result, client };
   };
 
@@ -351,14 +500,14 @@ function configureClient(
       note: `${spec.label} has no ${useGlobal ? 'user-level' : 'project-local'} config; try the other scope`,
     });
   } else {
-    results.push(writeTarget(rel));
+    results.push(writeTarget(rel, useGlobal));
   }
 
   if (!opts.global) {
-    for (const extra of spec.extraProjectPaths ?? []) results.push(writeTarget(extra));
+    for (const extra of spec.extraProjectPaths ?? []) results.push(writeTarget(extra, false));
   }
   if (useGlobal || opts.global) {
-    for (const extra of spec.extraGlobalPaths ?? []) results.push(writeTarget(extra));
+    for (const extra of spec.extraGlobalPaths ?? []) results.push(writeTarget(extra, true));
   }
   return results;
 }
@@ -368,56 +517,40 @@ function configureClient(
 function agentsBlock(): string {
   return [
     AGENTS_BEGIN,
-    '## Seer — use it FIRST for any code navigation in this repo',
+    '## Seer',
     '',
-    'This repo is indexed by **Seer**, a local MCP server (tool prefix',
-    '`seer_`) that returns deterministic structural facts about the code:',
-    'definitions, call graphs, routes, tests, edit-risk, monorepo boundaries,',
-    'and per-symbol git history. It is backed by a tree-sitter + SQLite index,',
-    'is always in sync (a watcher + per-query freshness check keep it current),',
-    'and answers in a fraction of the tokens a grep-and-read sweep would burn.',
+    'Use Seer before text search for code structure in this repo. Seer is a',
+    'local MCP server (`seer_*` tools) backed by a SQLite index of symbols,',
+    'callers, callees, routes, tests, dependencies, boundaries, risk, and git',
+    'history.',
     '',
-    '### Hard rule',
+    'Start here:',
+    '1. `seer_health` - confirm the MCP server is indexing this workspace.',
+    '2. `seer_search` or `seer_definition` - find the symbol/file.',
+    '3. `seer_preflight { symbol }` - get definition, callers, tests, risk,',
+    '   history, and blast radius before editing.',
     '',
-    'For any **structural** question — "where is X defined", "what calls X",',
-    '"what would break if I change X", "what tests cover X", "what are the',
-    'routes / modules / dependencies" — **call a `seer_` tool first.** Reach for',
-    '`grep`/`ripgrep`/`view_file` only when Seer returns nothing, or for things',
-    'Seer does not index: comments, string literals, config values, and docs.',
-    'Do not open files blindly to find a symbol — `seer_definition` jumps',
-    'straight to it.',
+    'Useful tools:',
+    '- `seer_callers` / `seer_callees` for call graph questions.',
+    '- `seer_behavior` for tests that cover a symbol.',
+    '- `seer_history` for recent commits touching a symbol.',
+    '- `seer_skeleton { file }` to inspect a large file cheaply.',
+    '- `seer_architecture` / `seer_boundaries` to orient in a repo.',
     '',
-    '### Which tool for which question',
-    '',
-    '| You want to… | Use | Instead of |',
-    '| --- | --- | --- |',
-    '| Find a symbol / file by name | `seer_search` | `grep -r`, fuzzy file open |',
-    '| Jump to a definition | `seer_definition { name }` | grepping for `function X` |',
-    '| See who calls something | `seer_callers { symbol }` | grepping the name |',
-    '| See what something calls | `seer_callees { symbol }` | reading the body |',
-    '| Everything before editing a symbol | `seer_preflight { symbol }` | 10 separate searches |',
-    '| Blast radius of your diff | `seer_preflight { fromRef, toRef }` | guessing |',
-    '| Tests that pin a behavior | `seer_behavior { symbol }` | scanning test dirs |',
-    '| Per-symbol git history / blame | `seer_history { symbol }` | `git log -S` |',
-    '| Read a big file cheaply | `seer_skeleton { file }` | reading 2000 lines |',
-    '| Orient in an unfamiliar repo | `seer_architecture`, `seer_boundaries` | spelunking |',
-    '',
-    '### Default workflow',
-    '',
-    '1. `seer_health` — confirm the index is live (one cheap call).',
-    '2. `seer_search` / `seer_definition` — locate the symbol or file.',
-    '3. `seer_preflight { symbol }` — pull definition, callers, tests, risk, and',
-    '   history in ONE call before you edit.',
-    '4. `seer_preflight { fromRef: "main", toRef: "HEAD" }` — blast radius of a diff.',
-    '',
-    'Batch several read-only lookups into one round-trip with `seer_batch`. If a',
-    'name is misspelled, Seer returns `didYouMean` suggestions — use them rather',
-    'than falling back to grep.',
+    'Use `rg` or manual file reads after Seer when you need comments, docs,',
+    'literal text, or when Seer returns no useful hit.',
+    AGENTS_END,
+  ].join('\n');
+}
+function claudeImportBlock(): string {
+  return [
+    AGENTS_BEGIN,
+    '@AGENTS.md',
     AGENTS_END,
   ].join('\n');
 }
 
-function claudeImportBlock(): string {
+function geminiImportBlock(): string {
   return [
     AGENTS_BEGIN,
     '@AGENTS.md',
@@ -483,7 +616,8 @@ export interface UninstallOptions {
   clients?: ClientId[];
   global?: boolean;
   agents?: boolean;   // also strip guidance files (default true)
-  print?: boolean;    // dry run — report, do not write
+  print?: boolean;    // dry run: report, do not write
+  force?: boolean;    // remove global entries even when pinned elsewhere
 }
 
 export interface UninstallResult {
@@ -496,6 +630,7 @@ function removeJsonClient(
   spec: ClientSpec,
   file: string,
   opts: UninstallOptions,
+  targetIsGlobal = false,
 ): UninstallEntry {
   const base: UninstallEntry = { label: spec.label, file, action: 'skipped' };
 
@@ -510,6 +645,17 @@ function removeJsonClient(
   const root = data[spec.rootKey];
   if (!root || typeof root !== 'object' || !('seer' in root)) {
     return base; // nothing to remove
+  }
+
+  if (targetIsGlobal && !opts.force) {
+    const pinnedWorkspace = workspaceFromArgs(root.seer?.args);
+    if (pinnedWorkspace && !sameResolvedPath(pinnedWorkspace, opts.workspace)) {
+      return {
+        ...base,
+        action: 'skipped',
+        note: `seer entry is pinned to another workspace: ${pinnedWorkspace}`,
+      };
+    }
   }
 
   if (opts.print) return { ...base, action: 'removed' };
@@ -535,6 +681,7 @@ function removeTomlClient(
   spec: ClientSpec,
   file: string,
   opts: UninstallOptions,
+  targetIsGlobal = false,
 ): UninstallEntry {
   const base: UninstallEntry = { label: spec.label, file, action: 'skipped' };
 
@@ -542,6 +689,17 @@ function removeTomlClient(
 
   const raw = fs.readFileSync(file, 'utf8');
   if (!/^[ \t]*\[mcp_servers\.seer\]/m.test(raw)) return base;
+
+  if (targetIsGlobal && !opts.force) {
+    const pinnedWorkspace = tomlEntryWorkspace(file);
+    if (pinnedWorkspace && !sameResolvedPath(pinnedWorkspace, opts.workspace)) {
+      return {
+        ...base,
+        action: 'skipped',
+        note: `seer entry is pinned to another workspace: ${pinnedWorkspace}`,
+      };
+    }
+  }
 
   if (opts.print) return { ...base, action: 'removed' };
 
@@ -574,21 +732,21 @@ function uninstallClient(client: ClientId, opts: UninstallOptions): UninstallEnt
   const useGlobal = opts.global || spec.projectPath === null;
   const rel = useGlobal ? spec.globalPath : spec.projectPath;
 
-  const removeTarget = (target: string): UninstallEntry => {
-    const file = path.isAbsolute(target) ? target : path.join(opts.workspace, target);
+  const removeTarget = (target: string, targetIsGlobal: boolean): UninstallEntry => {
+    const file = targetPath(opts.workspace, target);
     return spec.toml
-      ? removeTomlClient(spec, file, opts)
-      : removeJsonClient(spec, file, opts);
+      ? removeTomlClient(spec, file, opts, targetIsGlobal)
+      : removeJsonClient(spec, file, opts, targetIsGlobal);
   };
 
   const results: UninstallEntry[] = [];
-  if (rel) results.push(removeTarget(rel));
+  if (rel) results.push(removeTarget(rel, useGlobal));
 
   if (!opts.global) {
-    for (const extra of spec.extraProjectPaths ?? []) results.push(removeTarget(extra));
+    for (const extra of spec.extraProjectPaths ?? []) results.push(removeTarget(extra, false));
   }
   if (useGlobal || opts.global) {
-    for (const extra of spec.extraGlobalPaths ?? []) results.push(removeTarget(extra));
+    for (const extra of spec.extraGlobalPaths ?? []) results.push(removeTarget(extra, true));
   }
   return results;
 }
@@ -646,14 +804,129 @@ export function runUninstall(opts: UninstallOptions): UninstallResult {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-export function runInit(opts: InitOptions): InitResult {
+function refreshClient(client: ClientId, opts: UpdateOptions): PlanEntry[] {
+  const spec = CLIENTS[client];
+  const scope = opts.global ? 'global' : 'all';
+  const projectLaunch = resolveLaunch(opts.workspace, { ...opts, npx: true }, false);
+  const globalLaunch = resolveLaunch(opts.workspace, { ...opts, npx: true }, true);
+  const results: PlanEntry[] = [];
+
+  for (const target of clientTargets(client, opts.workspace, scope)) {
+    const present = hasSeerEntry(client, target.file);
+    if (present === false) {
+      if (opts.clients && opts.clients.length) {
+        results.push({
+          client,
+          label: spec.label,
+          file: target.file,
+          action: 'skipped',
+          note: 'no existing seer entry',
+        });
+      }
+      continue;
+    }
+    if (present === null) {
+      results.push({
+        client,
+        label: spec.label,
+        file: target.file,
+        action: 'manual',
+        note: `could not parse existing ${path.basename(target.file)}; update the seer entry by hand`,
+      });
+      continue;
+    }
+
+    if (target.isGlobal && !opts.force) {
+      const pinnedWorkspace = entryWorkspace(spec, target.file);
+      if (pinnedWorkspace === null) {
+        results.push({
+          client,
+          label: spec.label,
+          file: target.file,
+          action: 'manual',
+          note: `could not read existing ${path.basename(target.file)} workspace; update the seer entry by hand`,
+        });
+        continue;
+      }
+      if (pinnedWorkspace && !sameResolvedPath(pinnedWorkspace, opts.workspace)) {
+        results.push({
+          client,
+          label: spec.label,
+          file: target.file,
+          action: 'skipped',
+          note: `seer entry is pinned to another workspace: ${pinnedWorkspace}`,
+        });
+        continue;
+      }
+    }
+
+    const launch = target.isGlobal ? globalLaunch : projectLaunch;
+    const result = spec.toml
+      ? writeTomlClient(spec, target.file, launch, { ...opts, force: true }, true)
+      : writeJsonClient(spec, target.file, launch, { ...opts, force: true }, true);
+    results.push({ ...result, client });
+  }
+
+  return results;
+}
+
+export function runUpdate(opts: UpdateOptions): InitResult {
   const workspace = path.resolve(opts.workspace);
-  const clients = (opts.clients && opts.clients.length ? opts.clients : DEFAULT_CLIENTS)
+  const detected = detectConfiguredClients(workspace, { global: opts.global });
+  const clients = (opts.clients && opts.clients.length ? opts.clients : detected)
     .filter((c) => ALL_CLIENTS.includes(c));
 
-  const launch = resolveLaunch(workspace, { ...opts, workspace });
+  const entries = clients.flatMap((c) => refreshClient(c, { ...opts, workspace }));
+  const launch = resolveLaunch(
+    workspace,
+    { ...opts, workspace, npx: true },
+    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null),
+  );
 
-  const entries = clients.flatMap((c) => configureClient(c, launch, { ...opts, workspace }));
+  let agents: ContextFileResult | undefined;
+  let contextFiles: ContextFileResult[] | undefined;
+  if (opts.agents !== false) {
+    const hasAction = entries.some((e) => e.action !== 'skipped');
+    const shouldWriteAgents = fs.existsSync(path.join(workspace, 'AGENTS.md')) || hasAction || clients.length > 0;
+    if (shouldWriteAgents) {
+      agents = writeContextFile('AGENTS.md', 'AGENTS.md (agent guide)', { ...opts, workspace, force: true });
+    }
+    contextFiles = [];
+    if (clients.includes('claude') || fs.existsSync(path.join(workspace, 'CLAUDE.md'))) {
+      contextFiles.push(writeContextFile(
+        'CLAUDE.md',
+        'CLAUDE.md (Claude guide)',
+        { ...opts, workspace, force: true },
+        claudeImportBlock(),
+      ));
+    }
+    if (clients.includes('gemini') || clients.includes('antigravity') || fs.existsSync(path.join(workspace, 'GEMINI.md'))) {
+      contextFiles.push(writeContextFile(
+        'GEMINI.md',
+        'GEMINI.md (Gemini guide)',
+        { ...opts, workspace, force: true },
+        geminiImportBlock(),
+      ));
+    }
+    if (contextFiles.length === 0) contextFiles = undefined;
+  }
+
+  return { launch, entries, agents, contextFiles };
+}
+
+export function runInit(opts: InitOptions): InitResult {
+  const workspace = path.resolve(opts.workspace);
+  const defaultClients = opts.auto ? detectAutoClients(workspace) : DEFAULT_CLIENTS;
+  const clients = (opts.clients && opts.clients.length ? opts.clients : defaultClients)
+    .filter((c) => ALL_CLIENTS.includes(c));
+
+  const launch = resolveLaunch(
+    workspace,
+    { ...opts, workspace },
+    Boolean(opts.global) || clients.some((c) => CLIENTS[c].projectPath === null),
+  );
+
+  const entries = clients.flatMap((c) => configureClient(c, { ...opts, workspace }));
 
   let agents: ContextFileResult | undefined;
   let contextFiles: ContextFileResult[] | undefined;
@@ -674,7 +947,12 @@ export function runInit(opts: InitOptions): InitResult {
     // told Seer exists — this is the difference between Gemini using Seer and
     // defaulting to grep.
     if (clients.includes('gemini') || clients.includes('antigravity')) {
-      contextFiles.push(writeContextFile('GEMINI.md', 'GEMINI.md (Gemini guide)', { ...opts, workspace }));
+      contextFiles.push(writeContextFile(
+        'GEMINI.md',
+        'GEMINI.md (Gemini guide)',
+        { ...opts, workspace },
+        geminiImportBlock(),
+      ));
     }
     if (contextFiles.length === 0) contextFiles = undefined;
   }

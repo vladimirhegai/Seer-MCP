@@ -7,11 +7,23 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
-import { runInit, runUninstall, ClientId } from './init.js';
+import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.7';
+const VERSION = '0.1.8';
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
+
+function parseClientList(raw: string | undefined): ClientId[] | undefined {
+  if (!raw) return undefined;
+  const names = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (names.includes('all')) return KNOWN_CLIENTS;
+  const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
+  if (bad.length) {
+    console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
+    process.exit(1);
+  }
+  return names as ClientId[];
+}
 
 function resolveDb(repoPath: string, customDb?: string): string {
   if (customDb) return path.resolve(customDb);
@@ -28,7 +40,7 @@ function openStore(dbPath: string, mutable = false): Store {
   return mutable ? new Store(dbPath) : Store.openReadOnly(dbPath);
 }
 
-// ── Program ────────────────────────────────────────────────────────────────────
+//  Program
 
 const program = new Command();
 
@@ -37,7 +49,7 @@ program
   .description('Local-first AI codebase explainer')
   .version(VERSION);
 
-// ── seer index ───────────────────────────────────────────────────────────────
+//  seer index
 
 program
   .command('index <repo-path>')
@@ -85,33 +97,34 @@ program
         parallel: opts.parallel,
         jobs: jobsN != null && !isNaN(jobsN) && jobsN > 0 ? jobsN : undefined,
       });
-      console.log(`\n  ✓ Indexed ${result.filesIndexed.toLocaleString()} files`);
+      console.log(`\n   Indexed ${result.filesIndexed.toLocaleString()} files`);
       if (result.filesReusedFromCache > 0) console.log(`    ${result.filesReusedFromCache.toLocaleString()} reused from cache`);
       if (result.filesSkipped > 0)         console.log(`    ${result.filesSkipped.toLocaleString()} skipped`);
       if (result.filesSkippedTooLarge > 0) console.log(`    ${result.filesSkippedTooLarge.toLocaleString()} skipped (too large)`);
       if (result.filesParseError > 0)      console.log(`    ${result.filesParseError.toLocaleString()} parse errors`);
       if (result.wasmResets > 0)           console.log(`    ${result.wasmResets} WASM reset(s)`);
-      console.log(`  ✓ ${result.symbols.toLocaleString()} symbols`);
-      console.log(`  ✓ ${result.edges.toLocaleString()} edges (${result.resolvedEdges.toLocaleString()} resolved)`);
-      console.log(`  ✓ ${result.resolvedImports.toLocaleString()} imports resolved`);
-      if ((result.routesResolved ?? 0) > 0)      console.log(`  ✓ ${result.routesResolved} routes linked to handlers`);
-      if ((result.testEdgesAdded ?? 0) > 0)      console.log(`  ✓ ${result.testEdgesAdded} test edges synthesized`);
-      if ((result.externalDependencies ?? 0) > 0)console.log(`  ✓ ${result.externalDependencies} external deps`);
-      if (result.pagerankRecomputed) console.log(`  ✓ PageRank computed`);
-      else                            console.log(`  ↻ PageRank reused (graph unchanged)`);
+      console.log(`   ${result.symbols.toLocaleString()} symbols`);
+      console.log(`   ${result.edges.toLocaleString()} edges (${result.resolvedEdges.toLocaleString()} resolved)`);
+      console.log(`   ${result.resolvedImports.toLocaleString()} imports resolved`);
+      if ((result.routesResolved ?? 0) > 0)      console.log(`   ${result.routesResolved} routes linked to handlers`);
+      if ((result.testEdgesAdded ?? 0) > 0)      console.log(`   ${result.testEdgesAdded} test edges synthesized`);
+      if ((result.externalDependencies ?? 0) > 0)console.log(`   ${result.externalDependencies} external deps`);
+      if (result.pagerankRecomputed) console.log(`   PageRank computed`);
+      else                            console.log(`   PageRank reused (graph unchanged)`);
       console.log(`\n  Done in ${(result.elapsedMs / 1000).toFixed(1)}s`);
     } finally {
       store.close();
     }
   });
 
-// ── seer init ──────────────────────────────────────────────────────────────
+//  seer init
 
 program
   .command('init [workspace]')
   .description('Wire Seer in as an MCP server for your AI agents and write guidance files')
   .option('--db <path>', 'Custom database path passed through to the MCP launcher')
-  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (default: claude,cursor,vscode,codex,gemini)')
+  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (default: project-local clients)')
+  .option('--auto', 'Project-local setup plus detected editor-global clients (Antigravity/Windsurf)')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
   .option('--pkg <name>', 'npm package name used by the --npx launcher', 'seer-mcp')
@@ -120,30 +133,18 @@ program
   .option('--print', 'Print the plan without writing any files')
   .option('--force', 'Overwrite an existing seer entry / agents block')
   .action((workspace: string | undefined, opts: {
-    db?: string; client?: string; global?: boolean; npx?: boolean; pkg?: string;
+    db?: string; client?: string; auto?: boolean; global?: boolean; npx?: boolean; pkg?: string;
     command?: string; agents?: boolean; print?: boolean; force?: boolean;
   }) => {
     const ws = path.resolve(workspace ?? process.cwd());
     if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
 
-    let clients: ClientId[] | undefined;
-    if (opts.client) {
-      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-      if (names.includes('all')) {
-        clients = KNOWN_CLIENTS;
-      } else {
-        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
-        if (bad.length) {
-          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
-          process.exit(1);
-        }
-        clients = names as ClientId[];
-      }
-    }
+    const clients = parseClientList(opts.client);
 
     const result = runInit({
       workspace: ws,
       clients,
+      auto: opts.auto,
       global: opts.global,
       npx: opts.npx,
       pkg: opts.pkg,
@@ -154,13 +155,16 @@ program
       db: opts.db,
     });
 
-    console.log(`\nSeer Init  ${opts.print ? '(dry run — nothing written)' : ''}`);
+    console.log(`\nSeer Init  ${opts.print ? '(dry run - nothing written)' : ''}`);
     console.log(`  Workspace: ${ws}`);
     console.log(`  Launcher:  ${result.launch.command} ${result.launch.args.join(' ')}\n`);
+    if (opts.auto && !opts.client) {
+      console.log(`  Auto clients: ${detectAutoClients(ws).join(', ')}\n`);
+    }
 
     const mark: Record<string, string> = opts.print
-      ? { wrote: '+ would write ', updated: '~ would update', skipped: '· would skip ', manual: '! manual      ' }
-      : { wrote: '✓ wrote ', updated: '✓ updated', skipped: '· skipped', manual: '! manual ' };
+      ? { wrote: '+ would write ', updated: '~ would update', skipped: '. would skip ', manual: '! manual      ' }
+      : { wrote: 'OK wrote ', updated: 'OK updated', skipped: '. skipped', manual: '! manual ' };
     for (const e of result.entries) {
       console.log(`  ${mark[e.action] ?? e.action}  ${e.label.padEnd(28)} ${e.file}`);
       if (e.note) console.log(`             ${e.note}`);
@@ -181,125 +185,92 @@ program
     console.log(`    3. Ask your agent to call seer_health to confirm it is connected.\n`);
   });
 
-// ── seer update ─────────────────────────────────────────────────────────────
-//
-// The npx launcher (`npx -y seer-mcp mcp`) auto-fetches the latest published
-// package on every agent start, so the binary self-updates. MCP configs also
-// never need changing — the launcher command is stable across releases. The
-// only thing that doesn't self-update is the guidance content written into
-// AGENTS.md / CLAUDE.md / GEMINI.md; `seer init` skips those files if the
-// markers are already present. `seer update` forces a refresh of those files
-// while leaving the MCP configs alone (they're already correct).
+// seer update
 
 program
   .command('update [workspace]')
-  .description('Refresh guidance files (AGENTS.md, CLAUDE.md, GEMINI.md) with the latest Seer content. MCP configs are unchanged — the npx launcher auto-updates the binary.')
-  .option('--client <names>', 'Comma-separated clients to target (default: all previously-configured clients)')
-  .option('--global', 'Target user-level configs instead of project-local ones')
-  .option('--print', 'Dry run — show what would change without writing anything')
+  .description('Refresh existing Seer MCP entries and guidance files for this workspace')
+  .option('--client <names>', 'Comma-separated clients to target (default: clients that already have seer configured)')
+  .option('--global', 'Only refresh user-level configs')
+  .option('--no-agents', 'Do not touch guidance files')
+  .option('--force', 'Re-point global seer entries even if they are pinned to another workspace')
+  .option('--print', 'Dry run: show what would change without writing anything')
   .action((workspace: string | undefined, opts: {
-    client?: string; global?: boolean; print?: boolean;
+    client?: string; global?: boolean; agents?: boolean; force?: boolean; print?: boolean;
   }) => {
     const ws = path.resolve(workspace ?? process.cwd());
     if (!fs.existsSync(ws)) { console.error(`Workspace not found: ${ws}`); process.exit(1); }
 
-    let clients: ClientId[] | undefined;
-    if (opts.client) {
-      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-      if (names.includes('all')) {
-        clients = KNOWN_CLIENTS;
-      } else {
-        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
-        if (bad.length) {
-          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
-          process.exit(1);
-        }
-        clients = names as ClientId[];
-      }
-    }
-
-    // Force-refresh guidance files; leave the launcher/MCP config alone by
-    // passing force only to the guidance pass via runInit internals. Since
-    // runInit's force flag governs both, we instead call it with force:true
-    // knowing that for npx installs the MCP config content is identical anyway
-    // (same command) — the "updated" write is a no-op in practice.
-    const result = runInit({
+    const clients = parseClientList(opts.client);
+    const inferred = clients ?? detectConfiguredClients(ws, { global: opts.global });
+    const result = runUpdate({
       workspace: ws,
-      clients,
+      clients: inferred,
       global: opts.global,
-      npx: true,        // keep the config in npx form — stable across updates
+      agents: opts.agents,
+      force: opts.force,
       print: opts.print,
-      force: true,      // the whole point: refresh guidance even if markers exist
     });
 
-    console.log(`\nSeer Update  ${opts.print ? '(dry run — nothing written)' : ''}`);
-    if (workspace) console.log(`  Workspace: ${ws}\n`);
+    console.log(`\nSeer Update  ${opts.print ? '(dry run - nothing written)' : ''}`);
+    console.log(`  Workspace: ${ws}`);
+    console.log(`  Clients:   ${inferred.length ? inferred.join(', ') : '(none found)'}\n`);
 
     const mark: Record<string, string> = opts.print
-      ? { wrote: '+ would write ', updated: '~ would update', skipped: '· no change  ', manual: '! manual      ' }
-      : { wrote: '✓ wrote ', updated: '✓ updated', skipped: '· no change ', manual: '! manual ' };
+      ? { wrote: '+ would write ', updated: '~ would update', skipped: '. no change  ', manual: '! manual      ' }
+      : { wrote: 'OK wrote ', updated: 'OK updated', skipped: '. no change ', manual: '! manual ' };
 
-    // Only report the guidance files — that's the point of this command.
-    const guidanceFiles = [result.agents, ...(result.contextFiles ?? [])].filter(Boolean) as Array<{ label: string; file: string; action: string }>;
-    if (guidanceFiles.length === 0) {
-      console.log(`  · No guidance files to update (try --client to specify agents).`);
-    } else {
-      for (const cf of guidanceFiles) {
-        console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(30)} ${cf.file}`);
-      }
+    for (const e of result.entries) {
+      console.log(`  ${mark[e.action] ?? e.action}  ${e.label.padEnd(30)} ${e.file}`);
+      if (e.note) console.log(`               ${e.note}`);
+    }
+    for (const cf of [result.agents, ...(result.contextFiles ?? [])].filter(Boolean) as Array<{ label: string; file: string; action: string }>) {
+      console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(30)} ${cf.file}`);
     }
 
-    if (!opts.print) {
-      console.log(`\n  Guidance files carry the latest tool table and workflow steps.`);
-      console.log(`  The npx launcher auto-fetches the latest binary on each agent start — no action needed.\n`);
+    if (inferred.length === 0 && !result.agents && !(result.contextFiles ?? []).length) {
+      console.log(`  . No Seer install found here. Run "npx seer-mcp init --auto" from the repo.`);
+    }
+    if (opts.print) {
+      console.log(`\n  (Dry run - run without --print to apply)\n`);
+    } else if (inferred.length > 0) {
+      console.log(`\n  Updated. Restart your agent so it reloads the MCP server.\n`);
     } else {
-      console.log(`\n  (Dry run — run without --print to apply)\n`);
+      console.log('');
     }
   });
 
-// ── seer uninstall ──────────────────────────────────────────────────────────
-
+// seer uninstall
 program
   .command('uninstall [workspace]')
   .description('Remove the Seer MCP entry from every agent config and strip the seer block from guidance files')
   .option('--client <names>', 'Comma-separated clients to target (default: all known clients)')
   .option('--global', 'Target user-level configs instead of project-local ones')
   .option('--no-agents', 'Do not touch guidance files (AGENTS.md, CLAUDE.md, GEMINI.md)')
-  .option('--print', 'Dry run — show what would change without writing anything')
+  .option('--force', 'Remove global seer entries even if they are pinned to another workspace')
+  .option('--print', 'Dry run  show what would change without writing anything')
   .action((workspace: string | undefined, opts: {
-    client?: string; global?: boolean; agents?: boolean; print?: boolean;
+    client?: string; global?: boolean; agents?: boolean; force?: boolean; print?: boolean;
   }) => {
     const ws = path.resolve(workspace ?? process.cwd());
 
-    let clients: ClientId[] | undefined;
-    if (opts.client) {
-      const names = opts.client.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-      if (names.includes('all')) {
-        clients = KNOWN_CLIENTS;
-      } else {
-        const bad = names.filter((n) => !KNOWN_CLIENTS.includes(n as ClientId));
-        if (bad.length) {
-          console.error(`Unknown client(s): ${bad.join(', ')}. Known: ${KNOWN_CLIENTS.join(', ')}, all`);
-          process.exit(1);
-        }
-        clients = names as ClientId[];
-      }
-    }
+    const clients = parseClientList(opts.client);
 
     const result = runUninstall({
       workspace: ws,
       clients,
       global: opts.global,
       agents: opts.agents,
+      force: opts.force,
       print: opts.print,
     });
 
-    console.log(`\nSeer Uninstall  ${opts.print ? '(dry run — nothing written)' : ''}`);
+    console.log(`\nSeer Uninstall  ${opts.print ? '(dry run - nothing written)' : ''}`);
     if (workspace) console.log(`  Workspace: ${ws}`);
 
     const mark: Record<string, string> = opts.print
-      ? { removed: '- would remove', deleted: '- would delete', skipped: '· nothing to do', manual: '! manual      ' }
-      : { removed: '✓ removed', deleted: '✓ deleted', skipped: '· nothing to do', manual: '! manual ' };
+      ? { removed: '- would remove', deleted: '- would delete', skipped: '. nothing to do', manual: '! manual      ' }
+      : { removed: 'OK removed', deleted: 'OK deleted', skipped: '. nothing to do', manual: '! manual ' };
 
     const allEntries = [...result.entries, ...result.contextFiles];
     const acted = allEntries.filter((e) => e.action !== 'skipped');
@@ -310,22 +281,22 @@ program
       if (e.note) console.log(`               ${e.note}`);
     }
     if (acted.length === 0) {
-      console.log(`  · Nothing to remove — no seer entries found.`);
+      console.log(`  . Nothing to remove - no seer entries found.`);
     }
     if (skipped.length > 0 && acted.length > 0) {
-      console.log(`  · ${skipped.length} file(s) had nothing to remove (already clean or not present).`);
+      console.log(`   ${skipped.length} file(s) had nothing to remove (already clean or not present).`);
     }
 
     if (!opts.print && acted.length > 0) {
       console.log(`\n  Done. Restart your agent to deregister the seer MCP server.\n`);
     } else if (opts.print) {
-      console.log(`\n  (Dry run — run without --print to apply)\n`);
+      console.log(`\n  (Dry run - run without --print to apply)\n`);
     } else {
       console.log('');
     }
   });
 
-// ── seer callers / callees / symbols / stats / health ──────────────────────────
+//  seer callers / callees / symbols / stats / health
 
 program
   .command('callers <symbol>')
@@ -348,7 +319,7 @@ program
         const loc = `${c.callerFile}:${c.callerLine + 1}`;
         console.log(`  ${c.callerName.padEnd(32)} ${c.callerKind.padEnd(12)} ${loc}`);
       }
-      if (total > callers.length) console.log(`  … and ${total - callers.length} more`);
+      if (total > callers.length) console.log(`   and ${total - callers.length} more`);
     } finally { store.close(); }
   });
 
@@ -370,7 +341,7 @@ program
         const kind = c.calleeKind ?? '?';
         console.log(`  ${c.calleeName.padEnd(32)} ${kind.padEnd(12)} ${loc}`);
       }
-      if (callees.length > limit) console.log(`  … and ${callees.length - limit} more`);
+      if (callees.length > limit) console.log(`   and ${callees.length - limit} more`);
     } finally { store.close(); }
   });
 
@@ -403,7 +374,7 @@ program
       else { symbols = store.getTopSymbols(limit, includeOpts); console.log(`\nTop ${limit} symbols by PageRank\n`); }
       if (symbols.length === 0) { console.log('  (none found)'); return; }
       console.log(`  ${'Name'.padEnd(32)} ${'Kind'.padEnd(12)} ${'Line'.padEnd(6)} ${'PageRank'.padEnd(10)} ${'Role'.padEnd(11)} File`);
-      console.log('  ' + '─'.repeat(102));
+      console.log('  ' + ''.repeat(102));
       for (const s of symbols) {
         const pr = s.pagerank.toFixed(4);
         const loc = String(s.lineStart + 1).padEnd(6);
@@ -424,7 +395,7 @@ program
     try {
       const stats = store.getStats();
       console.log('\nSeer Index Stats');
-      console.log('──────────────────');
+      console.log('');
       console.log(`  Files:           ${stats.files.toLocaleString()}`);
       console.log(`  Symbols:         ${stats.symbols.toLocaleString()}`);
       console.log(`  Edges:           ${stats.edges.toLocaleString()}`);
@@ -452,12 +423,12 @@ program
       const schema = store.schemaInfo();
       const stats = store.getStats();
       console.log('\nSeer Health');
-      console.log('─────────────');
+      console.log('');
       console.log(`  DB path:           ${dbPath}`);
       console.log(`  Read-only:         ${store.isReadOnly()}`);
       console.log(`  Schema version:    ${schema.dbVersion} (build expects ${schema.buildVersion})`);
-      if (!schema.current) console.log(`  ⚠  Schema is behind. Run \`seer index <path>\` to migrate.`);
-      else                  console.log(`  ✓  Schema is up to date.`);
+      if (!schema.current) console.log(`    Schema is behind. Run \`seer index <path>\` to migrate.`);
+      else                  console.log(`    Schema is up to date.`);
       console.log(`  Files:             ${stats.files.toLocaleString()}`);
       console.log(`  Symbols:           ${stats.symbols.toLocaleString()}`);
       console.log(`  Edges:             ${stats.edges.toLocaleString()} (${stats.resolvedEdges.toLocaleString()} resolved)`);
@@ -472,7 +443,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer routes ──────────────────────────────────────────────────────────────
+//  seer routes
 
 program
   .command('routes')
@@ -495,13 +466,13 @@ program
       if (rows.length === 0) { console.log('No routes found.'); return; }
       console.log(`\nRoutes (${rows.length} shown)\n`);
       for (const r of rows) {
-        const h = r.handlerSymbol ? `→ ${r.handlerSymbol}` : (r.handlerName ? `→ ${r.handlerName} (unresolved)` : '');
+        const h = r.handlerSymbol ? ` ${r.handlerSymbol}` : (r.handlerName ? ` ${r.handlerName} (unresolved)` : '');
         console.log(`  ${r.method.padEnd(6)} ${r.path.padEnd(40)} ${r.framework.padEnd(10)} ${h}`);
       }
     } finally { store.close(); }
   });
 
-// ── seer service-calls / service-links / trace-service ──────────────────────
+//  seer service-calls / service-links / trace-service
 
 program
   .command('service-calls')
@@ -578,7 +549,7 @@ program
         const route = r.routePath ?? r.callNormalizedPath ?? r.callRawTarget;
         console.log(
           `  ${(r.callMethod ?? 'ANY').padEnd(6)} ${(route ?? '').padEnd(36)} ` +
-          `${caller.padEnd(22)} → ${handler.padEnd(22)} ` +
+          `${caller.padEnd(22)}  ${handler.padEnd(22)} ` +
           `[${r.matchKind} ${r.confidence.toFixed(2)}]`,
         );
       }
@@ -609,12 +580,12 @@ program
           `SELECT qualified_name, name FROM symbols WHERE id = ?`
         ).get(id) as { qualified_name: string | null; name: string } | undefined;
         const label = row?.qualified_name ?? row?.name ?? `#${id}`;
-        console.log(`  → ${label}`);
+        console.log(`   ${label}`);
       }
     } finally { store.close(); }
   });
 
-// ── seer deps ────────────────────────────────────────────────────────────────
+//  seer deps
 
 program
   .command('deps')
@@ -639,7 +610,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer config ──────────────────────────────────────────────────────────────
+//  seer config
 
 program
   .command('config')
@@ -660,7 +631,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer churn (file-level git churn pass) ──────────────────────────────────
+//  seer churn (file-level git churn pass)
 
 program
   .command('churn')
@@ -675,11 +646,11 @@ program
     try {
       const { collectChurn } = await import('../indexer/churn.js');
       const r = await collectChurn(workspace, store);
-      console.log(`\nChurn pass: ${r.filesWithChurn}/${r.filesAnalyzed} files have history (HEAD ${r.headSha?.slice(0, 8) ?? '—'}), ${r.elapsedMs}ms`);
+      console.log(`\nChurn pass: ${r.filesWithChurn}/${r.filesAnalyzed} files have history (HEAD ${r.headSha?.slice(0, 8) ?? ''}), ${r.elapsedMs}ms`);
     } finally { store.close(); }
   });
 
-// ── seer history (Track D) ──────────────────────────────────────────────────
+//  seer history (Track D)
 
 program
   .command('history <symbol>')
@@ -697,7 +668,7 @@ program
         const history = store.getSymbolHistory(m.id, { limit });
         const total = store.countSymbolHistory(m.id);
         console.log(`\n${m.qualifiedName ?? m.name}  (${m.kind})  ${m.filePath}:${m.lineStart + 1}`);
-        if (history.length === 0) { console.log(`  (no history — run \`seer symbol-history\` first)`); continue; }
+        if (history.length === 0) { console.log(`  (no history  run \`seer symbol-history\` first)`); continue; }
         console.log(`  ${total} commits in history${total > history.length ? ` (showing ${history.length})` : ''}`);
         for (const h of history) {
           const date = new Date(h.committedAt * 1000).toISOString().slice(0, 10);
@@ -733,11 +704,11 @@ program
     } finally { store.close(); }
   });
 
-// ── seer continuity (rename/move continuity evidence) ────────────────────
+//  seer continuity (rename/move continuity evidence)
 
 program
   .command('continuity <symbol>')
-  .description('v10 — Show rename/move continuity evidence (advisory; confidence-labelled).')
+  .description('v10  Show rename/move continuity evidence (advisory; confidence-labelled).')
   .option('--db <path>', 'Database path')
   .action(async (symbol: string, opts: { db?: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
@@ -769,14 +740,14 @@ program
           continue;
         }
         for (const r of rows) {
-          console.log(`  ← previous: ${r.previousName.padEnd(28)} conf=${r.confidence.toFixed(2)}  [${r.matchReasons.join(', ')}]`);
+          console.log(`   previous: ${r.previousName.padEnd(28)} conf=${r.confidence.toFixed(2)}  [${r.matchReasons.join(', ')}]`);
           console.log(`     in:       ${r.previousFile}`);
         }
       }
     } finally { store.close(); }
   });
 
-// ── seer architecture ──────────────────────────────────────────────────────
+//  seer architecture
 
 program
   .command('architecture')
@@ -790,7 +761,7 @@ program
       const { buildArchitecture } = await import('../indexer/architecture.js');
       const a = buildArchitecture(path.dirname(path.dirname(dbPath)), store);
       console.log(`\nArchitecture snapshot`);
-      console.log(`─────────────────────`);
+      console.log(``);
       console.log(`  Workspace: ${a.workspace}`);
       console.log(`  Totals:    files=${a.totals.files}  symbols=${a.totals.symbols}  edges=${a.totals.edges}  routes=${a.totals.routes}  deps=${a.totals.externalDependencies}  configKeys=${a.totals.configKeys}`);
       console.log(`\n  Languages:`);
@@ -805,7 +776,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer detect-changes ────────────────────────────────────────────────────
+//  seer detect-changes
 
 program
   .command('detect-changes')
@@ -829,7 +800,7 @@ program
       for (const f of r.changedFiles) {
         console.log(`\n  ${f.path}  (${f.hunks} hunk(s))`);
         for (const s of f.symbols) {
-          console.log(`    → ${(s.symbol.qualifiedName ?? s.symbol.name).padEnd(40)} ${s.symbol.kind}`);
+          console.log(`     ${(s.symbol.qualifiedName ?? s.symbol.name).padEnd(40)} ${s.symbol.kind}`);
         }
       }
       if (r.transitivelyAffected.length > 0) {
@@ -842,7 +813,7 @@ program
     } finally { store.close(); }
   });
 
-// ── Track-E: modules / behavior / risk / context ──────────────────────────
+//  Track-E: modules / behavior / risk / context
 
 program
   .command('modules')
@@ -856,10 +827,10 @@ program
     try {
       const sortBy = opts.sort === 'size' || opts.sort === 'label' ? opts.sort : 'centrality';
       const rows = store.listModules({ limit: parseInt(opts.limit, 10) || 40, sortBy });
-      if (rows.length === 0) { console.log('No modules — run `seer index` to build the clustering.'); return; }
+      if (rows.length === 0) { console.log('No modules  run `seer index` to build the clustering.'); return; }
       console.log(`\nModules (${rows.length} shown, sorted by ${sortBy})\n`);
       console.log(`  ${'Label'.padEnd(28)} ${'Files'.padStart(5)} ${'Symbols'.padStart(7)} ${'Lang'.padEnd(12)} ${'Cohesion'.padStart(8)} ${'Central'.padStart(8)}`);
-      console.log('  ' + '─'.repeat(80));
+      console.log('  ' + ''.repeat(80));
       for (const m of rows) {
         console.log(
           `  ${m.label.padEnd(28)} ${String(m.sizeFiles).padStart(5)} ${String(m.sizeSymbols).padStart(7)} ${(m.primaryLanguage ?? '').padEnd(12)} ${m.cohesion.toFixed(2).padStart(8)} ${m.centrality.toFixed(4).padStart(8)}`,
@@ -968,7 +939,7 @@ program
       if (!c) { console.log(`No symbol "${symbol}"`); return; }
       console.log(`\nContext for ${c.symbol.qualifiedName ?? c.symbol.name}  (${c.symbol.kind})  ${c.symbol.file}:${c.symbol.lineStart + 1}`);
       if (c.module) console.log(`  Module: ${c.module.label}`);
-      console.log(`  Complexity: loc=${c.complexity.loc ?? '—'}  cyclomatic=${c.complexity.cyclomatic ?? '—'}  cognitive=${c.complexity.cognitive ?? '—'}`);
+      console.log(`  Complexity: loc=${c.complexity.loc ?? ''}  cyclomatic=${c.complexity.cyclomatic ?? ''}  cognitive=${c.complexity.cognitive ?? ''}`);
       console.log(`  Callers: ${c.callers.total} total; Callees: ${c.callees.total}; Blast radius (depth ${c.blastRadius.maxDepth}): direct=${c.blastRadius.directCallers}, transitive=${c.blastRadius.transitiveCallers}`);
       console.log(`  Behavior: direct=${c.behavior.direct}  indirect=${c.behavior.indirect}  naming=${c.behavior.namingMatches}  same-file=${c.behavior.sameFileMatches}`);
       console.log(`  Routes: ${c.routes.length}  Config: ${c.configKeys.length}  History: ${c.recentHistory.total}`);
@@ -981,7 +952,7 @@ program
     } finally { store.close(); }
   });
 
-// ── Track-F: bundle export/import + CI pipeline ──────────────────────────
+//  Track-F: bundle export/import + CI pipeline
 
 const bundleCmd = program
   .command('bundle')
@@ -1006,7 +977,7 @@ bundleCmd
       builtAt: (builtAt != null && !isNaN(builtAt)) ? builtAt : undefined,
       log: (m) => console.log(`  ${m}`),
     });
-    console.log(`\n  ✓ Bundle exported to ${r.bundlePath}`);
+    console.log(`\n   Bundle exported to ${r.bundlePath}`);
     console.log(`    ${r.bytes.toLocaleString()} bytes  schemaVersion=${r.manifest.schemaVersion}  symbols=${r.manifest.index.symbols}  edges=${r.manifest.index.edges}`);
     console.log(`    DB sha256=${r.manifest.dbSha256.slice(0, 16)}...  built in ${r.elapsedMs}ms`);
   });
@@ -1019,7 +990,7 @@ bundleCmd
   .option('--overwrite', 'Allow overwriting an existing index')
   .option('--skip-integrity-check', 'Skip sha256 check (forensics only)')
   .option('--skip-schema-check', 'Skip schemaVersion compatibility check (use only if you KNOW the bundle is safe)')
-  .option('--external', 'Additive external import — adds routes/service endpoints as a read-only external layer, never replaces local rows.')
+  .option('--external', 'Additive external import  adds routes/service endpoints as a read-only external layer, never replaces local rows.')
   .option('--alias <name>', 'Optional alias for the external bundle (defaults to manifest.gitBranch or filename).')
   .option('--force', 'Force re-import even if the same hash is already present (external mode only).')
   .action(async (bundle: string, opts: { workspace?: string; db?: string; overwrite?: boolean; skipIntegrityCheck?: boolean; skipSchemaCheck?: boolean; external?: boolean; alias?: string; force?: boolean }) => {
@@ -1038,14 +1009,14 @@ bundleCmd
           log: (m) => console.log(`  ${m}`),
         });
         if (r.alreadyImported) {
-          console.log(`\n  ↻ External bundle already imported (hash unchanged); no-op.`);
+          console.log(`\n   External bundle already imported (hash unchanged); no-op.`);
         } else {
-          console.log(`\n  ✓ External bundle imported as layer #${r.bundleId} (${r.externalProject ?? 'unnamed'}).`);
+          console.log(`\n   External bundle imported as layer #${r.bundleId} (${r.externalProject ?? 'unnamed'}).`);
           console.log(`    routes=${r.routesImported}  serviceEndpoints=${r.serviceEndpointsImported}  schemaVersion=${r.schemaVersion}`);
           console.log(`    hash=${r.externalHash.slice(0, 12)}...  took ${r.elapsedMs}ms`);
         }
       } catch (err) {
-        console.error(`\n  ✗ External import failed: ${(err as Error).message}`);
+        console.error(`\n   External import failed: ${(err as Error).message}`);
         process.exit(1);
       } finally { store.close(); }
       return;
@@ -1060,17 +1031,17 @@ bundleCmd
         skipSchemaCheck: opts.skipSchemaCheck,
         log: (m) => console.log(`  ${m}`),
       });
-      console.log(`\n  ✓ Bundle imported to ${r.dbPath}`);
+      console.log(`\n   Bundle imported to ${r.dbPath}`);
       console.log(`    builtAt=${new Date(r.manifest.builtAt).toISOString()}  schemaVersion=${r.manifest.schemaVersion}`);
       console.log(`    symbols=${r.manifest.index.symbols}  edges=${r.manifest.index.edges}  modules=${r.manifest.index.modules}`);
       console.log(`    Took ${r.elapsedMs}ms`);
     } catch (err) {
-      console.error(`\n  ✗ Import failed: ${(err as Error).message}`);
+      console.error(`\n   Import failed: ${(err as Error).message}`);
       process.exit(1);
     }
   });
 
-// ── seer boundaries (Feature 4: monorepo boundary detection) ─────────────
+//  seer boundaries (Feature 4: monorepo boundary detection)
 
 program
   .command('boundaries')
@@ -1083,7 +1054,7 @@ program
     try {
       const rows = store.listBoundaries(parseInt(opts.limit, 10) || 50);
       if (rows.length === 0) {
-        console.log('No boundaries detected — workspace has no nested package manifests or convention dirs.');
+        console.log('No boundaries detected  workspace has no nested package manifests or convention dirs.');
         return;
       }
       console.log(`\nBoundaries (${rows.length} shown)\n`);
@@ -1094,7 +1065,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer preflight ────────────────────────────────────────────────────────
+//  seer preflight
 
 program
   .command('preflight')
@@ -1148,7 +1119,7 @@ program
 
 function printPreflight(r: import('../indexer/preflight.js').PreflightResult): void {
   if (!r.ok) {
-    console.log(`\n  ✗ preflight failed: ${r.reason}`);
+    console.log(`\n   preflight failed: ${r.reason}`);
     return;
   }
   console.log(`\nPreflight (${r.mode})`);
@@ -1156,7 +1127,7 @@ function printPreflight(r: import('../indexer/preflight.js').PreflightResult): v
     console.log(`  Symbol:   ${r.symbol.qualifiedName ?? r.symbol.name}  ${r.symbol.file}:${r.symbol.lineStart + 1}`);
   }
   if (r.range) {
-    console.log(`  Range:    ${r.range.fromRef ?? '(working tree)'} → ${r.range.toRef ?? 'HEAD'}`);
+    console.log(`  Range:    ${r.range.fromRef ?? '(working tree)'}  ${r.range.toRef ?? 'HEAD'}`);
     console.log(`            ${r.range.changedFiles} file(s), ${r.range.directHunkCount} hunk(s)`);
   }
   console.log(`  Risk:     ${r.risk.overall.toUpperCase()}`);
@@ -1166,7 +1137,7 @@ function printPreflight(r: import('../indexer/preflight.js').PreflightResult): v
   if (r.likelyTests.length > 0) {
     console.log(`  Likely tests (${r.likelyTests.length}):`);
     for (const t of r.likelyTests.slice(0, 8)) {
-      console.log(`    • ${(t.testSymbol.qualifiedName ?? t.testSymbol.name).padEnd(40)} [${t.relationship}]  spec=${t.specificity}`);
+      console.log(`     ${(t.testSymbol.qualifiedName ?? t.testSymbol.name).padEnd(40)} [${t.relationship}]  spec=${t.specificity}`);
     }
   }
   if (r.serviceImpact.inbound.length + r.serviceImpact.outbound.length > 0) {
@@ -1181,11 +1152,11 @@ function printPreflight(r: import('../indexer/preflight.js').PreflightResult): v
   }
   if (r.warnings.length > 0) {
     console.log(`  Warnings:`);
-    for (const w of r.warnings) console.log(`    ⚠  ${w}`);
+    for (const w of r.warnings) console.log(`      ${w}`);
   }
 }
 
-// ── seer contract diff ────────────────────────────────────────────────────
+//  seer contract diff
 
 const contractCmd = program
   .command('contract')
@@ -1193,7 +1164,7 @@ const contractCmd = program
 
 contractCmd
   .command('diff <old-bundle> <new-bundle>')
-  .description('Diff API/service contracts (routes, tRPC/GraphQL/gRPC ops, topics, queues) between two bundles. Exit 0 even when breaking changes appear — advisory only.')
+  .description('Diff API/service contracts (routes, tRPC/GraphQL/gRPC ops, topics, queues) between two bundles. Exit 0 even when breaking changes appear  advisory only.')
   .option('--json', 'Emit machine-readable JSON instead of a compact table.')
   .option('--include-callers', 'Include affectedCallers using service-link evidence from both bundles.')
   .action(async (oldBundle: string, newBundle: string, opts: { json?: boolean; includeCallers?: boolean }) => {
@@ -1212,7 +1183,7 @@ contractCmd
       // Advisory: always exit 0.
       process.exit(0);
     } catch (err) {
-      console.error(`\n  ✗ contract diff failed: ${(err as Error).message}`);
+      console.error(`\n   contract diff failed: ${(err as Error).message}`);
       process.exit(1);
     }
   });
@@ -1248,7 +1219,7 @@ bundleCmd
       const manifest = readBundleManifest(path.resolve(bundle));
       console.log(JSON.stringify(manifest, null, 2));
     } catch (err) {
-      console.error(`\n  ✗ ${(err as Error).message}`);
+      console.error(`\n   ${(err as Error).message}`);
       process.exit(1);
     }
   });
@@ -1280,10 +1251,10 @@ ciCmd
         gitHead: opts.gitHead, gitBranch: opts.gitBranch,
         builtAt: (builtAt != null && !isNaN(builtAt)) ? builtAt : undefined,
       });
-      console.log(`\n  ✓ CI bundle: ${r.bundle.bundlePath}`);
+      console.log(`\n   CI bundle: ${r.bundle.bundlePath}`);
       console.log(`    ${r.index.symbols.toLocaleString()} symbols / ${r.index.edges.toLocaleString()} edges in ${r.totalElapsedMs}ms`);
     } catch (err) {
-      console.error(`\n  ✗ CI bundle failed: ${(err as Error).message}`);
+      console.error(`\n   CI bundle failed: ${(err as Error).message}`);
       process.exit(1);
     }
   });
@@ -1296,7 +1267,7 @@ ciCmd
     process.stdout.write(workflowTemplate());
   });
 
-// ── Track-F: SCIP import ────────────────────────────────────────────────
+//  Track-F: SCIP import
 
 program
   .command('scip-import <scip-path>')
@@ -1320,14 +1291,14 @@ program
         requireFileInIndex: opts.requireFileInIndex ?? true,
         log: (m) => console.log(`  ${m}`),
       });
-      console.log(`\n  ✓ SCIP import done in ${r.elapsedMs}ms`);
+      console.log(`\n   SCIP import done in ${r.elapsedMs}ms`);
       console.log(`    docs=${r.documentsProcessed}  symbols=${r.symbolsInserted} new, ${r.symbolsMerged} merged`);
       console.log(`    edges=${r.edgesInserted}  filesMissing=${r.filesMissing}`);
-      console.log(`    tool=${r.tool ?? '—'}  sha=${r.sha256.slice(0, 12)}...`);
+      console.log(`    tool=${r.tool ?? ''}  sha=${r.sha256.slice(0, 12)}...`);
     } finally { store.close(); }
   });
 
-// ── Track-F: duplicate detection ────────────────────────────────────────
+//  Track-F: duplicate detection
 
 program
   .command('duplicates')
@@ -1350,7 +1321,7 @@ program
         maxClusters: parseInt(opts.limit, 10) || 40,
       });
       if (clusters.length === 0) {
-        console.log('No duplicate clusters found (have you run `seer index`? — shape hashes are built during indexing).');
+        console.log('No duplicate clusters found (have you run `seer index`?  shape hashes are built during indexing).');
         return;
       }
       console.log(`\nFound ${clusters.length} duplicate cluster(s):\n`);
@@ -1364,7 +1335,7 @@ program
     } finally { store.close(); }
   });
 
-// ── seer mcp ─────────────────────────────────────────────────────────────────
+//  seer mcp
 
 program
   .command('mcp')
@@ -1385,7 +1356,7 @@ program
     });
   });
 
-// ── DB auto-detection ──────────────────────────────────────────────────────────
+//  DB auto-detection
 
 function parseMode(input: string | undefined): 'full' | 'standard' | 'fast' | undefined {
   if (!input) return undefined;
@@ -1397,7 +1368,7 @@ function parseMode(input: string | undefined): 'full' | 'standard' | 'fast' | un
 
 function findDbFromCwd(): string {
   let dir = process.cwd();
-  for (let i = 0; i < 6; i++) {
+  while (true) {
     const candidate = path.join(dir, '.seer', 'graph.db');
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);

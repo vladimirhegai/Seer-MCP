@@ -1,6 +1,7 @@
 import fs from 'fs';
 import crypto from 'crypto';
 import path from 'path';
+import glob from 'fast-glob';
 import { Indexer } from './index.js';
 import { Store } from '../db/store.js';
 import { discoverFiles } from './discovery.js';
@@ -43,6 +44,28 @@ function sha256Short(content: string): string {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
 }
 
+async function discoverProtoFiles(absRoot: string): Promise<Array<{ absolutePath: string; relativePath: string }>> {
+  const entries = await glob(['**/*.proto'], {
+    cwd: absRoot,
+    ignore: [
+      'node_modules/**', '**/node_modules/**',
+      '.git/**', '**/.git/**',
+      'dist/**', '**/dist/**',
+      'build/**', '**/build/**',
+      'out/**', '**/out/**',
+      'vendor/**', '**/vendor/**', '**/__pycache__/**',
+      '.next/**', '**/.next/**',
+    ],
+    onlyFiles: true,
+    followSymbolicLinks: false,
+    dot: false,
+  });
+  return entries.sort().map(rel => ({
+    absolutePath: path.join(absRoot, rel),
+    relativePath: rel,
+  }));
+}
+
 /**
  * Inspect a workspace for changes since the last index, then reindex only
  * the files that need it. Designed to run before every MCP query.
@@ -74,7 +97,10 @@ export async function jitSync(
   // 2. Walk the workspace and find candidate files. discoverFiles() applies
   //    the same ignore rules the indexer uses, so freshness can't be
   //    misled by build artifacts or `vendor/` entries.
-  const discovered = await discoverFiles(absRoot);
+  const discovered = [
+    ...await discoverFiles(absRoot),
+    ...await discoverProtoFiles(absRoot),
+  ];
   const discoveredByPath = new Map<string, string>();
   for (const d of discovered) {
     discoveredByPath.set(normalizeForCompare(d.absolutePath), d.relativePath);
