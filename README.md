@@ -68,25 +68,32 @@ npx seer-mcp init --client antigravity   # Antigravity IDE / CLI
 npx seer-mcp init --client claude        # Claude Code CLI
 npx seer-mcp init --client windsurf      # Windsurf user config, pinned here
 npx seer-mcp init --client codex         # Codex only
-npx seer-mcp init --client all           # all clients, including Windsurf user config
+npx seer-mcp init --client all           # all clients; also writes Windsurf user config
 ```
 
 Useful flags:
 
 - `--auto`: workspace-local setup; no global editor files.
-- `--client <name>`: target one client, or use `all`.
+- `--client <name>`: target one client. `all` includes user-level clients such as Windsurf.
 - `--global`: write user-level config for clients that support it.
 - `--print`: preview files before writing.
 - `--force`: replace an existing `seer` / `seer_<workspace>` entry.
 
-Restart/reload your agent, then ask it to call:
+Build the local index now:
+
+```bash
+npx seer-mcp index .
+```
+
+Then restart/reload your agent and ask it to call:
 
 ```text
 seer_health
 ```
 
-The first query builds `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore`
-if it is not already ignored.
+The index lives at `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore` if
+it is not already ignored. If you skip `index .`, Seer builds the index on the
+first query.
 Claude Code gets Seer's core MCP tools marked as always-load. Antigravity has
 no eager flag; Seer relies on workspace-local config plus `--workspace`/`cwd`.
 

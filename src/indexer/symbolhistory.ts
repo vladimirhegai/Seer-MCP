@@ -34,16 +34,26 @@ export interface SymbolHistoryOptions {
   since?: number;
   /** Only re-run if HEAD differs from `git_index_state.last_head_sha`. Default true. */
   skipIfHeadUnchanged?: boolean;
+  /** Stop after this many files. Intended for MCP-safe partial builds. */
+  maxFiles?: number;
+  /** Wall-clock budget for the build. Incomplete runs do not stamp HEAD. */
+  deadlineMs?: number;
+  /** Timeout for each individual git log/show command. */
+  gitCommandTimeoutMs?: number;
   /** Logger; defaults to stderr. */
   log?: (msg: string) => void;
 }
 
 export interface SymbolHistoryResult {
+  completed: boolean;
   filesProcessed: number;
+  filesTotal: number;
+  filesRemaining: number;
   symbolsProcessed: number;
   historyRowsInserted: number;
   skipped: boolean;
   elapsedMs: number;
+  reason?: string;
 }
 
 export async function buildSymbolHistory(
@@ -52,10 +62,38 @@ export async function buildSymbolHistory(
   options: SymbolHistoryOptions = {},
 ): Promise<SymbolHistoryResult> {
   const start = Date.now();
+  const deadlineAt = options.deadlineMs && options.deadlineMs > 0
+    ? start + options.deadlineMs
+    : Number.POSITIVE_INFINITY;
+  let stopReason: string | null = null;
   const log = options.log ?? ((m: string) => process.stderr.write(`[symbol-history] ${m}\n`));
+  const done = (
+    completed: boolean,
+    filesProcessed: number,
+    filesTotal: number,
+    symbolsProcessed: number,
+    historyRowsInserted: number,
+    skipped: boolean,
+    reason?: string,
+  ): SymbolHistoryResult => ({
+    completed,
+    filesProcessed,
+    filesTotal,
+    filesRemaining: Math.max(0, filesTotal - filesProcessed),
+    symbolsProcessed,
+    historyRowsInserted,
+    skipped,
+    elapsedMs: Date.now() - start,
+    ...(reason ? { reason } : {}),
+  });
+  const deadlineExceeded = (): boolean => Date.now() >= deadlineAt;
+  const noteTimeout = (command: string): void => {
+    const timeout = options.gitCommandTimeoutMs ?? (Number(process.env.SEER_GIT_TIMEOUT_MS) || 15000);
+    stopReason = `${command} timed out after ${timeout}ms`;
+  };
   if (!isGitRepo(repoRoot)) {
     log('not a git repo, skipping');
-    return { filesProcessed: 0, symbolsProcessed: 0, historyRowsInserted: 0, skipped: true, elapsedMs: Date.now() - start };
+    return done(true, 0, 0, 0, 0, true);
   }
   const head = gitHeadSha(repoRoot);
   const state = store.getGitIndexState();
@@ -66,13 +104,13 @@ export async function buildSymbolHistory(
   // actually built.
   if (options.skipIfHeadUnchanged !== false && state && state.lastHistoryHeadSha === head && head !== null) {
     log(`HEAD ${head?.slice(0, 8)} unchanged; skipping`);
-    return { filesProcessed: 0, symbolsProcessed: 0, historyRowsInserted: 0, skipped: true, elapsedMs: Date.now() - start };
+    return done(true, 0, 0, 0, 0, true);
   }
   const remote = gitRemoteUrl(repoRoot);
   const maxCommits = options.maxCommitsPerFile ?? 200;
   const symbols = store.listSymbolsForHistoryIndex();
   if (symbols.length === 0) {
-    return { filesProcessed: 0, symbolsProcessed: 0, historyRowsInserted: 0, skipped: false, elapsedMs: Date.now() - start };
+    return done(true, 0, 0, 0, 0, false);
   }
 
   // Group symbols by file path so we walk `git log` once per file.
@@ -83,23 +121,47 @@ export async function buildSymbolHistory(
     arr.push(s);
   }
 
+  const filesTotal = byFile.size;
+  const maxFiles = Math.min(options.maxFiles ?? filesTotal, filesTotal);
   let totalInserts = 0;
   let processedFiles = 0;
   for (const [filePath, fileSymbols] of byFile) {
+    if (processedFiles >= maxFiles) {
+      stopReason = `stopped after maxFiles=${maxFiles}`;
+      break;
+    }
+    if (deadlineExceeded()) {
+      stopReason = `deadline exceeded after ${options.deadlineMs}ms`;
+      break;
+    }
     processedFiles++;
-    const commits = await commitsForFile(repoRoot, filePath, { limit: maxCommits, since: options.since });
+    const commits = await commitsForFile(repoRoot, filePath, {
+      limit: maxCommits,
+      since: options.since,
+      timeoutMs: options.gitCommandTimeoutMs,
+      onTimeout: noteTimeout,
+    });
+    if (stopReason) break;
     if (commits.length === 0) continue;
     // For each commit, fetch its diff hunks (in the new-file coordinate
     // space). A symbol whose [line_start..line_end] range overlaps any hunk
     // is considered touched.
     for (let i = 0; i < commits.length; i++) {
+      if (deadlineExceeded()) {
+        stopReason = `deadline exceeded after ${options.deadlineMs}ms`;
+        break;
+      }
       const c = commits[i];
       // Use the per-commit path resolved from `git log --follow --name-status`.
       // If that wasn't available (older git or no rename detected), fall back
       // to the current path — that's correct for commits where the file
       // hadn't been renamed.
       const lookupPath = c.pathAtCommit ?? filePath;
-      const info = await fileDiffInfo(repoRoot, c.sha, lookupPath);
+      const info = await fileDiffInfo(repoRoot, c.sha, lookupPath, {
+        timeoutMs: options.gitCommandTimeoutMs,
+        onTimeout: noteTimeout,
+      });
+      if (stopReason) break;
       if (info.hunks.length === 0 && !info.isFileAddition) continue;
       const totalAdded = info.hunks.reduce((acc, h) => acc + h.newLines, 0);
       const totalRemoved = info.hunks.reduce((acc, h) => acc + h.oldLines, 0);
@@ -144,6 +206,12 @@ export async function buildSymbolHistory(
         totalInserts++;
       }
     }
+    if (stopReason) break;
+  }
+
+  if (stopReason) {
+    log(`partial: ${processedFiles}/${filesTotal} files, ${totalInserts} history rows (${stopReason})`);
+    return done(false, processedFiles, filesTotal, symbols.length, totalInserts, false, stopReason);
   }
 
   // v10 — run the continuity heuristics for symbols whose recorded history is
@@ -163,7 +231,10 @@ export async function buildSymbolHistory(
   store.setHistoryHeadSha(repoRoot, head, remote);
   log(`done: ${processedFiles} files, ${totalInserts} history rows`);
   return {
+    completed: true,
     filesProcessed: processedFiles,
+    filesTotal,
+    filesRemaining: 0,
     symbolsProcessed: symbols.length,
     historyRowsInserted: totalInserts,
     skipped: false,

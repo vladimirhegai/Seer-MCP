@@ -50,12 +50,15 @@ Use a narrower command when you know the client:
 | VS Code native MCP / Copilot | `npx seer-mcp init --client vscode` |
 | OpenAI Codex CLI / extension | `npx seer-mcp init --client codex` |
 | Gemini CLI | `npx seer-mcp init --client gemini` |
-| Windsurf | `npx seer-mcp init --client windsurf` |
-| Everything supported | `npx seer-mcp init --client all` |
+| Windsurf user config | `npx seer-mcp init --client windsurf` |
+| Everything supported, including Windsurf user config | `npx seer-mcp init --client all` |
 | Workspace-local defaults only | `npx seer-mcp init` |
 
 Use `--force` if you intentionally want to replace an existing `seer` /
 `seer_<workspace>` entry.
+
+`--client all` includes user-level-only clients such as Windsurf. Use `--auto`
+when you want the workspace-local default set only.
 
 Use `--global` only when you want Seer in a user-level config file:
 
@@ -68,7 +71,15 @@ belong to one project folder. For Antigravity, prefer the workspace-local
 command first; the global fallback can expose multiple repo-specific Seer
 servers to every Antigravity workspace.
 
-## Verify
+## Build And Verify
+
+Build the index from the repo before starting the agent:
+
+```bash
+npx seer-mcp index .
+```
+
+If you skip this, Seer builds `<repo>/.seer/graph.db` on the first MCP query.
 
 Restart or reload your agent, then ask it to call:
 
@@ -84,7 +95,6 @@ after rerunning setup.
 Terminal check:
 
 ```bash
-npx seer-mcp index .
 npx seer-mcp health
 npx seer-mcp symbols runInit --top 5
 ```
@@ -206,7 +216,7 @@ Useful update flags:
 
 | Flag | Use |
 |---|---|
-| `--client all` | Refresh all known client entries that already exist. |
+| `--client all` | Refresh all known client entries that already exist, including user-level Windsurf when present. |
 | `--global` | Only refresh user-level configs. |
 | `--force` | Re-point a user-level Seer entry pinned to another repo. |
 | `--print` | Show the plan without writing files. |
@@ -270,7 +280,9 @@ For large transitive graphs, ask for a summary or page:
 {"scope":"callers","args":{"symbol":"Node.add_child","file":"scene/main/node.cpp","limit":20,"offset":20}}
 ```
 
-### First Query Is Slow
+### Build Or Rebuild The Index
+
+Run this yourself before opening an agent, or after changing many files:
 
 ```bash
 npx seer-mcp index .

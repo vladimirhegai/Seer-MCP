@@ -6,6 +6,8 @@ export interface ChurnResult {
   filesWithChurn: number;
   headSha: string | null;
   elapsedMs: number;
+  completed: boolean;
+  reason?: string;
 }
 
 /**
@@ -14,16 +16,24 @@ export interface ChurnResult {
  * over the whole repo) and useful on its own as a "what's risky to edit"
  * signal even before the per-symbol history pass.
  */
-export async function collectChurn(repoRoot: string, store: Store): Promise<ChurnResult> {
+export async function collectChurn(
+  repoRoot: string,
+  store: Store,
+  options: { gitCommandTimeoutMs?: number } = {},
+): Promise<ChurnResult> {
   const start = Date.now();
   if (!isGitRepo(repoRoot)) {
-    return { filesAnalyzed: 0, filesWithChurn: 0, headSha: null, elapsedMs: Date.now() - start };
+    return { filesAnalyzed: 0, filesWithChurn: 0, headSha: null, elapsedMs: Date.now() - start, completed: true };
   }
   const files = store.listFiles();
   if (files.length === 0) {
-    return { filesAnalyzed: 0, filesWithChurn: 0, headSha: gitHeadSha(repoRoot), elapsedMs: Date.now() - start };
+    return { filesAnalyzed: 0, filesWithChurn: 0, headSha: gitHeadSha(repoRoot), elapsedMs: Date.now() - start, completed: true };
   }
-  const churn = await collectFileChurn(repoRoot, files.map(f => f.path));
+  let reason: string | undefined;
+  const churn = await collectFileChurn(repoRoot, files.map(f => f.path), {
+    timeoutMs: options.gitCommandTimeoutMs,
+    onTimeout: command => { reason = `${command} timed out`; },
+  });
   let withChurn = 0;
   // Normalize path comparison the same way collectFileChurn does internally.
   const norm = (p: string): string => {
@@ -47,12 +57,14 @@ export async function collectChurn(repoRoot: string, store: Store): Promise<Chur
   // last index" diffs.
   const head = gitHeadSha(repoRoot);
   const remote = gitRemoteUrl(repoRoot);
-  store.setGitIndexState(repoRoot, head, remote);
+  if (!reason) store.setGitIndexState(repoRoot, head, remote);
 
   return {
     filesAnalyzed: files.length,
     filesWithChurn: withChurn,
     headSha: head,
     elapsedMs: Date.now() - start,
+    completed: reason == null,
+    ...(reason ? { reason } : {}),
   };
 }

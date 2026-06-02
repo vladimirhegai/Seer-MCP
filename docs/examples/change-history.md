@@ -6,6 +6,13 @@ the blast radius of a diff mapped to symbols rather than line numbers.
 
 ## History for one symbol
 
+Symbol history is an explicit index. Build it once before asking for per-symbol
+history:
+
+```bash
+seer symbol-history
+```
+
 ```
 seer_history { "symbol": "chargeCard" }
 ```
@@ -73,7 +80,8 @@ seer_continuity { "symbol": "chargeCard" }
 
 This is advisory and confidence-labeled. It will not invent a link it cannot
 justify by shape and scope similarity. For the authoritative cross-commit lineage
-(across moves and renames), `seer_history` follows the file through git.
+(across moves and renames), `seer_history` reads the symbol-history index, which
+follows the file through git.
 
 ## From the CLI
 

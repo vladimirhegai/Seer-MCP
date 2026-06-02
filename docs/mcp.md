@@ -26,12 +26,15 @@ user-level/global MCP files.
 | Codex CLI / extension | `npx seer-mcp init --client codex` |
 | Gemini CLI | `npx seer-mcp init --client gemini` |
 | Windsurf user config | `npx seer-mcp init --client windsurf` |
-| Everything supported | `npx seer-mcp init --client all` |
+| Everything supported, including Windsurf user config | `npx seer-mcp init --client all` |
 | Workspace-local setup | `npx seer-mcp init --auto` |
 | Workspace-local defaults only | `npx seer-mcp init` |
 
 Use `--print` to preview changes and `--force` to replace an existing `seer`
 entry.
+
+`--client all` includes user-level-only clients such as Windsurf. Use `--auto`
+when you want the workspace-local default set only.
 
 All `init`, `update`, and `uninstall` commands accept an optional workspace path:
 
@@ -75,6 +78,16 @@ Then restart/reload the agent. Do not trust Seer query results until
 Project A and Project B can both have Seer when each repo has its own local MCP
 file. For Antigravity, that file is `.agents/mcp_config.json`.
 
+## Build The Index
+
+Run this from the repo before starting the agent:
+
+```bash
+npx seer-mcp index .
+```
+
+If you skip this, Seer builds `<repo>/.seer/graph.db` on the first MCP query.
+
 ## Tool Loading
 
 MCP clients decide whether tools are visible immediately or discovered on
@@ -86,6 +99,24 @@ demand. Seer does not write undocumented eager flags.
 | Claude Code CLI | Seer marks core tools with `_meta["anthropic/alwaysLoad"]`; large/specialist tools remain on demand. |
 | Codex CLI / extension | Seer writes supported MCP config. No verified eager/always-load setting. |
 | Cursor / VS Code / Gemini / Windsurf | Seer writes supported MCP config. Use client allow/disable controls if available. |
+
+## History Tools
+
+`seer_history` is read-only and returns quickly. If it reports
+`historyIndex.built: false`, build history explicitly:
+
+```bash
+npx seer-mcp symbol-history --workspace C:/path/to/repo
+```
+
+Or ask the MCP tool to do a bounded pass:
+
+```json
+{ "maxSeconds": 60, "maxFiles": 200 }
+```
+
+Agents should ask before starting a history build. For very large repos, prefer
+the shell command so the agent session is not tied up by git history walking.
 
 ## Files By Client
 
@@ -214,7 +245,7 @@ Useful flags:
 
 | Flag | Use |
 |---|---|
-| `--client all` | Refresh all known clients that already have Seer entries. |
+| `--client all` | Refresh all known clients that already have Seer entries, including user-level Windsurf when present. |
 | `--global` | Only refresh user-level config files. |
 | `--force` | Re-point a user-level entry pinned to another repo. |
 | `--no-agents` | Leave instruction files alone. |

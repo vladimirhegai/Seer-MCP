@@ -7,6 +7,7 @@ import { Store } from '../db/store.js';
 import { Indexer } from '../indexer/index.js';
 import { jitSync } from '../indexer/freshness.js';
 import { SeerWatcher } from '../indexer/watcher.js';
+import { gitHeadSha } from '../indexer/git.js';
 import { buildArchitecture } from '../indexer/architecture.js';
 import { detectChanges } from '../indexer/detectchanges.js';
 import { collectChurn } from '../indexer/churn.js';
@@ -105,6 +106,26 @@ const TRACE_PREVIEW_LIMIT = 20;
 const TRACE_FULL_LIMIT = 100;
 const TRACE_SUMMARY_SAMPLE_LIMIT = 5000;
 const TRACE_SQL_CHUNK_SIZE = 900;
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 30_000;
+const DEFAULT_MCP_MAINTENANCE_TIMEOUT_MS = 90_000;
+const DEFAULT_FRESHNESS_WAIT_MS = 3_000;
+const DEFAULT_HISTORY_BUILD_SECONDS = 60;
+const DEFAULT_HISTORY_GIT_TIMEOUT_MS = 10_000;
+
+class SeerToolError extends Error {
+  constructor(
+    message: string,
+    public readonly payload: Record<string, unknown>,
+  ) {
+    super(message);
+  }
+}
+
+class SeerToolTimeoutError extends Error {
+  constructor(public readonly toolName: string, public readonly timeoutMs: number) {
+    super(`${toolName} exceeded ${timeoutMs}ms`);
+  }
+}
 
 function mcpInstructions(): string {
   return [
@@ -117,6 +138,7 @@ function mcpInstructions(): string {
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
+    'seer_history is read-only; if historyIndex.built is false, report that history is not built. Only run seer_symbol_history_build or CLI symbol-history when the user asks for a history build.',
     'For huge transitive graphs, prefer seer_trace mode="summary" or the compact preview; page with offset/limit and use mode="full" only when raw rows are needed.',
     'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
   ].join(' ');
@@ -133,6 +155,7 @@ export class SeerMcpServer {
   private jitEnabled: boolean;
   private watchEnabled: boolean;
   private jitPromise: Promise<void> | null = null;
+  private backgroundJitPromise: Promise<void> | null = null;
   private lastReconcileMs = 0;
   /**
    * How long a watcher-confirmed-clean index is trusted before the per-query
@@ -208,10 +231,63 @@ export class SeerMcpServer {
     return SeerMcpServer.DEFAULT_RECONCILE_THROTTLE_MS;
   }
 
+  private freshnessWaitMs(): number {
+    const raw = Number(process.env.SEER_MCP_FRESHNESS_WAIT_MS);
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    return DEFAULT_FRESHNESS_WAIT_MS;
+  }
+
+  private startBackgroundJit(reason: string): void {
+    if (this.backgroundJitPromise) return;
+    const trace = process.env.SEER_JIT_TRACE === '1';
+    const t0 = Date.now();
+    this.backgroundJitPromise = (async () => {
+      try {
+        const r = await jitSync(this.store, this.indexer, this.workspace, { maxDirty: 200 });
+        if (trace) {
+          process.stderr.write(
+            `[seer-mcp] background JIT (${reason}): dirty=${r.dirtyReindexed} added=${r.added} ` +
+            `removed=${r.removed} in ${Date.now() - t0}ms\n`,
+          );
+        }
+      } catch (err) {
+        process.stderr.write(`[seer-mcp] background JIT failed (${reason}): ${err}\n`);
+      } finally {
+        this.lastReconcileMs = Date.now();
+        this.backgroundJitPromise = null;
+      }
+    })();
+  }
+
+  private async waitForFreshness(promise: Promise<void>): Promise<void> {
+    const timeoutMs = this.freshnessWaitMs();
+    if (timeoutMs === 0) {
+      throw new SeerToolError('index freshness check is running', {
+        ok: false,
+        error: 'index_freshness_busy',
+        reason: 'Index freshness is running in the background. Retry shortly or call seer_health for watcher status.',
+      });
+    }
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new SeerToolError('index freshness timed out', {
+        ok: false,
+        error: 'index_freshness_busy',
+        timeoutMs,
+        reason: 'Index freshness did not finish within the MCP wait budget. Retry shortly or run seer_reindex explicitly.',
+      })), timeoutMs);
+    });
+    try {
+      await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async ensureFresh(): Promise<void> {
     if (!this.jitEnabled) return;
     // Coalesce concurrent queries onto a single in-flight reconcile.
-    if (this.jitPromise) { await this.jitPromise; return; }
+    if (this.jitPromise) { await this.waitForFreshness(this.jitPromise); return; }
 
     // Fast path: when the background watcher is running it marks files dirty on
     // OS file events. If it reports nothing pending AND a watcher/JIT pass
@@ -226,9 +302,24 @@ export class SeerMcpServer {
     const watcherStatus = this.watcher?.syncStatus() ?? null;
     const watcherClean = this.watcher != null && !this.watcher.isDirty();
     const lastKnownCleanMs = Math.max(this.lastReconcileMs, watcherStatus?.lastSyncMs ?? 0);
-    if (watcherClean &&
-        (Date.now() - lastKnownCleanMs) < this.reconcileThrottleMs()) {
+    if (watcherClean) {
+      // A clean watcher is the steady-state signal. Never block a user query on
+      // a periodic full workspace scan; kick that scan in the background so
+      // large repos do not turn ordinary searches into minute-long waits.
+      if ((Date.now() - lastKnownCleanMs) >= this.reconcileThrottleMs()) {
+        this.startBackgroundJit('periodic clean-watcher reconcile');
+      }
       return;
+    }
+
+    if (this.watcher && this.watcher.isDirty()) {
+      void this.watcher.syncNow().catch(err => process.stderr.write(`[seer-mcp] watcher sync failed: ${err}\n`));
+      throw new SeerToolError('index is syncing changes', {
+        ok: false,
+        error: 'index_sync_in_progress',
+        watcher: watcherStatus,
+        reason: 'The workspace index is syncing file changes. Retry shortly or call seer_health for current watcher status.',
+      });
     }
 
     const trace = process.env.SEER_JIT_TRACE === '1';
@@ -245,7 +336,7 @@ export class SeerMcpServer {
       } catch (err) { process.stderr.write(`[seer-mcp] JIT failed: ${err}\n`); }
       finally { this.lastReconcileMs = Date.now(); this.jitPromise = null; }
     })();
-    await this.jitPromise;
+    await this.waitForFreshness(this.jitPromise);
   }
 
   private text(obj: unknown): { content: Array<{ type: 'text'; text: string }> } {
@@ -264,8 +355,82 @@ export class SeerMcpServer {
     def: { description?: string; inputSchema?: Record<string, any>; [k: string]: any },
     handler: (args: any) => Promise<any>,
   ): void {
-    this.handlers.set(name, handler);
-    (this.mcp.registerTool as any)(name, this.withClientHints(name, def), handler);
+    const wrapped = async (args: any): Promise<any> => {
+      try {
+        return await this.runToolWithTimeout(name, handler, args);
+      } catch (err) {
+        return this.text(this.toolErrorPayload(name, err));
+      }
+    };
+    this.handlers.set(name, wrapped);
+    (this.mcp.registerTool as any)(name, this.withClientHints(name, def), wrapped);
+  }
+
+  private toolTimeoutMs(name: string): number {
+    const env = Number(process.env.SEER_MCP_TOOL_TIMEOUT_MS);
+    if (Number.isFinite(env) && env >= 0) return env;
+    if (this.isMaintenanceTool(name)) return DEFAULT_MCP_MAINTENANCE_TIMEOUT_MS;
+    return DEFAULT_MCP_TOOL_TIMEOUT_MS;
+  }
+
+  private isMaintenanceTool(name: string): boolean {
+    return new Set([
+      'seer_reindex',
+      'seer_churn',
+      'seer_symbol_history_build',
+      'seer_modules_build',
+      'seer_shape_hash_build',
+      'seer_bundle_export',
+      'seer_bundle_import',
+      'seer_scip_import',
+    ]).has(name);
+  }
+
+  private async runToolWithTimeout(
+    name: string,
+    handler: (args: any) => Promise<any>,
+    args: any,
+  ): Promise<any> {
+    const timeoutMs = this.toolTimeoutMs(name);
+    if (timeoutMs === 0) return handler(args);
+    const pending = handler(args);
+    let timer: NodeJS.Timeout | null = null;
+    let timedOut = false;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new SeerToolTimeoutError(name, timeoutMs));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        pending.catch((err: unknown) => {
+          process.stderr.write(`[seer-mcp] ${name} finished after timeout/failure: ${(err as Error).message ?? err}\n`);
+        });
+      }
+    }
+  }
+
+  private toolErrorPayload(name: string, err: unknown): Record<string, unknown> {
+    if (err instanceof SeerToolError) return { tool: name, ...err.payload };
+    if (err instanceof SeerToolTimeoutError) {
+      return {
+        ok: false,
+        tool: name,
+        error: 'tool_timeout',
+        timeoutMs: err.timeoutMs,
+        reason: `${name} exceeded the MCP timeout budget. Narrow the query, use summary/pagination, or run the explicit CLI/build command for long maintenance work.`,
+      };
+    }
+    return {
+      ok: false,
+      tool: name,
+      error: 'tool_failed',
+      reason: (err as Error).message ?? String(err),
+    };
   }
 
   private withClientHints(
@@ -487,57 +652,118 @@ export class SeerMcpServer {
   }
 
   // ── Lazy lifecycle resolution (AI-agent optimization §5a) ────────────────
-  // Derived passes (modules / shape-hash / symbol-history) normally run during
-  // indexing. When the DB was produced some other way (bundle import, partial
-  // index) the dependent tools used to silently return nothing until the agent
-  // hand-ran a *_build tool. These guards extend the JIT-freshness philosophy
-  // to those passes: build on first dependent query, once per process.
-  private autoBuilt = { modules: false, shapes: false, history: false, continuity: false };
+  // Derived passes (modules / shape-hash) normally run during indexing. When
+  // the DB was produced some other way (bundle import, partial index), the
+  // dependent tools used to silently return nothing until the agent hand-ran a
+  // *_build tool. These guards self-heal cheap-ish local derived state once
+  // per process. Symbol history is intentionally excluded because git history
+  // walking can take minutes in large repos and must stay explicit.
+  private autoBuilt = { modules: false, shapes: false, continuity: false };
 
-  private ensureModules(): void {
-    if (this.autoBuilt.modules) return;
-    this.autoBuilt.modules = true;
-    try { if (this.store.countModules() === 0) buildModules(this.store); }
-    catch (err) { process.stderr.write(`[seer-mcp] auto modules build skipped: ${err}\n`); }
+  private autoModuleMaxFiles(): number {
+    const raw = Number(process.env.SEER_MCP_AUTO_MODULE_MAX_FILES);
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    return 10_000;
   }
 
-  private ensureShapeHashes(): void {
-    if (this.autoBuilt.shapes) return;
+  private autoShapeMaxSymbols(): number {
+    const raw = Number(process.env.SEER_MCP_AUTO_SHAPE_MAX_SYMBOLS);
+    if (Number.isFinite(raw) && raw >= 0) return raw;
+    return 5_000;
+  }
+
+  private ensureModules(): boolean {
+    if (this.autoBuilt.modules) return true;
+    this.autoBuilt.modules = true;
+    try {
+      if (this.store.countModules() === 0) {
+        const files = this.store.getStats().files;
+        const maxFiles = this.autoModuleMaxFiles();
+        if (files > maxFiles) {
+          process.stderr.write(`[seer-mcp] auto modules build skipped: ${files} files exceeds ${maxFiles}\n`);
+          return false;
+        }
+        buildModules(this.store);
+      }
+      return true;
+    } catch (err) {
+      process.stderr.write(`[seer-mcp] auto modules build skipped: ${err}\n`);
+      return false;
+    }
+  }
+
+  private ensureShapeHashes(): boolean {
+    if (this.autoBuilt.shapes) return true;
     this.autoBuilt.shapes = true;
     try {
       const row = this.store.rawDb()
         .prepare('SELECT COUNT(*) AS c FROM symbols WHERE shape_hash IS NOT NULL')
         .get() as { c: number };
-      if (Number(row.c) === 0) buildShapeHashes(this.store, {});
-    } catch (err) { process.stderr.write(`[seer-mcp] auto shape-hash build skipped: ${err}\n`); }
+      if (Number(row.c) === 0) {
+        const pending = this.store.rawDb().prepare(`
+          SELECT COUNT(*) AS c
+          FROM symbols s
+          WHERE s.kind IN ('function','method','constructor')
+            AND s.symbol_role <> 'declaration'
+            AND s.loc >= 4
+        `).get() as { c: number };
+        const maxSymbols = this.autoShapeMaxSymbols();
+        if (Number(pending.c) > maxSymbols) {
+          process.stderr.write(`[seer-mcp] auto shape-hash build skipped: ${pending.c} symbols exceeds ${maxSymbols}\n`);
+          return false;
+        }
+        buildShapeHashes(this.store, {});
+      }
+      return true;
+    } catch (err) {
+      process.stderr.write(`[seer-mcp] auto shape-hash build skipped: ${err}\n`);
+      return false;
+    }
   }
 
-  private async ensureSymbolHistory(): Promise<void> {
-    if (this.autoBuilt.history) return;
-    this.autoBuilt.history = true;
+  private countTableRows(table: string): number {
     try {
       const row = this.store.rawDb()
-        .prepare('SELECT COUNT(*) AS c FROM symbol_history')
+        .prepare(`SELECT COUNT(*) AS c FROM ${table}`)
         .get() as { c: number };
-      if (Number(row.c) === 0) {
-        await buildSymbolHistory(this.workspace, this.store, {
-          maxCommitsPerFile: 200, skipIfHeadUnchanged: true,
-        });
-      }
-    } catch (err) { process.stderr.write(`[seer-mcp] auto symbol-history build skipped: ${err}\n`); }
+      return Number(row.c);
+    } catch {
+      return 0;
+    }
   }
 
-  private ensureContinuity(): void {
-    if (this.autoBuilt.continuity) return;
+  private historyIndexStatus(): Record<string, unknown> {
+    const rows = this.countTableRows('symbol_history');
+    const state = this.store.getGitIndexState();
+    const head = gitHeadSha(this.workspace);
+    const builtHead = state?.lastHistoryHeadSha ?? null;
+    const built = rows > 0 || builtHead != null;
+    const stale = builtHead != null && head != null && builtHead !== head;
+    return {
+      built,
+      rows,
+      headSha: head,
+      lastHistoryHeadSha: builtHead,
+      lastHistoryAt: state?.lastHistoryAt ?? null,
+      stale,
+    };
+  }
+
+  private ensureContinuity(): boolean {
+    if (this.autoBuilt.continuity) return true;
     this.autoBuilt.continuity = true;
     try {
-      if (!this.store.hasV10()) return;
-      this.ensureShapeHashes(); // continuity compares shape hashes
+      if (!this.store.hasV10()) return true;
+      if (!this.ensureShapeHashes()) return false; // continuity compares shape hashes
       const row = this.store.rawDb()
         .prepare('SELECT COUNT(*) AS c FROM symbol_history_continuity')
         .get() as { c: number };
       if (Number(row.c) === 0) buildContinuity(this.store, {});
-    } catch (err) { process.stderr.write(`[seer-mcp] auto continuity build skipped: ${err}\n`); }
+      return true;
+    } catch (err) {
+      process.stderr.write(`[seer-mcp] auto continuity build skipped: ${err}\n`);
+      return false;
+    }
   }
 
   private registerTools(): void {
@@ -1269,15 +1495,18 @@ export class SeerMcpServer {
 
     this.registerTool('seer_churn', {
       description: 'Run a file-level git churn pass (commit counts, last commit, authors). Idempotent.',
-      inputSchema: {},
-    }, async () => {
-      return this.text(await collectChurn(this.workspace, this.store));
+      inputSchema: {
+        gitCommandTimeoutMs: z.number().int().positive().max(60000).optional()
+          .describe('Timeout for the underlying git log command. Default 15000ms or SEER_GIT_TIMEOUT_MS.'),
+      },
+    }, async ({ gitCommandTimeoutMs }) => {
+      return this.text(await collectChurn(this.workspace, this.store, { gitCommandTimeoutMs }));
     });
 
     // ── Track-D tools ───────────────────────────────────────────────────────
 
     this.registerTool('seer_history', {
-      description: 'Per-symbol git history. Returns commits whose hunks overlap the symbol\'s line range.',
+      description: 'Read-only per-symbol git history from the prebuilt history index. Returns commits whose hunks overlap the symbol\'s line range. Does not build history; if historyIndex.built is false, only build explicitly with seer_symbol_history_build or CLI symbol-history when requested.',
       inputSchema: {
         symbol: z.string(),
         limit: z.number().int().positive().max(200).optional(),
@@ -1286,14 +1515,14 @@ export class SeerMcpServer {
       },
     }, async ({ symbol, limit, since, file }) => {
       await this.ensureFresh();
-      await this.ensureSymbolHistory();
-      this.ensureContinuity();
+      const historyIndex = this.historyIndexStatus();
       const candidates = this.store.getDefinition(symbol, { filePath: file });
       const items: any[] = [];
+      const continuityRows = this.countTableRows('symbol_history_continuity');
       for (const c of candidates.slice(0, 5)) {
         const history = this.store.getSymbolHistory(c.id, { limit: limit ?? 50, since });
         const total = this.store.countSymbolHistory(c.id);
-        const continuity = getContinuityForSymbol(this.store, c.id);
+        const continuity = continuityRows > 0 ? getContinuityForSymbol(this.store, c.id) : [];
         items.push({
           symbol: { id: c.id, name: c.name, qualifiedName: c.qualifiedName, kind: c.kind, file: c.filePath },
           total,
@@ -1311,23 +1540,41 @@ export class SeerMcpServer {
         });
       }
       return this.text({
-        symbol, returned: items.length, results: items,
-        note: 'Honest limits: file renames followed via --follow; symbol renames cut off history at the rename commit. Confidence drops with commit age.',
+        symbol,
+        file,
+        historyIndex,
+        returned: items.length,
+        results: items,
+        note: (historyIndex as any).built
+          ? 'Honest limits: file renames followed via --follow; symbol renames cut off history at the rename commit. Confidence drops with commit age.'
+          : 'Symbol history is not built for this workspace yet. Build explicitly with seer_symbol_history_build, or run `seer symbol-history --workspace <repo>` outside the agent for large repos. Agents should ask before starting a history build.',
       });
     });
 
     this.registerTool('seer_symbol_history_build', {
-      description: '(Advanced — usually unnecessary.) seer_history auto-builds this index on first use. Call only to force a refresh or set a custom maxCommitsPerFile. Can take minutes on large repos.',
+      description: '(Advanced maintenance.) Build the per-symbol git history index. Bounded by default for MCP safety; for very large repos, prefer the CLI `seer symbol-history --workspace <repo>`.',
       inputSchema: {
         maxCommitsPerFile: z.number().int().positive().max(2000).optional(),
+        maxFiles: z.number().int().positive().max(100000).optional(),
+        maxSeconds: z.number().int().positive().max(600).optional(),
+        gitCommandTimeoutMs: z.number().int().positive().max(60000).optional(),
         force: z.boolean().optional(),
       },
-    }, async ({ maxCommitsPerFile, force }) => {
+    }, async ({ maxCommitsPerFile, maxFiles, maxSeconds, gitCommandTimeoutMs, force }) => {
       const r = await buildSymbolHistory(this.workspace, this.store, {
         maxCommitsPerFile: maxCommitsPerFile ?? 200,
+        maxFiles,
+        deadlineMs: (maxSeconds ?? DEFAULT_HISTORY_BUILD_SECONDS) * 1000,
+        gitCommandTimeoutMs: gitCommandTimeoutMs ?? DEFAULT_HISTORY_GIT_TIMEOUT_MS,
         skipIfHeadUnchanged: !force,
       });
-      return this.text(r);
+      return this.text({
+        ...r,
+        historyIndex: this.historyIndexStatus(),
+        note: r.completed
+          ? 'Symbol history build completed.'
+          : 'Partial build only. Run again with a larger maxSeconds/maxFiles budget, or use the CLI for long history indexing outside an agent session.',
+      });
     });
 
     // ── Track-E tools ───────────────────────────────────────────────────────
@@ -1340,7 +1587,12 @@ export class SeerMcpServer {
       },
     }, async ({ limit, sortBy }) => {
       await this.ensureFresh();
-      this.ensureModules();
+      if (!this.ensureModules()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'modules',
+        reason: 'Module clustering is not built and this workspace is too large for safe inline MCP auto-build. Run seer_modules_build or rerun `seer index` explicitly.',
+      });
       const modules = this.store.listModules({ limit: limit ?? 50, sortBy });
       return this.text({
         total: this.store.countModules(),
@@ -1360,7 +1612,12 @@ export class SeerMcpServer {
       },
     }, async ({ id, label, fileLimit, symbolLimit }) => {
       await this.ensureFresh();
-      this.ensureModules();
+      if (!this.ensureModules()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'modules',
+        reason: 'Module clustering is not built and this workspace is too large for safe inline MCP auto-build. Run seer_modules_build or rerun `seer index` explicitly.',
+      });
       const mod = id != null ? this.store.getModuleById(id)
                 : label != null ? this.store.getModuleByLabel(label)
                 : null;
@@ -1387,7 +1644,12 @@ export class SeerMcpServer {
       },
     }, async ({ symbol, file }) => {
       await this.ensureFresh();
-      this.ensureModules();
+      if (!this.ensureModules()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'modules',
+        reason: 'Module clustering is not built and this workspace is too large for safe inline MCP auto-build. Run seer_modules_build or rerun `seer index` explicitly.',
+      });
       const defs = this.store.getDefinition(symbol, { filePath: file });
       if (defs.length === 0) {
         const didYouMean = this.suggestSymbols(symbol);
@@ -1415,7 +1677,12 @@ export class SeerMcpServer {
       },
     }, async ({ id, label, direction, limit }) => {
       await this.ensureFresh();
-      this.ensureModules();
+      if (!this.ensureModules()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'modules',
+        reason: 'Module clustering is not built and this workspace is too large for safe inline MCP auto-build. Run seer_modules_build or rerun `seer index` explicitly.',
+      });
       const mod = id != null ? this.store.getModuleById(id)
                 : label != null ? this.store.getModuleByLabel(label)
                 : null;
@@ -1467,7 +1734,12 @@ export class SeerMcpServer {
       },
     }, async ({ id, label, maxDepth, direction }) => {
       await this.ensureFresh();
-      this.ensureModules();
+      if (!this.ensureModules()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'modules',
+        reason: 'Module clustering is not built and this workspace is too large for safe inline MCP auto-build. Run seer_modules_build or rerun `seer index` explicitly.',
+      });
       const mod = id != null ? this.store.getModuleById(id)
                 : label != null ? this.store.getModuleByLabel(label)
                 : null;
@@ -1500,8 +1772,22 @@ export class SeerMcpServer {
 
     this.registerTool('seer_modules_build', {
       description: '(Advanced — usually unnecessary.) Module clustering (Louvain) runs automatically during indexing and auto-builds on first seer_modules* query. Call only to force a rebuild. Idempotent.',
-      inputSchema: {},
-    }, async () => {
+      inputSchema: {
+        forceLarge: z.boolean().optional().describe('Allow inline MCP rebuild even when the workspace exceeds the safe auto-build size guard. Prefer `seer index` from a shell instead.'),
+      },
+    }, async ({ forceLarge }) => {
+      const files = this.store.getStats().files;
+      const maxFiles = this.autoModuleMaxFiles();
+      if (!forceLarge && files > maxFiles) {
+        return this.text({
+          ok: false,
+          error: 'derived_index_too_large',
+          derivedIndex: 'modules',
+          files,
+          maxFiles,
+          reason: 'Module rebuild is too large for a safe MCP call. Run `seer index` from a shell, or pass forceLarge if you intentionally want the agent process to do it.',
+        });
+      }
       const r = buildModules(this.store);
       return this.text(r);
     });
@@ -1622,7 +1908,12 @@ export class SeerMcpServer {
       },
     }, async ({ symbol, file }) => {
       await this.ensureFresh();
-      this.ensureContinuity();
+      if (!this.ensureContinuity()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'continuity',
+        reason: 'Continuity evidence needs shape hashes, and this workspace is too large for safe inline MCP auto-build. Run seer_shape_hash_build or rerun `seer index` explicitly.',
+      });
       const defs = this.store.getDefinition(symbol, { filePath: file });
       if (defs.length === 0) {
         const didYouMean = this.suggestSymbols(symbol);
@@ -1830,7 +2121,12 @@ export class SeerMcpServer {
       },
     }, async ({ maxDistance, minLoc, includeTests, limit }) => {
       await this.ensureFresh();
-      this.ensureShapeHashes();
+      if (!this.ensureShapeHashes()) return this.text({
+        ok: false,
+        error: 'derived_index_required',
+        derivedIndex: 'shape_hashes',
+        reason: 'Shape hashes are not built and this workspace is too large for safe inline MCP auto-build. Run seer_shape_hash_build or rerun `seer index` explicitly.',
+      });
       const clusters = findDuplicates(this.store, {
         maxDistance: maxDistance ?? 6,
         minLoc: minLoc ?? 4,
@@ -1854,8 +2150,28 @@ export class SeerMcpServer {
       inputSchema: {
         force: z.boolean().optional().describe('Re-hash symbols that already have a hash.'),
         minLoc: z.number().int().positive().optional(),
+        forceLarge: z.boolean().optional().describe('Allow inline MCP rebuild even when the workspace exceeds the safe auto-build size guard. Prefer `seer index` from a shell instead.'),
       },
-    }, async ({ force, minLoc }) => {
+    }, async ({ force, minLoc, forceLarge }) => {
+      const pending = this.store.rawDb().prepare(`
+        SELECT COUNT(*) AS c
+        FROM symbols s
+        WHERE s.kind IN ('function','method','constructor')
+          AND s.symbol_role <> 'declaration'
+          AND s.loc >= ?
+          ${force ? '' : 'AND s.shape_hash IS NULL'}
+      `).get(minLoc ?? 4) as { c: number };
+      const maxSymbols = this.autoShapeMaxSymbols();
+      if (!forceLarge && Number(pending.c) > maxSymbols) {
+        return this.text({
+          ok: false,
+          error: 'derived_index_too_large',
+          derivedIndex: 'shape_hashes',
+          pendingSymbols: Number(pending.c),
+          maxSymbols,
+          reason: 'Shape-hash rebuild is too large for a safe MCP call. Run `seer index` from a shell, or pass forceLarge if you intentionally want the agent process to do it.',
+        });
+      }
       const r = buildShapeHashes(this.store, { force, minLoc });
       return this.text(r);
     });
@@ -1971,7 +2287,13 @@ export class SeerMcpServer {
           const raw = r?.content?.[0]?.text;
           let parsed: unknown;
           try { parsed = raw != null ? JSON.parse(raw) : null; } catch { parsed = raw ?? null; }
-          results.push({ tool: toolName, ok: true, result: parsed });
+          const parsedOk = !(parsed && typeof parsed === 'object' && (parsed as any).ok === false);
+          results.push({
+            tool: toolName,
+            ok: parsedOk,
+            result: parsed,
+            ...(!parsedOk ? { error: (parsed as any).error ?? (parsed as any).reason ?? 'tool returned ok:false' } : {}),
+          });
         } catch (err) {
           results.push({ tool: toolName, ok: false, error: (err as Error).message });
         }

@@ -10,16 +10,34 @@ import { spawn, spawnSync } from 'child_process';
  * silently no-ops. Callers should check the return value.
  */
 
+const DEFAULT_GIT_TIMEOUT_MS = 15_000;
+
+function gitTimeoutMs(override?: number): number {
+  if (override != null && Number.isFinite(override) && override > 0) return override;
+  const raw = Number(process.env.SEER_GIT_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return DEFAULT_GIT_TIMEOUT_MS;
+}
+
+function syncOpts(timeoutMs?: number): { encoding: 'utf8'; timeout: number; windowsHide: boolean } {
+  return { encoding: 'utf8', timeout: gitTimeoutMs(timeoutMs), windowsHide: true };
+}
+
+function killProcess(proc: ReturnType<typeof spawn>): void {
+  try { proc.kill('SIGKILL'); }
+  catch { try { proc.kill(); } catch { /* */ } }
+}
+
 export function isGitRepo(repoRoot: string): boolean {
   try {
-    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', '--is-inside-work-tree'], { encoding: 'utf8' });
+    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', '--is-inside-work-tree'], syncOpts());
     return r.status === 0 && r.stdout.trim() === 'true';
   } catch { return false; }
 }
 
 export function gitHeadSha(repoRoot: string): string | null {
   try {
-    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
+    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], syncOpts());
     if (r.status !== 0) return null;
     return r.stdout.trim() || null;
   } catch { return null; }
@@ -27,7 +45,7 @@ export function gitHeadSha(repoRoot: string): string | null {
 
 export function gitRemoteUrl(repoRoot: string, remote = 'origin'): string | null {
   try {
-    const r = spawnSync('git', ['-C', repoRoot, 'config', '--get', `remote.${remote}.url`], { encoding: 'utf8' });
+    const r = spawnSync('git', ['-C', repoRoot, 'config', '--get', `remote.${remote}.url`], syncOpts());
     if (r.status !== 0) return null;
     return r.stdout.trim() || null;
   } catch { return null; }
@@ -51,6 +69,7 @@ export interface FileChurnStats {
 export async function collectFileChurn(
   repoRoot: string,
   filesAbs: Iterable<string>,
+  options: { timeoutMs?: number; onTimeout?: (command: string) => void } = {},
 ): Promise<Map<string, FileChurnStats>> {
   const result = new Map<string, FileChurnStats>();
   if (!isGitRepo(repoRoot)) return result;
@@ -62,11 +81,17 @@ export async function collectFileChurn(
   for (const a of filesAbs) absSet.add(normalize(a));
 
   return new Promise((resolve, reject) => {
+    let timedOut = false;
     const proc = spawn(
       'git',
       ['-C', repoRoot, 'log', '--name-only', '--pretty=format:__COMMIT__%H%x09%an%x09%aI', '--no-merges'],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.('git log --name-only');
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
     let buf = '';
     let currentSha: string | null = null;
     let currentAuthor: string | null = null;
@@ -121,8 +146,13 @@ export async function collectFileChurn(
       }
     });
     proc.stderr.on('data', () => { /* swallow */ });
-    proc.on('error', reject);
+    proc.on('error', err => {
+      clearTimeout(timer);
+      if (timedOut) resolve(result);
+      else reject(err);
+    });
     proc.on('close', () => {
+      clearTimeout(timer);
       if (buf.length > 0) handleLine(buf);
       for (const [key, e] of perFile) {
         const sortedAuthors = Array.from(e.authors.entries()).sort((a, b) => b[1] - a[1]);
@@ -179,7 +209,7 @@ export interface CommitMeta {
 export async function commitsForFile(
   repoRoot: string,
   filePath: string,
-  options: { limit?: number; since?: number } = {},
+  options: { limit?: number; since?: number; timeoutMs?: number; onTimeout?: (command: string) => void } = {},
 ): Promise<CommitMeta[]> {
   if (!isGitRepo(repoRoot)) return [];
   const rel = path.relative(repoRoot, filePath);
@@ -194,13 +224,23 @@ export async function commitsForFile(
   args.push('--', rel);
 
   return new Promise((resolve) => {
+    let timedOut = false;
     const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.(`git log --follow -- ${rel}`);
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
     let buf = '';
     proc.stdout.on('data', (c: Buffer) => { buf += c.toString('utf8'); });
     proc.stderr.on('data', () => { /* */ });
-    proc.on('error', () => resolve([]));
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve([]);
+    });
     proc.on('close', () => {
-      resolve(parseFollowLog(buf));
+      clearTimeout(timer);
+      resolve(timedOut ? [] : parseFollowLog(buf));
     });
   });
 }
@@ -307,17 +347,32 @@ export async function fileDiffHunks(
  */
 export async function fileDiffInfo(
   repoRoot: string, sha: string, filePath: string,
+  options: { timeoutMs?: number; onTimeout?: (command: string) => void } = {},
 ): Promise<FileDiffInfo> {
   if (!isGitRepo(repoRoot)) return { hunks: [], isFileAddition: false };
   const rel = path.isAbsolute(filePath) ? path.relative(repoRoot, filePath) : filePath;
   const args = ['-C', repoRoot, 'show', '--format=', '-U0', sha, '--', rel];
   return new Promise(resolve => {
+    let timedOut = false;
     const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.(`git show ${sha} -- ${rel}`);
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
     let buf = '';
     proc.stdout.on('data', (c: Buffer) => { buf += c.toString('utf8'); });
     proc.stderr.on('data', () => { /* */ });
-    proc.on('error', () => resolve({ hunks: [], isFileAddition: false }));
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve({ hunks: [], isFileAddition: false });
+    });
     proc.on('close', () => {
+      clearTimeout(timer);
+      if (timedOut) {
+        resolve({ hunks: [], isFileAddition: false });
+        return;
+      }
       const out: DiffHunk[] = [];
       const re = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm;
       let m;
@@ -347,10 +402,15 @@ export async function commitNumstat(
   if (filePath) args.push('--', path.relative(repoRoot, filePath));
   return new Promise(resolve => {
     const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => killProcess(proc), gitTimeoutMs());
     let buf = '';
     proc.stdout.on('data', (c: Buffer) => { buf += c.toString('utf8'); });
-    proc.on('error', () => resolve({ added: 0, removed: 0 }));
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve({ added: 0, removed: 0 });
+    });
     proc.on('close', () => {
+      clearTimeout(timer);
       let added = 0, removed = 0;
       for (const line of buf.split('\n')) {
         const parts = line.trim().split(/\s+/);
@@ -376,7 +436,7 @@ export function gitChangedFiles(repoRoot: string, fromRef?: string, toRef?: stri
   if (fromRef && toRef) args.push(`${fromRef}..${toRef}`);
   else if (fromRef)    args.push(fromRef);
   // No refs → working-tree diff against HEAD.
-  const r = spawnSync('git', args, { encoding: 'utf8' });
+  const r = spawnSync('git', args, syncOpts());
   if (r.status !== 0) return [];
   return r.stdout.split('\n').filter(Boolean).map(rel => path.resolve(repoRoot, rel));
 }
@@ -396,7 +456,7 @@ export function fileDiffHunksSync(
   if (fromRef && toRef) args.push(`${fromRef}..${toRef}`);
   else if (fromRef)    args.push(fromRef);
   args.push('--', rel);
-  const r = spawnSync('git', args, { encoding: 'utf8' });
+  const r = spawnSync('git', args, syncOpts());
   if (r.status !== 0) return [];
   const out: DiffHunk[] = [];
   const re = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm;

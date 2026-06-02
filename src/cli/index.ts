@@ -128,7 +128,7 @@ program
   .command('init [workspace]')
   .description('Wire Seer in as an MCP server for your AI agents and write guidance files')
   .option('--db <path>', 'Custom database path passed through to the MCP launcher')
-  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all (default: project-local clients)')
+  .option('--client <names>', 'Comma-separated clients: claude,cursor,vscode,codex,gemini,antigravity,windsurf,all; all includes user-level clients (default: project-local clients)')
   .option('--auto', 'Workspace-local setup for supported clients; no user-level/global config')
   .option('--global', 'Write user-level config instead of project-local config')
   .option('--npx', 'Emit a portable "npx -y <pkg> mcp" launcher instead of an absolute node path')
@@ -185,8 +185,9 @@ program
     }
 
     console.log(`\n  Next:`);
-    console.log(`    1. Reload / restart your agent so it picks up the new MCP server.`);
-    console.log(`    2. Seer indexes this workspace automatically on first query.`);
+    console.log(`    1. From this repo, build the index now: npx seer-mcp index .`);
+    console.log(`       If you skip this, Seer builds it on the first MCP query.`);
+    console.log(`    2. Reload / restart your agent so it picks up the new MCP server.`);
     console.log(`    3. Ask your agent to call seer_health to confirm it is connected.\n`);
   });
 
