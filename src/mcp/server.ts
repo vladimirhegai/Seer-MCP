@@ -61,6 +61,51 @@ export interface McpServerOptions {
   jit?: boolean;
 }
 
+type TraceMode = 'summary' | 'preview' | 'full';
+
+interface TraceReach {
+  id: number;
+  depth: number;
+}
+
+interface TraceItem {
+  id: number;
+  name: string;
+  qualifiedName: string | null;
+  kind: string;
+  file: string;
+  lineStart: number;
+  pagerank: number;
+  depth: number;
+}
+
+interface TraceRow {
+  id: unknown;
+  name: unknown;
+  qualifiedName: unknown;
+  kind: unknown;
+  file: unknown;
+  lineStart: unknown;
+  pagerank: unknown;
+}
+
+const CORE_ALWAYS_LOAD_TOOLS = new Set([
+  'seer_health',
+  'seer_search',
+  'seer_definition',
+  'seer_file_symbols',
+  'seer_context',
+  'seer_preflight',
+  'seer_callers',
+  'seer_callees',
+  'seer_trace',
+]);
+
+const TRACE_PREVIEW_LIMIT = 20;
+const TRACE_FULL_LIMIT = 100;
+const TRACE_SUMMARY_SAMPLE_LIMIT = 5000;
+const TRACE_SQL_CHUNK_SIZE = 900;
+
 function mcpInstructions(): string {
   return [
     'Use Seer first for structural code navigation in this workspace.',
@@ -72,6 +117,7 @@ function mcpInstructions(): string {
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
+    'For huge transitive graphs, prefer seer_trace mode="summary" or the compact preview; page with offset/limit and use mode="full" only when raw rows are needed.',
     'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
   ].join(' ');
 }
@@ -219,7 +265,21 @@ export class SeerMcpServer {
     handler: (args: any) => Promise<any>,
   ): void {
     this.handlers.set(name, handler);
-    (this.mcp.registerTool as any)(name, def, handler);
+    (this.mcp.registerTool as any)(name, this.withClientHints(name, def), handler);
+  }
+
+  private withClientHints(
+    name: string,
+    def: { description?: string; inputSchema?: Record<string, any>; [k: string]: any },
+  ): { description?: string; inputSchema?: Record<string, any>; [k: string]: any } {
+    if (!CORE_ALWAYS_LOAD_TOOLS.has(name)) return def;
+    return {
+      ...def,
+      _meta: {
+        ...(def._meta ?? {}),
+        'anthropic/alwaysLoad': true,
+      },
+    };
   }
 
   /**
@@ -273,6 +333,157 @@ export class SeerMcpServer {
       out.note = `Output trimmed to ~${tokenBudget} tokens (${kept.length}/${items.length} items shown). Raise tokenBudget, add a filter, or paginate for the rest.`;
     }
     return this.text(out);
+  }
+
+  private traceMode(mode?: TraceMode, summaryOnly?: boolean): TraceMode {
+    if (summaryOnly) return 'summary';
+    return mode ?? 'preview';
+  }
+
+  private traceLimit(mode: TraceMode, limit?: number): number {
+    return Math.min(limit ?? (mode === 'full' ? TRACE_FULL_LIMIT : TRACE_PREVIEW_LIMIT), 500);
+  }
+
+  private loadTraceItems(
+    hits: TraceReach[],
+    pageOffset: number,
+    pageLimit: number,
+  ): { items: TraceItem[]; pageItems: TraceItem[]; sampled: boolean } {
+    if (hits.length === 0) return { items: [], pageItems: [], sampled: false };
+
+    const sample = hits.slice(0, TRACE_SUMMARY_SAMPLE_LIMIT);
+    const page = hits.slice(pageOffset, pageOffset + pageLimit);
+    const combinedById = new Map<number, TraceReach>();
+    for (const h of sample) combinedById.set(h.id, h);
+    for (const h of page) combinedById.set(h.id, h);
+    const combined = Array.from(combinedById.values());
+
+    const depthById = new Map<number, number>();
+    for (const h of combined) depthById.set(h.id, h.depth);
+
+    const byId = new Map<number, TraceItem>();
+    const db = this.store.rawDb();
+    for (let i = 0; i < combined.length; i += TRACE_SQL_CHUNK_SIZE) {
+      const ids = combined.slice(i, i + TRACE_SQL_CHUNK_SIZE).map(h => h.id);
+      const ph = ids.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT s.id, s.name, s.qualified_name AS qualifiedName, s.kind,
+               f.path AS file, s.line_start AS lineStart, s.pagerank
+        FROM symbols s JOIN files f ON f.id = s.file_id
+        WHERE s.id IN (${ph})
+      `).all(...ids) as unknown as TraceRow[];
+      for (const row of rows) {
+        const id = Number(row.id);
+        byId.set(id, {
+          id,
+          name: String(row.name),
+          qualifiedName: row.qualifiedName == null ? null : String(row.qualifiedName),
+          kind: String(row.kind),
+          file: String(row.file),
+          lineStart: Number(row.lineStart),
+          pagerank: Number(row.pagerank ?? 0),
+          depth: depthById.get(id) ?? 0,
+        });
+      }
+    }
+
+    const toItem = (h: TraceReach): TraceItem => byId.get(h.id) ?? {
+      id: h.id,
+      name: '',
+      qualifiedName: null,
+      kind: '',
+      file: '',
+      lineStart: 0,
+      pagerank: 0,
+      depth: h.depth,
+    };
+    const items = sample.map(toItem);
+    const pageItems = page.map(toItem);
+    items.sort((a, b) => a.depth - b.depth || b.pagerank - a.pagerank);
+    pageItems.sort((a, b) => a.depth - b.depth || b.pagerank - a.pagerank);
+    return { items, pageItems, sampled: sample.length < hits.length };
+  }
+
+  private traceDepthCounts(hits: TraceReach[]): Record<string, number> {
+    const depthCounts: Record<string, number> = {};
+    for (const h of hits) {
+      const key = String(h.depth);
+      depthCounts[key] = (depthCounts[key] ?? 0) + 1;
+    }
+    return depthCounts;
+  }
+
+  private traceSummary(
+    hits: TraceReach[],
+    items: TraceItem[],
+    sampled: boolean,
+  ): {
+    depthCounts: Record<string, number>;
+    topFiles: Array<{
+      file: string;
+      count: number;
+      minDepth: number;
+      samples: Array<{ name: string; qualifiedName: string | null; lineStart: number; depth: number }>;
+    }>;
+    topSymbols: Array<{
+      id: number;
+      name: string;
+      qualifiedName: string | null;
+      kind: string;
+      file: string;
+      lineStart: number;
+      depth: number;
+      pagerank: number;
+    }>;
+    summarySampled?: boolean;
+    summarySampleSize?: number;
+  } {
+    const files = new Map<string, {
+      file: string;
+      count: number;
+      minDepth: number;
+      samples: Array<{ name: string; qualifiedName: string | null; lineStart: number; depth: number }>;
+    }>();
+    for (const item of items) {
+      const current = files.get(item.file) ?? {
+        file: item.file,
+        count: 0,
+        minDepth: item.depth,
+        samples: [],
+      };
+      current.count += 1;
+      current.minDepth = Math.min(current.minDepth, item.depth);
+      if (current.samples.length < 3) {
+        current.samples.push({
+          name: item.name,
+          qualifiedName: item.qualifiedName,
+          lineStart: item.lineStart,
+          depth: item.depth,
+        });
+      }
+      files.set(item.file, current);
+    }
+
+    return {
+      depthCounts: this.traceDepthCounts(hits),
+      topFiles: Array.from(files.values())
+        .sort((a, b) => b.count - a.count || a.minDepth - b.minDepth || a.file.localeCompare(b.file))
+        .slice(0, 10),
+      topSymbols: items.slice(0, 10).map(item => ({
+        id: item.id,
+        name: item.name,
+        qualifiedName: item.qualifiedName,
+        kind: item.kind,
+        file: item.file,
+        lineStart: item.lineStart,
+        depth: item.depth,
+        pagerank: item.pagerank,
+      })),
+      ...(sampled ? {
+        summarySampled: true,
+        summarySampleSize: items.length,
+      } : {}),
+    };
   }
 
   // ── Lazy lifecycle resolution (AI-agent optimization §5a) ────────────────
@@ -935,15 +1146,21 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_trace_callers', {
-      description: 'Bounded reverse-reachable callers of a symbol (transitive blast radius). Pass file to disambiguate common names or qualified names. Returns each caller with the BFS depth at which it was found.',
+      description: 'Bounded reverse-reachable callers of a symbol (transitive blast radius). Pass file to disambiguate common names. Default mode=preview returns exact totals, depth/file summaries, and a small page of rows; use mode=full only when you need more raw rows.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
         maxDepth: z.number().int().positive().max(8).optional(),
         maxNodes: z.number().int().positive().max(50000).optional(),
         limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        mode: z.enum(['summary', 'preview', 'full']).optional()
+          .describe('summary returns counts/top files only; preview is compact default; full returns a larger raw page.'),
+        summaryOnly: z.boolean().optional().describe('Shortcut for mode=summary.'),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals or summary.'),
       },
-    }, async ({ symbol, file, maxDepth, maxNodes, limit }) => {
+    }, async ({ symbol, file, maxDepth, maxNodes, limit, offset, mode, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
       const defs = this.store.getDefinition(symbol, { filePath: file });
       if (defs.length === 0) return this.text({
@@ -951,79 +1168,83 @@ export class SeerMcpServer {
         reason: file ? `no symbol "${symbol}" in ${file}` : `no symbol "${symbol}"`,
       });
       const target = defs[0];
-      const hits = this.store.reverseReachableWithDepth(target.id, maxDepth ?? 4, maxNodes ?? 20000);
-      const lim = Math.min(hits.length, limit ?? 100);
-      const ids = hits.slice(0, lim).map(h => h.id);
-      if (ids.length === 0) {
-        return this.text({ symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath }, maxDepth: maxDepth ?? 4, total: 0, items: [] });
-      }
-      const ph = ids.map(() => '?').join(',');
-      const rows = (this.store as any).rawDb().prepare(`
-        SELECT s.id, s.name, s.qualified_name AS qualifiedName, s.kind,
-               f.path AS file, s.line_start AS lineStart, s.pagerank
-        FROM symbols s JOIN files f ON f.id = s.file_id
-        WHERE s.id IN (${ph})
-      `).all(...ids) as any[];
-      const byId = new Map(rows.map(r => [Number(r.id), r]));
-      const items = hits.slice(0, lim).map(h => {
-        const r = byId.get(h.id);
-        return r ? {
-          id: Number(r.id), name: String(r.name),
-          qualifiedName: r.qualifiedName == null ? null : String(r.qualifiedName),
-          kind: String(r.kind), file: String(r.file), lineStart: Number(r.lineStart),
-          pagerank: Number(r.pagerank), depth: h.depth,
-        } : { id: h.id, name: '', qualifiedName: null, kind: '', file: '', lineStart: 0, pagerank: 0, depth: h.depth };
-      });
-      items.sort((a, b) => a.depth - b.depth || b.pagerank - a.pagerank);
-      return this.text({
+      const maxD = maxDepth ?? 4;
+      const maxN = maxNodes ?? 20000;
+      const selectedMode = this.traceMode(mode, summaryOnly);
+      const pageLimit = this.traceLimit(selectedMode, limit);
+      const hits = this.store.reverseReachableWithDepth(target.id, maxD, maxN);
+      const pageOffset = Math.min(offset ?? 0, hits.length);
+      const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
+      const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
+      const base = {
         symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
-        maxDepth: maxDepth ?? 4, total: hits.length, returned: items.length,
-        items, source: 'tree-sitter',
-      });
+        maxDepth: maxD,
+        maxNodes: maxN,
+        total: hits.length,
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
+        mode: selectedMode,
+        source: 'tree-sitter',
+        ...this.traceSummary(hits, items, sampled),
+        note: selectedMode === 'full'
+          ? 'Full mode still paginates. Increase limit or use nextOffset for more rows.'
+          : 'Compact trace preview. Use mode="summary" for counts only or mode="full" with limit/offset for more rows.',
+      };
+      if (selectedMode === 'summary') return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_trace_callees', {
-      description: 'Bounded forward-reachable callees of a symbol (everything its call graph reaches within depth N).',
+      description: 'Bounded forward-reachable callees of a symbol. Default mode=preview returns exact totals, depth/file summaries, and a small page of rows; use mode=full only when you need more raw rows.',
       inputSchema: {
         symbol: z.string(),
+        file: z.string().optional(),
         maxDepth: z.number().int().positive().max(8).optional(),
         maxNodes: z.number().int().positive().max(50000).optional(),
         limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        mode: z.enum(['summary', 'preview', 'full']).optional()
+          .describe('summary returns counts/top files only; preview is compact default; full returns a larger raw page.'),
+        summaryOnly: z.boolean().optional().describe('Shortcut for mode=summary.'),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals or summary.'),
       },
-    }, async ({ symbol, maxDepth, maxNodes, limit }) => {
+    }, async ({ symbol, file, maxDepth, maxNodes, limit, offset, mode, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
-      const defs = this.store.getDefinition(symbol);
-      if (defs.length === 0) return this.text({ found: false, reason: `no symbol "${symbol}"` });
+      const defs = this.store.getDefinition(symbol, { filePath: file });
+      if (defs.length === 0) return this.text({
+        found: false,
+        reason: file ? `no symbol "${symbol}" in ${file}` : `no symbol "${symbol}"`,
+      });
       const target = defs[0];
-      const hits = this.store.forwardReachableWithDepth(target.id, maxDepth ?? 4, maxNodes ?? 20000);
-      const lim = Math.min(hits.length, limit ?? 100);
-      const ids = hits.slice(0, lim).map(h => h.id);
-      if (ids.length === 0) {
-        return this.text({ symbol: { id: target.id, name: target.name }, maxDepth: maxDepth ?? 4, total: 0, items: [] });
-      }
-      const ph = ids.map(() => '?').join(',');
-      const rows = (this.store as any).rawDb().prepare(`
-        SELECT s.id, s.name, s.qualified_name AS qualifiedName, s.kind,
-               f.path AS file, s.line_start AS lineStart, s.pagerank
-        FROM symbols s JOIN files f ON f.id = s.file_id
-        WHERE s.id IN (${ph})
-      `).all(...ids) as any[];
-      const byId = new Map(rows.map(r => [Number(r.id), r]));
-      const items = hits.slice(0, lim).map(h => {
-        const r = byId.get(h.id);
-        return r ? {
-          id: Number(r.id), name: String(r.name),
-          qualifiedName: r.qualifiedName == null ? null : String(r.qualifiedName),
-          kind: String(r.kind), file: String(r.file), lineStart: Number(r.lineStart),
-          pagerank: Number(r.pagerank), depth: h.depth,
-        } : { id: h.id, name: '', qualifiedName: null, kind: '', file: '', lineStart: 0, pagerank: 0, depth: h.depth };
-      });
-      items.sort((a, b) => a.depth - b.depth || b.pagerank - a.pagerank);
-      return this.text({
-        symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName },
-        maxDepth: maxDepth ?? 4, total: hits.length, returned: items.length,
-        items, source: 'tree-sitter',
-      });
+      const maxD = maxDepth ?? 4;
+      const maxN = maxNodes ?? 20000;
+      const selectedMode = this.traceMode(mode, summaryOnly);
+      const pageLimit = this.traceLimit(selectedMode, limit);
+      const hits = this.store.forwardReachableWithDepth(target.id, maxD, maxN);
+      const pageOffset = Math.min(offset ?? 0, hits.length);
+      const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
+      const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
+      const base = {
+        symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
+        maxDepth: maxD,
+        maxNodes: maxN,
+        total: hits.length,
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
+        mode: selectedMode,
+        source: 'tree-sitter',
+        ...this.traceSummary(hits, items, sampled),
+        note: selectedMode === 'full'
+          ? 'Full mode still paginates. Increase limit or use nextOffset for more rows.'
+          : 'Compact trace preview. Use mode="summary" for counts only or mode="full" with limit/offset for more rows.',
+      };
+      if (selectedMode === 'summary') return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_architecture', {
@@ -1682,14 +1903,15 @@ export class SeerMcpServer {
     this.registerTool('seer_trace', {
       description:
         'CORE drill-down tool. Unified graph-trace entry point. Set `scope` and pass the matching `args`:\n' +
-        '• callers {symbol, file?, maxDepth?, maxNodes?, limit?} — transitive reverse callers (blast radius)\n' +
-        '• callees {symbol, maxDepth?, maxNodes?, limit?} — transitive forward callees\n' +
+        '• callers {symbol, file?, maxDepth?, maxNodes?, limit?, offset?, mode?, summaryOnly?, tokenBudget?} — transitive reverse callers (blast radius)\n' +
+        '• callees {symbol, file?, maxDepth?, maxNodes?, limit?, offset?, mode?, summaryOnly?, tokenBudget?} — transitive forward callees\n' +
         '• path {from, to, maxDepth?} — shortest call path A→B\n' +
         '• file {file, maxDepth?, maxNodes?} — import-graph closure from a file\n' +
         '• module {id|label, maxDepth?, direction?} — module dependency reachability\n' +
         '• service {from, maxDepth?, maxNodes?, maxFanout?} — service-link reachability\n' +
         '• service_path {from, to, maxDepth?} — shortest service-link path\n' +
         '• module_service {moduleId, maxDepth?, maxNodes?} — cross-module service-link reachability\n' +
+        'For callers/callees, `mode` is summary|preview|full; use `offset` and `limit` to page large graphs.\n' +
         'Delegates to the specific seer_trace_* tool (each still available for direct use).',
       inputSchema: {
         scope: z.enum([

@@ -52,6 +52,11 @@ async function main(): Promise<void> {
     '}',
     '',
   ].join('\n'));
+  fs.writeFileSync(path.join(TMP_WS, 'fanout.ts'), [
+    'export function noisyTarget(): number { return 1; }',
+    ...Array.from({ length: 30 }, (_, i) => `export function noisyCaller${i}(): number { return noisyTarget(); }`),
+    '',
+  ].join('\n'));
   console.log(`  Workspace: ${TMP_WS}`);
 
   // Spawn the MCP server. Disable JIT/watcher for deterministic tests.
@@ -126,6 +131,9 @@ async function main(): Promise<void> {
     if (toolNames.includes(e)) ok(`tools/list includes ${e}`);
     else bad(`tools/list missing ${e}`, toolNames);
   }
+  const healthTool = (list.result?.tools ?? []).find((t: any) => t.name === 'seer_health');
+  if (healthTool?._meta?.['anthropic/alwaysLoad'] === true) ok('core tools advertise Claude alwaysLoad hint');
+  else bad('core tools missing Claude alwaysLoad hint', healthTool);
 
   // seer_health
   const health = await call('tools/call', { name: 'seer_health', arguments: {} });
@@ -186,6 +194,36 @@ async function main(): Promise<void> {
   if (exactTraceParsed.total === 1 && traceNames.includes('alphaOnly') && !traceNames.includes('betaOnly')) {
     ok('seer_trace_callers with file disambiguates qualified method names');
   } else bad('seer_trace_callers with file leaked or missed callers', exactTraceParsed);
+
+  const noisyTrace = await call('tools/call', {
+    name: 'seer_trace_callers',
+    arguments: { symbol: 'noisyTarget', maxDepth: 1 },
+  });
+  const noisyTraceParsed = JSON.parse(noisyTrace.result?.content?.[0]?.text ?? '{}');
+  if (noisyTraceParsed.total >= 30 && noisyTraceParsed.returned <= 20 && noisyTraceParsed.nextOffset != null) {
+    ok('seer_trace_callers defaults to compact paginated preview');
+  } else bad('seer_trace_callers default preview is too large or unpaged', noisyTraceParsed);
+  if (noisyTraceParsed.depthCounts?.['1'] >= 30 && Array.isArray(noisyTraceParsed.topFiles)) {
+    ok('seer_trace_callers returns summary fields for large graphs');
+  } else bad('seer_trace_callers missing compact summary fields', noisyTraceParsed);
+
+  const noisySummary = await call('tools/call', {
+    name: 'seer_trace_callers',
+    arguments: { symbol: 'noisyTarget', maxDepth: 1, summaryOnly: true },
+  });
+  const noisySummaryParsed = JSON.parse(noisySummary.result?.content?.[0]?.text ?? '{}');
+  if (noisySummaryParsed.mode === 'summary' && noisySummaryParsed.returned === 0 && noisySummaryParsed.items === undefined) {
+    ok('seer_trace_callers summaryOnly omits raw items');
+  } else bad('seer_trace_callers summaryOnly returned row payload', noisySummaryParsed);
+
+  const noisyNext = await call('tools/call', {
+    name: 'seer_trace_callers',
+    arguments: { symbol: 'noisyTarget', maxDepth: 1, offset: noisyTraceParsed.nextOffset, limit: 10 },
+  });
+  const noisyNextParsed = JSON.parse(noisyNext.result?.content?.[0]?.text ?? '{}');
+  if (noisyNextParsed.offset === noisyTraceParsed.nextOffset && noisyNextParsed.returned <= 10) {
+    ok('seer_trace_callers paginates with offset/limit');
+  } else bad('seer_trace_callers offset pagination failed', noisyNextParsed);
 
   // seer_callees
   const callees = await call('tools/call', { name: 'seer_callees', arguments: { symbol: 'process_payment' } });

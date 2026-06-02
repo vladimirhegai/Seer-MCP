@@ -89,6 +89,17 @@ npx seer-mcp health
 npx seer-mcp symbols runInit --top 5
 ```
 
+## Tool Loading
+
+Seer writes client config, but the client decides how MCP tools are loaded.
+
+- Antigravity: no eager flag. Seer keeps the setup workspace-local, pins
+  `--workspace`/`cwd`, and writes strong agent instructions.
+- Claude Code: Seer marks the core tools as `anthropic/alwaysLoad`; larger
+  specialist tools stay discoverable on demand.
+- Codex, Cursor, VS Code, Gemini, Windsurf: Seer writes the supported MCP
+  config shape and relies on the client to expose tools after reload.
+
 ## Where Seer Stores Data
 
 Seer creates:
@@ -249,6 +260,15 @@ npx seer-mcp callers Node.add_child --file scene/main/node.cpp
 ```
 
 In MCP, pass the same `file` field to `seer_callers` or `seer_trace` callers.
+For large transitive graphs, ask for a summary or page:
+
+```json
+{"scope":"callers","args":{"symbol":"Node.add_child","file":"scene/main/node.cpp","mode":"summary"}}
+```
+
+```json
+{"scope":"callers","args":{"symbol":"Node.add_child","file":"scene/main/node.cpp","limit":20,"offset":20}}
+```
 
 ### First Query Is Slow
 

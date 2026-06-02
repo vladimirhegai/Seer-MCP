@@ -75,6 +75,18 @@ Then restart/reload the agent. Do not trust Seer query results until
 Project A and Project B can both have Seer when each repo has its own local MCP
 file. For Antigravity, that file is `.agents/mcp_config.json`.
 
+## Tool Loading
+
+MCP clients decide whether tools are visible immediately or discovered on
+demand. Seer does not write undocumented eager flags.
+
+| Client | Seer behavior |
+|---|---|
+| Antigravity IDE / CLI | No eager flag. Seer uses workspace-local config, `--workspace`, `cwd`, repo-specific server ids, and agent instructions. |
+| Claude Code CLI | Seer marks core tools with `_meta["anthropic/alwaysLoad"]`; large/specialist tools remain on demand. |
+| Codex CLI / extension | Seer writes supported MCP config. No verified eager/always-load setting. |
+| Cursor / VS Code / Gemini / Windsurf | Seer writes supported MCP config. Use client allow/disable controls if available. |
+
 ## Files By Client
 
 | Client | Config file | MCP key | Scope |

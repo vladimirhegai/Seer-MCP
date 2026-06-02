@@ -51,8 +51,14 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_behavior` (`symbol`) tests that exercise the symbol, ranked by how
   directly they hit it.
 - `seer_trace_path` (`from`, `to`) shortest call path between two symbols.
-- `seer_trace_callers` (`symbol`, `file?`, `maxDepth?`) transitive callers.
-- `seer_trace_callees` (`symbol`, `maxDepth?`) transitive callees.
+- `seer_trace_callers`
+  (`symbol`, `file?`, `maxDepth?`, `limit?`, `offset?`, `mode?`) transitive
+  callers. Default `mode: "preview"` returns exact totals, depth/file
+  summaries, and a small page of rows.
+- `seer_trace_callees`
+  (`symbol`, `file?`, `maxDepth?`, `limit?`, `offset?`, `mode?`) transitive
+  callees. Use `mode: "summary"` for counts/top files only, or `mode: "full"`
+  when raw rows are needed.
 - `seer_detect_changes` (`fromRef?`, `toRef?`) blast radius for a diff.
 
 ## Modules and boundaries
@@ -103,11 +109,12 @@ and it maps a git diff to the affected symbols and their blast radius.
 ## Keeping output small
 
 The high-volume list tools (`seer_symbols`, `seer_definition`, `seer_callers`,
-`seer_callees`, `seer_complexity`, `seer_service_calls`, `seer_service_links`)
-accept an optional `tokenBudget`. Seer packs the highest-ranked rows until the
-serialized payload would exceed roughly `tokenBudget * 4` characters, then flags
-`truncated: true` with an `omitted` count and a note on how to get the rest. With
-no budget, output is untrimmed and byte-identical to before.
+`seer_callees`, `seer_trace_callers`, `seer_trace_callees`, `seer_complexity`,
+`seer_service_calls`, `seer_service_links`) accept an optional `tokenBudget`.
+Seer packs the highest-ranked rows until the serialized payload would exceed
+roughly `tokenBudget * 4` characters, then flags `truncated: true` with an
+`omitted` count and a note on how to get the rest. With no budget, direct list
+tools stay untrimmed; trace tools default to compact previews with totals.
 
 ## Tools you usually do not need
 

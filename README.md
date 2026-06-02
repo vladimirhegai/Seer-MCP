@@ -87,6 +87,8 @@ seer_health
 
 The first query builds `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore`
 if it is not already ignored.
+Claude Code gets Seer's core MCP tools marked as always-load. Antigravity has
+no eager flag; Seer relies on workspace-local config plus `--workspace`/`cwd`.
 
 Update existing installs:
 
