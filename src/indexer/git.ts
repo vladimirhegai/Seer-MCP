@@ -35,6 +35,19 @@ export function isGitRepo(repoRoot: string): boolean {
   } catch { return false; }
 }
 
+/**
+ * True when the repo is a shallow clone (`git clone --depth N`). A shallow
+ * checkout has almost no commit history, so per-symbol/file history walks return
+ * little or nothing through no fault of Seer's — worth telling the agent rather
+ * than silently reporting an empty history. Returns false on any git error.
+ */
+export function isShallowRepo(repoRoot: string): boolean {
+  try {
+    const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', '--is-shallow-repository'], syncOpts());
+    return r.status === 0 && r.stdout.trim() === 'true';
+  } catch { return false; }
+}
+
 export function gitHeadSha(repoRoot: string): string | null {
   try {
     const r = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], syncOpts());
@@ -416,16 +429,24 @@ export interface CommitWithDiff {
 /**
  * Walk a single file's history AND its diffs in one subprocess.
  *
- * `git log --follow -U0 -p` emits, per commit: the `__C__` header line, the
+ * `git log [--follow] -U0 -p` emits, per commit: the `__C__` header line, the
  * message body (terminated by `__BODY_END__`), then the unified diff for the
  * followed path. We deliberately DO NOT pass `--name-status`: combined with a
  * custom `--pretty=format:` and `-p`, git emits the name-status summary and
  * SUPPRESSES the patch (verified empirically), which would silently drop every
- * hunk. `--follow` already threads the diff through renames, so the per-commit
- * path the old code resolved from `--name-status` is no longer needed.
+ * hunk.
+ *
+ * `follow` (default false) controls rename traversal. With `--follow`, git
+ * re-runs rename detection at every step of the walk — the single most expensive
+ * common `git log` flag — to thread the diff through file renames. WITHOUT it the
+ * walk stops at the file's rename boundary ("history starts here"), which is
+ * 2-5x faster on deep histories; the continuity pass (shape-hash rename/move
+ * recovery) bridges that boundary, so the default trades a small amount of raw
+ * per-file rename linkage for a large constant-factor speedup. Callers that need
+ * unbroken file-rename chains in the raw rows pass `follow: true`.
  *
  * Spawns drop from `F*C` (one `git show` per file-commit pair) to `F` (one walk
- * per file) while preserving per-file `--follow` rename precision.
+ * per file).
  *
  * `assumeRepo` lets a caller that already validated the repo skip the redundant
  * blocking `isGitRepo()` spawn on every call.
@@ -435,7 +456,7 @@ export async function commitsWithDiffsForFile(
   filePath: string,
   options: {
     limit?: number; since?: number; timeoutMs?: number;
-    onTimeout?: (command: string) => void; assumeRepo?: boolean;
+    onTimeout?: (command: string) => void; assumeRepo?: boolean; follow?: boolean;
   } = {},
 ): Promise<CommitWithDiff[]> {
   if (!options.assumeRepo && !isGitRepo(repoRoot)) return [];
@@ -443,7 +464,7 @@ export async function commitsWithDiffsForFile(
   const args = ['-C', repoRoot, 'log',
     '--pretty=format:__C__%H%x09%an%x09%ae%x09%aI%n%B%n__BODY_END__',
     '--no-merges',
-    '--follow',
+    ...(options.follow ? ['--follow'] : []),
     '-U0',
     '-p',
   ];
@@ -456,7 +477,7 @@ export async function commitsWithDiffsForFile(
     const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const timer = setTimeout(() => {
       timedOut = true;
-      options.onTimeout?.(`git log -p --follow -- ${rel}`);
+      options.onTimeout?.(`git log -p${options.follow ? ' --follow' : ''} -- ${rel}`);
       killProcess(proc);
     }, gitTimeoutMs(options.timeoutMs));
     let buf = '';

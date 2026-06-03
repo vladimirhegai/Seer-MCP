@@ -47,10 +47,15 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_symbols` (`query?`, `top?`) BM25 search, or top symbols by PageRank.
 - `seer_definition` (`name`, `file?`) exact definition lookup.
 - `seer_file_symbols` (`file`) symbols in a file, in line order.
-- `seer_callers` (`symbol`, `file?`) direct callers, with a true count. Use
-  `file` to disambiguate common or qualified method names.
+- `seer_callers` (`symbol`, `file?`, `includeNameMatches?`) DIRECT callers. `total`
+  is call SITES (edges); `uniqueCallers` is distinct caller functions. Use `file`
+  or a qualified `Class.method` to disambiguate. For C/C++ member calls the
+  receiver type is unresolved, so the precise count can undercount; when that
+  happens an `ambiguity` block reports the by-name upper bound, and
+  `includeNameMatches: true` returns the by-name caller list. (For TRANSITIVE
+  reach, use `seer_trace_callers` / `seer_trace` `scope: "callers"`.)
 - `seer_callees` (`symbol`) direct callees.
-- `seer_search` (`query`) combined symbol + file-path search.
+- `seer_search` (`query`, `tokenBudget?`) combined symbol + file-path search.
 - `seer_skeleton` (`file`, `focusSymbol?`) render a file as signatures only, with
   bodies collapsed to `{ ... N lines ... }`. Read a 2,000-line file for the cost
   of its outline. `focusSymbol` expands one body verbatim.
@@ -64,8 +69,8 @@ and it maps a git diff to the affected symbols and their blast radius.
 ## Complexity and blast radius
 
 - `seer_complexity` (`by?`, `minValue?`) cyclomatic / cognitive / LOC rankings.
-- `seer_behavior` (`symbol`) tests that exercise the symbol, ranked by how
-  directly they hit it.
+- `seer_behavior` (`symbol`, `file?`) tests that exercise the symbol, ranked by
+  how directly they hit it. Pass `file` to pin a common method name.
 - `seer_trace_path` (`from`, `to`) shortest call path between two symbols.
 - `seer_trace_callers`
   (`symbol`, `file?`, `maxDepth?`, `limit?`, `offset?`, `mode?`) transitive
@@ -111,8 +116,17 @@ and it maps a git diff to the affected symbols and their blast radius.
 ## Unified context
 
 - `seer_preflight` consolidated pre-edit packet (symbol or diff-range mode).
-- `seer_context` consolidated symbol context.
-- `seer_risk` decomposed edit-risk analysis.
+- `seer_context` (`symbol`, `file?`) consolidated symbol context.
+- `seer_risk` (`symbol`, `file?`) decomposed edit-risk analysis.
+
+> Disambiguation: the single-definition tools (`seer_context`, `seer_behavior`,
+> `seer_risk`, `seer_trace_callers`, `seer_trace_callees`) resolve a bare name to
+> the highest-PageRank definition. When the name is ambiguous and no `file` is
+> given, the response carries a `nameAmbiguity` hint listing the chosen
+> definition and the alternatives — pass `file` or a qualified `Class::method` to
+> target a specific one. `seer_callers`/`seer_callees` instead aggregate every
+> same-named definition on a bare name (the count is an upper bound across all of
+> them); pass `file` or `Class.method` there to scope to one.
 
 ---
 
@@ -122,13 +136,18 @@ and it maps a git diff to the affected symbols and their blast radius.
   One failing call does not abort the rest. It cannot nest inside itself.
 - `seer_trace` (`scope`, `args?`) a single entry point that dispatches to the
   whole `seer_trace_*` family (`callers`, `callees`, `path`, `file`, `module`,
-  `service`, `service_path`, `module_service`).
+  `service`, `service_path`, `module_service`). `seer_trace` is the always-loaded
+  entry point; the individual `seer_trace_*` tools behave identically when called
+  directly, but some MCP clients lazy-load them — prefer `seer_trace` if a
+  `seer_trace_*` tool is not listed. `args` is the delegate's own argument object
+  (e.g. `{ scope: "callers", args: { symbol, file?, maxDepth?, mode? } }`).
 
 ## Keeping output small
 
 The high-volume list tools (`seer_symbols`, `seer_definition`, `seer_callers`,
-`seer_callees`, `seer_trace_callers`, `seer_trace_callees`, `seer_complexity`,
-`seer_service_calls`, `seer_service_links`) accept an optional `tokenBudget`.
+`seer_callees`, `seer_search`, `seer_trace_callers`, `seer_trace_callees`,
+`seer_complexity`, `seer_service_calls`, `seer_service_links`) accept an optional
+`tokenBudget`.
 Seer packs the highest-ranked rows until the serialized payload would exceed
 roughly `tokenBudget * 4` characters, then flags `truncated: true` with an
 `omitted` count and a note on how to get the rest. With no budget, direct list

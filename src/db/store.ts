@@ -433,6 +433,10 @@ export class Store {
     // existing DBs get NULL which forces history to run on next invocation.
     this.addColumnIfMissing('git_index_state', 'last_history_head_sha', 'TEXT');
     this.addColumnIfMissing('git_index_state', 'last_history_at',       'INTEGER');
+    // v11+: persist the --follow choice used for the last full build so
+    // incremental refreshes can replicate it without scanning watermarks.
+    // NULL = unknown (old DB) → treated as false (the B2 default).
+    this.addColumnIfMissing('git_index_state', 'last_history_follow',   'INTEGER');
 
     // v5: symbol_role on symbols. The NOT NULL DEFAULT 'definition' on the
     // ALTER means every pre-v5 row gets a sane default without an explicit
@@ -1526,11 +1530,40 @@ export class Store {
     return out;
   }
 
-  /** Count of callers for a specific symbol id (id-scoped). */
+  /** Count of callers for a specific symbol id (id-scoped). Counts CALL SITES
+   * (one per edge), so two calls from the same function count as two. */
   countCallersById(symbolId: number): number {
     const row = this.db.prepare(
       "SELECT COUNT(*) AS c FROM edges WHERE to_id = ? AND kind = 'call'",
     ).get(symbolId) as Row;
+    return toNum(row.c);
+  }
+
+  /** Count of DISTINCT caller functions for a symbol id — the number of unique
+   * `from_id`s, not call sites. `countCallersById` counts edges (sites); a
+   * function that calls the target twice contributes 1 here and 2 there. Surfaced
+   * so agents don't read "6 callers" (sites) as "6 functions" (the count Codex
+   * flagged as ambiguous against blastRadius.directCallers). */
+  countUniqueCallersById(symbolId: number): number {
+    const row = this.db.prepare(
+      "SELECT COUNT(DISTINCT from_id) AS c FROM edges WHERE to_id = ? AND kind = 'call'",
+    ).get(symbolId) as Row;
+    return toNum(row.c);
+  }
+
+  /** How many definitions share a given SHORT name (e.g. `add_child`), excluding
+   * declarations/type-refs. >1 means the name is ambiguous: a call edge carrying
+   * only the short name (typical of C/C++ `obj->add_child()` member calls, whose
+   * receiver type tree-sitter can't infer) cannot be statically attributed to one
+   * specific definition. Used to flag honest blast-radius bounds. */
+  countDefinitionsByShortName(shortName: string): number {
+    if (!shortName) return 0;
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS c FROM symbols
+      WHERE name = ?
+        AND kind IN ('function','method','constructor','class')
+        AND (symbol_role IS NULL OR symbol_role = 'definition')
+    `).get(shortName) as Row;
     return toNum(row.c);
   }
 
@@ -3039,6 +3072,75 @@ export class Store {
     return inserted;
   }
 
+  /**
+   * Delete this file's existing history rows (by symbol id), then insert the
+   * freshly-computed batch — both in ONE transaction. Used by the per-file
+   * history walk so a reprocess produces EXACTLY the current correct set rather
+   * than unioning with stale rows. The reprocess cases that need this:
+   *   - a `--follow` toggle or algorithm bump changes which commits attribute
+   *     (the options fingerprint flips the watermark, but the symbol ids may be
+   *     unchanged, so plain INSERT OR IGNORE would leave the old rows behind);
+   *   - a `--force` rebuild where symbols were never reindexed (no ON DELETE
+   *     CASCADE fired).
+   * For the common incremental case (a changed file is reindexed) the symbols
+   * are replaced and ON DELETE CASCADE already cleared the old rows, so the
+   * delete here is a cheap no-op. Returns rows actually inserted.
+   */
+  replaceSymbolHistoryForSymbols(symbolIds: number[], rows: SymbolHistoryInsert[]): number {
+    if (symbolIds.length === 0 && rows.length === 0) return 0;
+    const stmt = this.stmtInsertSymbolHistory;
+    let inserted = 0;
+    this.db.exec('BEGIN');
+    try {
+      if (symbolIds.length > 0) {
+        // Chunk the IN-list so a file with thousands of symbols stays under the
+        // SQLite variable limit.
+        const del = this.db.prepare('DELETE FROM symbol_history WHERE symbol_id = ?');
+        for (const id of symbolIds) del.run(id);
+      }
+      for (const r of rows) {
+        const res = stmt.run(
+          r.symbolId, r.symbolKey, r.commitSha, r.authorName, r.authorEmail,
+          r.committedAt, r.message, r.linesAdded, r.linesRemoved,
+          r.prNumber, r.prUrl, r.matchStrategy, r.confidence);
+        if (Number(res.changes) > 0) inserted++;
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return inserted;
+  }
+
+  /**
+   * Like listSymbolsForHistoryIndex but scoped to a set of absolute file paths —
+   * used by the on-demand / scoped history build so it only loads the handful of
+   * symbols whose files were requested, instead of every symbol in the repo.
+   */
+  listSymbolsForHistoryIndexForFiles(
+    absPaths: string[],
+  ): Array<{ id: number; fileId: number; filePath: string; relPath: string; fileHash: string; lineStart: number; lineEnd: number; symbolKey: string }> {
+    if (absPaths.length === 0) return [];
+    const placeholders = absPaths.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT s.id, s.file_id AS fileId, f.path AS filePath, f.rel_path AS relPath,
+             f.hash AS fileHash,
+             s.line_start AS lineStart, s.line_end AS lineEnd, s.symbol_key AS symbolKey
+      FROM symbols s JOIN files f ON f.id = s.file_id
+      WHERE s.symbol_key IS NOT NULL
+        AND s.kind IN ('function','method','constructor','class')
+        AND f.path IN (${placeholders})
+    `).all(...absPaths) as Row[];
+    return rows.map(r => ({
+      id: toNum(r.id), fileId: toNum(r.fileId),
+      filePath: toStr(r.filePath), relPath: toStr(r.relPath),
+      fileHash: toStr(r.fileHash),
+      lineStart: toNum(r.lineStart), lineEnd: toNum(r.lineEnd),
+      symbolKey: toStr(r.symbolKey),
+    }));
+  }
+
   getSymbolHistory(symbolId: number, options: { limit?: number; since?: number } = {}): SymbolHistoryRow[] {
     if (!this.hasV4Tables) return [];
     const limit = Math.max(1, options.limit ?? 50);
@@ -3092,6 +3194,7 @@ export class Store {
     algorithmVersion: number;
     lastHistoryHeadSha: string | null;
     lastHistoryAt: number | null;
+    lastHistoryFollow: boolean | null;
   } | null {
     if (!this.hasV4Tables) return null;
     const row = this.db.prepare(
@@ -3099,7 +3202,8 @@ export class Store {
               last_processed_at AS lastProcessedAt, remote_url AS remoteUrl,
               algorithm_version AS algorithmVersion,
               last_history_head_sha AS lastHistoryHeadSha,
-              last_history_at AS lastHistoryAt
+              last_history_at AS lastHistoryAt,
+              last_history_follow AS lastHistoryFollow
        FROM git_index_state WHERE id = 1`
     ).get() as Row | undefined;
     if (!row) return null;
@@ -3111,6 +3215,7 @@ export class Store {
       algorithmVersion: toNum(row.algorithmVersion),
       lastHistoryHeadSha: toNullStr(row.lastHistoryHeadSha),
       lastHistoryAt: row.lastHistoryAt == null ? null : toNum(row.lastHistoryAt),
+      lastHistoryFollow: row.lastHistoryFollow == null ? null : (toNum(row.lastHistoryFollow) === 1),
     };
   }
 
@@ -3140,21 +3245,28 @@ export class Store {
    * setGitIndexState() so running file-level churn never makes a subsequent
    * buildSymbolHistory() skip.
    */
-  setHistoryHeadSha(repoRoot: string, lastHistoryHeadSha: string | null, remoteUrl: string | null): void {
+  setHistoryHeadSha(
+    repoRoot: string, lastHistoryHeadSha: string | null, remoteUrl: string | null,
+    follow?: boolean,
+  ): void {
     // Upsert: insert a fresh row if churn hasn't run yet; otherwise just
     // update the history columns. repo_root + remote_url are kept in sync
     // either way so the row stays self-describing.
+    // last_history_follow persists the --follow choice so incremental refreshes
+    // can replicate it without scanning per-file watermarks (which may be mixed
+    // if scoped builds ran after the full build).
     this.db.prepare(`
       INSERT INTO git_index_state
         (id, repo_root, last_processed_at, remote_url, algorithm_version,
-         last_history_head_sha, last_history_at)
-      VALUES (1, ?, ?, ?, 1, ?, ?)
+         last_history_head_sha, last_history_at, last_history_follow)
+      VALUES (1, ?, ?, ?, 1, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         repo_root = excluded.repo_root,
         remote_url = COALESCE(excluded.remote_url, git_index_state.remote_url),
         last_history_head_sha = excluded.last_history_head_sha,
-        last_history_at = excluded.last_history_at
-    `).run(repoRoot, Date.now(), remoteUrl, lastHistoryHeadSha, Date.now());
+        last_history_at = excluded.last_history_at,
+        last_history_follow = excluded.last_history_follow
+    `).run(repoRoot, Date.now(), remoteUrl, lastHistoryHeadSha, Date.now(), follow ? 1 : 0);
   }
 
   /** All symbols matching a symbol_key — used by `seer_history` to find the

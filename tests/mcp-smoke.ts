@@ -227,8 +227,12 @@ async function main(): Promise<void> {
     arguments: { symbol: 'noisyTarget', maxDepth: 1, summaryOnly: true },
   });
   const noisySummaryParsed = JSON.parse(noisySummary.result?.content?.[0]?.text ?? '{}');
-  if (noisySummaryParsed.mode === 'summary' && noisySummaryParsed.returned === 0 && noisySummaryParsed.items === undefined) {
-    ok('seer_trace_callers summaryOnly omits raw items');
+  // Summary mode must NOT carry raw rows, and must NOT emit a bare top-level
+  // `returned: 0` (agents misread that as "0 results" next to populated
+  // topFiles/topSymbols). The empty page is now nested under rows.omittedByMode.
+  if (noisySummaryParsed.mode === 'summary' && noisySummaryParsed.items === undefined
+      && noisySummaryParsed.returned === undefined && noisySummaryParsed.rows?.omittedByMode === true) {
+    ok('seer_trace_callers summaryOnly omits raw items (rows.omittedByMode, no misleading returned:0)');
   } else bad('seer_trace_callers summaryOnly returned row payload', noisySummaryParsed);
 
   const noisyNext = await call('tools/call', {

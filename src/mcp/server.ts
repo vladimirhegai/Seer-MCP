@@ -167,7 +167,7 @@ function mcpInstructions(): string {
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
-    'seer_history is read-only; if historyIndex.built is false, report that history is not built. Only run seer_symbol_history_build or CLI symbol-history when the user asks for a history build.',
+    'seer_history is read-only. If it returns a buildHint (no rows for the symbol), you may run a SCOPED seer_symbol_history_build { symbols: [name] } — it builds just that symbol\'s file in ~1s. A FULL history build (no symbols/paths) can take minutes on large repos: ask the user first, or point them at `seer symbol-history`.',
     'For huge transitive graphs, prefer seer_trace mode="summary" or the compact preview; page with offset/limit and use mode="full" only when raw rows are needed.',
     'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
   ].join(' ');
@@ -369,7 +369,12 @@ export class SeerMcpServer {
   }
 
   private text(obj: unknown): { content: Array<{ type: 'text'; text: string }> } {
-    return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] };
+    // Compact (no pretty-print) on purpose. The consumer is an LLM agent, and
+    // 2-space indentation added ~25% pure-whitespace tokens to EVERY response —
+    // a direct tax on Seer's core promise (lower tokens). Agents parse compact
+    // JSON fine, and this also makes budgetedText/seer_search budget accounting
+    // exact, since those already measure with a compact JSON.stringify.
+    return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
   }
 
   /**
@@ -534,6 +539,79 @@ export class SeerMcpServer {
       name: r.name, qualifiedName: r.qualifiedName, kind: r.kind,
       file: r.filePath, lineStart: r.lineStart,
     }));
+  }
+
+  /**
+   * Honest blast-radius bounds for a resolved caller target. id-resolved callers
+   * (`countCallersById`) are PRECISE but can badly understate reality when the
+   * call edges only carry a short name: C/C++ member calls (`obj->add_child()`)
+   * lose the receiver's static type, so tree-sitter can't bind them to THIS
+   * `Node.add_child` — they scatter across every same-named definition during
+   * global fallback. When that happens the id-resolved count (e.g. 6) is a lower
+   * bound and the name-level call-site count (e.g. 4252) is the upper bound. We
+   * surface BOTH so an agent sizing a refactor isn't misled into "only 6 callers".
+   * Returns undefined when the name is unambiguous (no extra context needed).
+   */
+  private callerAmbiguity(target: {
+    id: number; name: string; filePath: string; total: number;
+  }): {
+    reason: 'unresolved-receiver-type' | 'shared-short-name';
+    shortName: string;
+    sharedByDefinitions: number;
+    nameCallsites: number;
+    resolvedCallsites: number;
+    note: string;
+  } | undefined {
+    const shortName = target.name;
+    if (!shortName) return undefined;
+    let sharedDefs = 0;
+    let nameCallsites = 0;
+    try {
+      sharedDefs = this.store.countDefinitionsByShortName(shortName);
+      nameCallsites = this.store.countCallers(shortName);
+    } catch { return undefined; }
+    // Only meaningful when the name is shared AND more call sites use the bare
+    // name than resolved to this id (i.e. the resolver could not attribute them).
+    if (sharedDefs <= 1 || nameCallsites <= target.total) return undefined;
+    const lc = target.filePath.toLowerCase();
+    const dot = lc.lastIndexOf('.');
+    const ext = dot === -1 ? '' : lc.slice(dot);
+    const cppExts = new Set(['.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.h++', '.inl', '.ino']);
+    const reason = cppExts.has(ext) ? 'unresolved-receiver-type' as const : 'shared-short-name' as const;
+    const note = reason === 'unresolved-receiver-type'
+      ? `Likely undercount. ${shortName} is defined by ${sharedDefs} symbols, and ${nameCallsites} call sites invoke some "${shortName}". C/C++ member calls (obj->${shortName}()) lose the receiver's static type, so Seer cannot bind them to THIS definition — the ${target.total} resolved call site(s) are a LOWER bound; the true caller set for this symbol is between ${target.total} and ${nameCallsites}. Pass includeNameMatches=true for the by-name caller list, or grep for the exact receiver type.`
+      : `${shortName} is defined by ${sharedDefs} symbols and ${nameCallsites} call sites use the bare name; only ${target.total} resolved to THIS definition. The remainder bound to other same-named symbols. Pass includeNameMatches=true to see every by-name caller (the upper bound).`;
+    return { reason, shortName, sharedByDefinitions: sharedDefs, nameCallsites, resolvedCallsites: target.total, note };
+  }
+
+  /**
+   * When a BARE (file-less, unqualified) symbol name resolves to MORE THAN ONE
+   * definition, the symbol tools silently use the highest-PageRank one. On the
+   * Godot DB `add_child` resolves to `FabrikInverseKinematic::ChainItem::add_child`
+   * (pr 0.0002) instead of `Node::add_child` (pr 0.0000) — so an agent that asked
+   * about the wrong symbol got plausible-but-wrong data and no signal it happened.
+   * This returns a compact hint (chosen def + a few alternatives) so the agent
+   * knows to pass `file=` / a qualified name. Returns undefined when unambiguous,
+   * a file was given, or the name is already qualified. One cheap indexed lookup.
+   */
+  private nameAmbiguityHint(symbol: string, file: string | undefined): {
+    note: string;
+    resolvedTo: { qualifiedName: string; file: string; lineStart: number };
+    otherDefinitions: Array<{ qualifiedName: string; file: string; lineStart: number }>;
+  } | undefined {
+    if (file) return undefined;
+    if (symbol.includes('.') || symbol.includes('::')) return undefined;
+    let defs;
+    try { defs = this.store.getDefinition(symbol); } catch { return undefined; }
+    if (defs.length <= 1) return undefined;
+    const [chosen, ...rest] = defs;
+    return {
+      resolvedTo: { qualifiedName: chosen.qualifiedName ?? chosen.name, file: chosen.filePath, lineStart: chosen.lineStart },
+      otherDefinitions: rest.slice(0, 4).map(d => ({
+        qualifiedName: d.qualifiedName ?? d.name, file: d.filePath, lineStart: d.lineStart,
+      })),
+      note: `"${symbol}" is defined by ${defs.length} symbols; used the highest-PageRank one (${chosen.qualifiedName ?? chosen.name}). Pass file= or a qualified Class::method to target a different definition.`,
+    };
   }
 
   /**
@@ -985,15 +1063,17 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'CORE drill-down tool. Direct callers of a symbol with bounded preview + true total. Pass file to disambiguate common names or qualified names such as Class.method.',
+      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound — pass includeNameMatches=true for that list.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
         limit: z.number().int().positive().max(500).optional(),
+        includeNameMatches: z.boolean().optional()
+          .describe('Also return callers matched by SHORT name (type-unresolved upper bound). Useful for C/C++ member calls where the precise id-resolved set undercounts.'),
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims the (already limit-bounded) caller list.'),
       },
-    }, async ({ symbol, file, limit, tokenBudget }) => {
+    }, async ({ symbol, file, limit, includeNameMatches, tokenBudget }) => {
       await this.ensureFresh();
       // Resolve to a specific id when the input is DISAMBIGUATING: a `file` was
       // given, or the symbol is qualified (`Node.add_child` / `Node::add_child`).
@@ -1015,6 +1095,7 @@ export class SeerMcpServer {
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const total = target ? this.store.countCallersById(target.id) : this.store.countCallers(symbol);
+      const uniqueCallers = target ? this.store.countUniqueCallersById(target.id) : undefined;
       const rows = target
         ? this.store.findCallersById(target.id, limit ?? 40)
         : this.store.findCallers(symbol, limit ?? 40);
@@ -1023,18 +1104,51 @@ export class SeerMcpServer {
         callerKind: c.callerKind, file: c.callerFile, line: c.callerLine,
         edgeKind: c.edgeKind,
       }));
-      if (total === 0) {
-        const didYouMean = this.suggestSymbols(symbol);
-        return this.text({ symbol, file, target: target ? {
-          id: target.id, name: target.name, qualifiedName: target.qualifiedName,
-          kind: target.kind, file: target.filePath, lineStart: target.lineStart,
-        } : undefined, total: 0, returned: 0, items: [], source: 'tree-sitter',
-          ...(didYouMean.length > 0 ? { didYouMean } : {}) });
+      // Honest blast-radius bounds: when a resolved target's short name is shared
+      // and far more call sites use the bare name than resolved here, report both.
+      const ambiguity = target
+        ? this.callerAmbiguity({ id: target.id, name: target.name, filePath: target.filePath, total })
+        : undefined;
+      // Opt-in by-name caller list (the type-unresolved upper bound). Deduped by
+      // caller function so a hub method's list stays useful, capped to limit.
+      let nameMatches: Record<string, unknown> | undefined;
+      if (includeNameMatches && target) {
+        const nm = this.store.findCallers(target.name, 1000);
+        const seen = new Set<string>();
+        const deduped = nm.filter(c => {
+          const key = `${c.callerQualifiedName ?? c.callerName}@${c.callerFile}`;
+          if (seen.has(key)) return false;
+          seen.add(key); return true;
+        }).slice(0, limit ?? 40).map(c => ({
+          callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
+          callerKind: c.callerKind, file: c.callerFile, line: c.callerLine, edgeKind: c.edgeKind,
+        }));
+        nameMatches = {
+          shortName: target.name,
+          total: this.store.countCallers(target.name),
+          uniqueCallers: deduped.length,
+          returned: deduped.length,
+          note: 'Callers matched by SHORT name only (type-unresolved). Includes calls to OTHER same-named symbols — an upper bound, not all this symbol\'s callers.',
+          items: deduped,
+        };
       }
-      return this.budgetedText({ symbol, file, target: target ? {
+      const targetMeta = target ? {
         id: target.id, name: target.name, qualifiedName: target.qualifiedName,
         kind: target.kind, file: target.filePath, lineStart: target.lineStart,
-      } : undefined, total, source: 'tree-sitter' }, items, tokenBudget);
+      } : undefined;
+      if (total === 0) {
+        const didYouMean = this.suggestSymbols(symbol);
+        return this.text({ symbol, file, target: targetMeta,
+          total: 0, uniqueCallers, returned: 0, items: [], source: 'tree-sitter',
+          ...(ambiguity ? { ambiguity } : {}),
+          ...(nameMatches ? { nameMatches } : {}),
+          ...(didYouMean.length > 0 ? { didYouMean } : {}) });
+      }
+      return this.budgetedText({ symbol, file, target: targetMeta,
+        total, uniqueCallers,
+        ...(ambiguity ? { ambiguity } : {}),
+        ...(nameMatches ? { nameMatches } : {}),
+        source: 'tree-sitter' }, items, tokenBudget);
     });
 
     this.registerTool('seer_callees', {
@@ -1081,7 +1195,7 @@ export class SeerMcpServer {
     // Search: BM25 across symbols + files. Each symbol hit also gets enriched
     // with the containing symbol when the match is non-symbol (e.g. file).
     this.registerTool('seer_search', {
-      description: 'CORE discovery tool. Combined BM25 search across symbol names and file paths. Use this first when the target symbol/file is unknown; follow up with seer_definition or seer_file_symbols. Excludes vendor/generated/test/declaration rows by default.',
+      description: 'CORE discovery tool. Combined BM25 search across symbol names and file paths. Use this first when the target symbol/file is unknown; follow up with seer_definition or seer_file_symbols. Excludes vendor/generated/test/declaration rows by default. For broad queries pass a small limit (default 30, max 200) or tokenBudget to keep the response within MCP payload limits.',
       inputSchema: {
         query: z.string().min(1),
         limit: z.number().int().positive().max(200).optional(),
@@ -1090,8 +1204,10 @@ export class SeerMcpServer {
         includeTests: z.boolean().optional(),
         includeDeclarations: z.boolean().optional(),
         includeTypeRefs: z.boolean().optional(),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) on the whole response. Trims the lowest-ranked file-path hits first, then symbol hits, keeping totals + at least one symbol hit. Use on broad queries that overflow the MCP payload limit.'),
       },
-    }, async ({ query, limit, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs }) => {
+    }, async ({ query, limit, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs, tokenBudget }) => {
       await this.ensureFresh();
       const opts = {
         includeVendor: includeVendor ?? false,
@@ -1107,23 +1223,45 @@ export class SeerMcpServer {
         includeGenerated: opts.includeGenerated,
         includeTests: opts.includeTests,
       });
-      return this.text({
+      let symItems = symHits.map(r => ({
+        id: r.id, name: r.name, qualifiedName: r.qualifiedName,
+        kind: r.kind, file: r.filePath, lineStart: r.lineStart,
+        pagerank: r.pagerank, symbolRole: r.symbolRole,
+      }));
+      let fileItems = fileHits.map(f => ({ path: f.path, relPath: f.relPath, language: f.language, role: f.role }));
+      // File search is BM25-capped at `limit`; unlike symbolHits there is no
+      // cheap exact total, so a capped page must not masquerade as the full
+      // count. `total` is the matches seen on this page; `capped` flags that
+      // more may exist (raise limit to widen). symbolHits.total is exact.
+      const fileCapped = fileHits.length >= (limit ?? 30);
+      const build = (sym: typeof symItems, fil: typeof fileItems, extra?: Record<string, unknown>) => ({
         query,
-        symbolHits: {
-          total: symbolTotal, returned: symHits.length,
-          items: symHits.map(r => ({
-            id: r.id, name: r.name, qualifiedName: r.qualifiedName,
-            kind: r.kind, file: r.filePath, lineStart: r.lineStart,
-            pagerank: r.pagerank, symbolRole: r.symbolRole,
-          })),
-        },
-        fileHits: {
-          total: fileHits.length,
-          items: fileHits.map(f => ({ path: f.path, relPath: f.relPath, language: f.language, role: f.role })),
-        },
+        symbolHits: { total: symbolTotal, returned: sym.length, items: sym },
+        fileHits: { total: fileHits.length, returned: fil.length, ...(fileCapped ? { capped: true } : {}), items: fil },
         source: 'tree-sitter',
         note: 'Search-first: call seer_definition or seer_file_symbols on the chosen hit.',
+        ...(extra ?? {}),
       });
+      // Token budgeting: trim the lowest-ranked file-path hits first, then symbol
+      // hits, until the serialized payload fits. Always keep at least one symbol hit.
+      if (tokenBudget && tokenBudget > 0) {
+        const budgetChars = tokenBudget * 4;
+        let trimmedSym = 0, trimmedFile = 0;
+        while (JSON.stringify(build(symItems, fileItems)).length > budgetChars && fileItems.length > 0) {
+          fileItems = fileItems.slice(0, -1); trimmedFile++;
+        }
+        while (JSON.stringify(build(symItems, fileItems)).length > budgetChars && symItems.length > 1) {
+          symItems = symItems.slice(0, -1); trimmedSym++;
+        }
+        if (trimmedSym > 0 || trimmedFile > 0) {
+          return this.text(build(symItems, fileItems, {
+            truncated: true, tokenBudget,
+            omitted: { symbolHits: trimmedSym, fileHits: trimmedFile },
+            truncationNote: `Trimmed to ~${tokenBudget} tokens (dropped ${trimmedSym} symbol + ${trimmedFile} file hits). Raise tokenBudget, lower limit, or add a filter for the rest.`,
+          }));
+        }
+      }
+      return this.text(build(symItems, fileItems));
     });
 
     this.registerTool('seer_reindex', {
@@ -1327,7 +1465,7 @@ export class SeerMcpServer {
         source: 'tree-sitter',
         note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
       };
-      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      if (summaryOnly) return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1386,7 +1524,7 @@ export class SeerMcpServer {
         source: 'tree-sitter',
         note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
       };
-      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      if (summaryOnly) return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1464,18 +1602,20 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_behavior', {
-      description: 'Ranked behavioral contract for a symbol: direct/indirect/naming-convention/same-file tests with assertion counts, graph distance, and recency. Use this BEFORE editing a symbol to find the tests that describe its expected behavior.',
+      description: 'Ranked behavioral contract for a symbol: direct/indirect/naming-convention/same-file tests with assertion counts, graph distance, and recency. Use this BEFORE editing a symbol to find the tests that describe its expected behavior. Pass file to disambiguate common method names.',
       inputSchema: {
         symbol: z.string(),
+        file: z.string().optional(),
         limit: z.number().int().positive().max(200).optional(),
         indirectDepth: z.number().int().nonnegative().max(4).optional()
           .describe('BFS depth for indirect coverage (callers that transitively reach the symbol). 0 disables indirect.'),
         includeNamingConvention: z.boolean().optional(),
         includeSameFile: z.boolean().optional(),
       },
-    }, async ({ symbol, limit, indirectDepth, includeNamingConvention, includeSameFile }) => {
+    }, async ({ symbol, file, limit, indirectDepth, includeNamingConvention, includeSameFile }) => {
       await this.ensureFresh();
       const result = rankedBehavior(this.store, symbol, {
+        filePath: file,
         limit: limit ?? 30,
         indirectDepth: indirectDepth ?? 2,
         includeNamingConvention: includeNamingConvention ?? true,
@@ -1486,7 +1626,8 @@ export class SeerMcpServer {
         return this.text({ symbol, total: 0, direct: 0, indirect: 0, tests: [], reason: `no symbol "${symbol}"`,
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
-      return this.text(result);
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      return this.text(nameAmbiguity ? { ...result, nameAmbiguity } : result);
     });
 
     this.registerTool('seer_trace_path', {
@@ -1543,8 +1684,10 @@ export class SeerMcpServer {
       const pageOffset = Math.min(offset ?? 0, hits.length);
       const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
       const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
       const base = {
         symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
+        ...(nameAmbiguity ? { nameAmbiguity } : {}),
         maxDepth: maxD,
         maxNodes: maxN,
         total: hits.length,
@@ -1559,7 +1702,7 @@ export class SeerMcpServer {
           ? 'Full mode still paginates. Increase limit or use nextOffset for more rows.'
           : 'Compact trace preview. Use mode="summary" for counts only or mode="full" with limit/offset for more rows.',
       };
-      if (selectedMode === 'summary') return this.text({ ...base, returned: 0 });
+      if (selectedMode === 'summary') return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1594,8 +1737,10 @@ export class SeerMcpServer {
       const pageOffset = Math.min(offset ?? 0, hits.length);
       const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
       const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
       const base = {
         symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
+        ...(nameAmbiguity ? { nameAmbiguity } : {}),
         maxDepth: maxD,
         maxNodes: maxN,
         total: hits.length,
@@ -1610,7 +1755,7 @@ export class SeerMcpServer {
           ? 'Full mode still paginates. Increase limit or use nextOffset for more rows.'
           : 'Compact trace preview. Use mode="summary" for counts only or mode="full" with limit/offset for more rows.',
       };
-      if (selectedMode === 'summary') return this.text({ ...base, returned: 0 });
+      if (selectedMode === 'summary') return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1627,7 +1772,7 @@ export class SeerMcpServer {
       inputSchema: {
         fromRef: z.string().optional(),
         toRef: z.string().optional(),
-        callerDepth: z.number().int().positive().max(6).optional(),
+        callerDepth: z.number().int().positive().max(6).optional().describe('Transitive-caller BFS depth. Max 6.'),
       },
     }, async ({ fromRef, toRef, callerDepth }) => {
       await this.ensureFresh();
@@ -1680,29 +1825,86 @@ export class SeerMcpServer {
           continuity,
         });
       }
+      // Read-only contract: seer_history never writes. When the resolved symbol
+      // has no rows (either history was never built, or this file changed since
+      // it was — its rows cascade-cleared on reindex), point the agent at the
+      // CHEAP scoped build for exactly this symbol instead of a whole-repo pass.
+      const anyRows = items.some(it => it.total > 0);
+      // `built` is true once ANY rows exist; the FULL-index signal is the stamped
+      // global HEAD (a scoped build deliberately leaves it null).
+      const fullyBuilt = (historyIndex as any).lastHistoryHeadSha != null;
+      const buildHint = !anyRows
+        ? `No history rows for "${symbol}". Build just this symbol's file fast with seer_symbol_history_build { symbols: ["${symbol}"]${file ? `, file: "${file}"` : ''} } (~1s, scoped), or \`seer symbol-history\` for the full index.`
+        : undefined;
+      // Three honest states: (1) full index built; (2) not fully built but this
+      // symbol has rows from a SCOPED build; (3) nothing for this symbol yet.
+      const note = fullyBuilt
+        ? 'Honest limits: by default file renames cut off history at the rename commit (continuity bridges them); symbol renames also cut off there. Confidence drops with commit age.'
+        : anyRows
+          ? 'This symbol\'s history is available from a scoped build; the FULL index is not built, so other symbols may report no history until you run `seer symbol-history` or seer_symbol_history_build for them.'
+          : 'Symbol history is not built for this workspace yet. Build a specific symbol fast with seer_symbol_history_build { symbols: [...] }, or run `seer symbol-history --workspace <repo>` outside the agent for the full index.';
       return this.text({
         symbol,
         file,
         historyIndex,
         returned: items.length,
         results: items,
-        note: (historyIndex as any).built
-          ? 'Honest limits: file renames followed via --follow; symbol renames cut off history at the rename commit. Confidence drops with commit age.'
-          : 'Symbol history is not built for this workspace yet. Build explicitly with seer_symbol_history_build, or run `seer symbol-history --workspace <repo>` outside the agent for large repos. Agents should ask before starting a history build.',
+        ...(buildHint ? { buildHint } : {}),
+        note,
       });
     });
 
     this.registerTool('seer_symbol_history_build', {
-      description: '(Advanced maintenance.) Build the per-symbol git history index. Bounded by default for MCP safety; for very large repos, prefer the CLI `seer symbol-history --workspace <repo>`.',
+      description: 'Build the per-symbol git history index (this tool WRITES to the index). SCOPED is the cheap agent path: pass `symbols` (and/or `file`) or `paths` to build only those files\' history in ~1s — answer "history of one symbol" without a whole-repo build. Omit all of them for a bounded full build (prefer the CLI `seer symbol-history` for very large repos). Re-running is incremental: only files changed since last build are reprocessed.',
       inputSchema: {
+        symbols: z.array(z.string()).max(50).optional()
+          .describe('Build history for just the files that define these symbols (scoped/on-demand). Resolved by name; pair with `file` to disambiguate a single common name.'),
+        file: z.string().optional().describe('Disambiguating file for a single `symbols` entry.'),
+        paths: z.array(z.string()).max(50).optional()
+          .describe('Build history for just these files (absolute or repo-relative). Scoped/on-demand.'),
+        follow: z.boolean().optional()
+          .describe('Thread git --follow through file renames in the raw history (slower; default off — the continuity pass bridges renames).'),
         maxCommitsPerFile: z.number().int().positive().max(2000).optional(),
         maxFiles: z.number().int().positive().max(100000).optional(),
         maxSeconds: z.number().int().positive().max(600).optional(),
         gitCommandTimeoutMs: z.number().int().positive().max(60000).optional(),
         force: z.boolean().optional(),
       },
-    }, async ({ maxCommitsPerFile, maxFiles, maxSeconds, gitCommandTimeoutMs, force }) => {
+    }, async ({ symbols, file, paths, follow, maxCommitsPerFile, maxFiles, maxSeconds, gitCommandTimeoutMs, force }) => {
+      // Resolve a scoped file set from `symbols` and/or `paths`. A scoped build
+      // is fast (one git walk per file), bounded, and does not stamp the global
+      // history HEAD — so it never masquerades as a full build.
+      const onlyPaths = new Set<string>();
+      for (const p of paths ?? []) onlyPaths.add(p);
+      const unresolved: string[] = [];
+      for (const sym of symbols ?? []) {
+        const defs = this.store.getDefinition(sym, { filePath: file });
+        if (defs.length === 0) { unresolved.push(sym); continue; }
+        for (const d of defs.slice(0, 5)) onlyPaths.add(d.filePath);
+      }
+      const scopedRequested = (symbols?.length ?? 0) > 0 || (paths?.length ?? 0) > 0;
+      const scoped = scopedRequested;
+      if (scopedRequested && onlyPaths.size === 0) {
+        return this.text({
+          completed: true,
+          filesProcessed: 0,
+          filesTotal: 0,
+          filesRemaining: 0,
+          filesSkippedResume: 0,
+          symbolsProcessed: 0,
+          historyRowsInserted: 0,
+          skipped: true,
+          elapsedMs: 0,
+          scoped: true,
+          scopedFiles: 0,
+          ...(unresolved.length > 0 ? { unresolvedSymbols: unresolved } : {}),
+          historyIndex: this.historyIndexStatus(),
+          note: 'Scoped symbol-history build did not run because no requested symbols/paths resolved to indexed source files. Check the symbol name or pass file/path to disambiguate.',
+        });
+      }
       const r = await buildSymbolHistory(this.workspace, this.store, {
+        ...(scoped ? { onlyPaths: Array.from(onlyPaths) } : {}),
+        follow,
         maxCommitsPerFile: maxCommitsPerFile ?? 200,
         maxFiles,
         deadlineMs: (maxSeconds ?? DEFAULT_HISTORY_BUILD_SECONDS) * 1000,
@@ -1711,10 +1913,17 @@ export class SeerMcpServer {
       });
       return this.text({
         ...r,
+        scoped,
+        ...(scoped ? { scopedFiles: onlyPaths.size } : {}),
+        ...(unresolved.length > 0 ? { unresolvedSymbols: unresolved } : {}),
         historyIndex: this.historyIndexStatus(),
-        note: r.completed
-          ? 'Symbol history build completed.'
-          : 'Partial build only. Run again with a larger maxSeconds/maxFiles budget, or use the CLI for long history indexing outside an agent session.',
+        note: r.diagnostic
+          ? r.diagnostic
+          : scoped
+            ? `Scoped build of ${onlyPaths.size} file(s) done — call seer_history for those symbols now. The global index is NOT marked fully built (run a full build or the CLI for that).`
+            : r.completed
+              ? 'Full symbol history build completed.'
+              : 'Partial build only. Run again with a larger maxSeconds/maxFiles budget, or use the CLI for long history indexing outside an agent session.',
       });
     });
 
@@ -1888,7 +2097,7 @@ export class SeerMcpServer {
         source: 'tree-sitter',
         note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
       };
-      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      if (summaryOnly) return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1951,7 +2160,7 @@ export class SeerMcpServer {
         source: 'tree-sitter',
         note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
       };
-      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      if (summaryOnly) return this.text({ ...base, rows: { returned: 0, omittedByMode: true, note: 'Summary mode returns aggregates only (totals + topFiles/topSymbols/depthCounts where present). No raw rows are included by design — re-call with summaryOnly=false (or mode="preview"/"full") and page with offset/limit to get rows.' } });
       return this.budgetedText(base, pageItems, tokenBudget);
     });
 
@@ -1978,20 +2187,22 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_risk', {
-      description: 'Deterministic edit-risk profile for a symbol. Returns a decomposed score with per-signal contributions: fan-in, route exposure, test coverage, complexity, churn, config reads, and module-boundary crossings. The verdict (low/medium/high) is for triage; the signals are the evidence.',
+      description: 'Deterministic edit-risk profile for a symbol. Returns a decomposed score with per-signal contributions: fan-in, route exposure, test coverage, complexity, churn, config reads, and module-boundary crossings. The verdict (low/medium/high) is for triage; the signals are the evidence. Pass file to disambiguate common method names.',
       inputSchema: {
         symbol: z.string(),
-        callerDepth: z.number().int().positive().max(6).optional(),
+        file: z.string().optional(),
+        callerDepth: z.number().int().positive().max(6).optional().describe('Fan-in BFS depth. Max 6.'),
       },
-    }, async ({ symbol, callerDepth }) => {
+    }, async ({ symbol, file, callerDepth }) => {
       await this.ensureFresh();
-      const r = computeRisk(this.store, symbol, { callerDepth: callerDepth ?? 3 });
+      const r = computeRisk(this.store, symbol, { filePath: file, callerDepth: callerDepth ?? 3 });
       if (!r) {
         const didYouMean = this.suggestSymbols(symbol);
         return this.text({ found: false, reason: `no symbol "${symbol}"`,
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
-      return this.text(r);
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      return this.text(nameAmbiguity ? { ...r, nameAmbiguity } : r);
     });
 
     // ── Track-F tools (portability + precision) ─────────────────────────────
@@ -2170,7 +2381,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_preflight', {
-      description: 'CORE pre-edit tool. Compact "should I edit this?" evidence packet. Pass `symbol` for a single-symbol packet (risk, likely tests, service impact, history), or `fromRef`/`toRef` for a diff-range packet. Output is structured facts only.',
+      description: 'CORE pre-edit tool. Compact "should I edit this?" evidence packet. Pass `symbol` for a single-symbol packet (risk, likely tests, service impact, history), or `fromRef`/`toRef` for a diff-range packet. Output is structured facts only. Caps: maxSymbols/maxTests/maxHistory ≤ 50, callerDepth ≤ 6.',
       inputSchema: {
         symbol: z.string().optional(),
         file: z.string().optional(),
@@ -2178,10 +2389,10 @@ export class SeerMcpServer {
         toRef: z.string().optional(),
         oldBundle: z.string().optional(),
         newBundle: z.string().optional(),
-        maxSymbols: z.number().int().positive().max(50).optional(),
-        maxTests: z.number().int().positive().max(50).optional(),
-        maxHistory: z.number().int().positive().max(50).optional(),
-        callerDepth: z.number().int().positive().max(6).optional(),
+        maxSymbols: z.number().int().positive().max(50).optional().describe('Max 50.'),
+        maxTests: z.number().int().positive().max(50).optional().describe('Max 50.'),
+        maxHistory: z.number().int().positive().max(50).optional().describe('Max 50.'),
+        callerDepth: z.number().int().positive().max(6).optional().describe('Blast-radius BFS depth. Max 6.'),
       },
     }, async (args) => {
       await this.ensureFresh();
@@ -2362,16 +2573,16 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_context', {
-      description: 'CORE pre-edit tool. One compact packet for a symbol: definition, callers, callees, bounded route/config previews with totals, behavioral tests, history, complexity, module, blast radius, and deterministic risk. Use before reading/editing a known symbol, then drill in with seer_callers, seer_history, or seer_behavior.',
+      description: 'CORE pre-edit tool. One compact packet for a symbol: definition, callers, callees, bounded route/config previews with totals, behavioral tests, history, complexity, module, blast radius, and deterministic risk. Use before reading/editing a known symbol, then drill in with seer_callers, seer_history, or seer_behavior. Caps: callerLimit/calleeLimit/testLimit/affectedLimit ≤ 100, historyLimit ≤ 50, callerDepth ≤ 6.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
-        callerLimit: z.number().int().positive().max(100).optional(),
-        calleeLimit: z.number().int().positive().max(100).optional(),
-        testLimit: z.number().int().positive().max(100).optional(),
-        historyLimit: z.number().int().positive().max(50).optional(),
-        callerDepth: z.number().int().positive().max(6).optional(),
-        affectedLimit: z.number().int().positive().max(100).optional(),
+        callerLimit: z.number().int().positive().max(100).optional().describe('Max 100.'),
+        calleeLimit: z.number().int().positive().max(100).optional().describe('Max 100.'),
+        testLimit: z.number().int().positive().max(100).optional().describe('Max 100.'),
+        historyLimit: z.number().int().positive().max(50).optional().describe('Max 50.'),
+        callerDepth: z.number().int().positive().max(6).optional().describe('Blast-radius BFS depth. Max 6.'),
+        affectedLimit: z.number().int().positive().max(100).optional().describe('Max 100.'),
       },
     }, async ({ symbol, file, callerLimit, calleeLimit, testLimit, historyLimit, callerDepth, affectedLimit }) => {
       await this.ensureFresh();
@@ -2385,7 +2596,8 @@ export class SeerMcpServer {
         return this.text({ found: false, reason: `no symbol "${symbol}"`,
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
-      return this.text(packet);
+      const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      return this.text(nameAmbiguity ? { ...packet, nameAmbiguity } : packet);
     });
 
     // ── AI-agent optimization tools ─────────────────────────────────────────

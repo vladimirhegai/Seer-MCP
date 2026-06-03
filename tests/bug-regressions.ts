@@ -249,7 +249,11 @@ async function bug4and5_renameAndEmail(): Promise<void> {
   const indexer = new Indexer(store);
   await indexer.indexDirectory(repo, { quiet: true });
 
-  const r = await buildSymbolHistory(repo, store, { log: () => {} });
+  // Bug 5 is specifically about `--follow` rename-history correctness (the diff
+  // lookup that used to miss commits on the pre-rename path). Build with
+  // follow:true to exercise that path — the NEW default is follow:false (B2),
+  // where the continuity pass bridges the rename instead (asserted below).
+  const r = await buildSymbolHistory(repo, store, { follow: true, log: () => {} });
   assert(r.historyRowsInserted >= 2,
     `history has ≥2 rows (got ${r.historyRowsInserted})`);
 
@@ -263,12 +267,27 @@ async function bug4and5_renameAndEmail(): Promise<void> {
       `commit ${h.commitSha.slice(0,8)} has non-empty author email (got '${h.authorEmail}')`);
   }
 
-  // Bug 5: pre-rename commit must appear in history.
+  // Bug 5: with follow:true the pre-rename commit must appear in history.
   assert(hist.some(h => h.commitSha === sha1),
-    `pre-rename sha1=${sha1.slice(0,8)} appears in history (got [${hist.map(h => h.commitSha.slice(0,8)).join(',')}])`);
+    `pre-rename sha1=${sha1.slice(0,8)} appears in history with follow:true (got [${hist.map(h => h.commitSha.slice(0,8)).join(',')}])`);
   // Post-rename change should also appear.
   assert(hist.some(h => h.commitSha === sha3),
     `post-rename sha3=${sha3.slice(0,8)} appears in history`);
+
+  // B2 default (no-follow): raw history stops at the rename, so sha1 is absent
+  // from the raw rows — by design, the continuity pass is responsible for the
+  // bridge. Verify the default really does drop it (a forced rebuild from clean).
+  const store2 = new Store(path.join(tmp, 'g2.db'));
+  const indexer2 = new Indexer(store2);
+  await indexer2.indexDirectory(repo, { quiet: true });
+  await buildSymbolHistory(repo, store2, { log: () => {} });
+  const helperDef2 = store2.getDefinition('helper')[0];
+  const histDefault = store2.getSymbolHistory(helperDef2.id, { limit: 20 });
+  assert(!histDefault.some(h => h.commitSha === sha1),
+    'B2 default (no-follow): pre-rename commit is NOT in raw rows (continuity bridges it)');
+  assert(histDefault.some(h => h.commitSha === sha3),
+    'B2 default (no-follow): post-rename change still appears');
+  store2.close();
 
   store.close();
   fs.rmSync(tmp, { recursive: true, force: true });

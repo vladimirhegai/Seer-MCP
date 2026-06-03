@@ -55,11 +55,30 @@ export interface ContextPacket {
     }>;
   };
   blastRadius: {
+    /** Distinct caller functions resolved to this symbol id (unique from_ids). */
     directCallers: number;
+    /** Call SITES resolved to this id (edges) — ≥ directCallers when one function
+     * calls the symbol multiple times. Mirrors seer_callers `total`; surfaced so
+     * "directCallers" (functions) and seer_callers "total" (sites) reconcile. */
+    directCallsites: number;
     transitiveCallers: number;
     /** Sample of the highest-PageRank reverse-reachable callers (capped). */
     topAffected: Array<{ id: number; name: string; qualifiedName: string | null; file: string; pagerank: number }>;
     maxDepth: number;
+    /**
+     * Present only when this symbol's short name is shared by multiple
+     * definitions and many more call sites use the bare name than resolved here
+     * (typical of C/C++ member calls with unresolvable receiver types). The
+     * id-resolved counts are then a LOWER bound; `nameCallsites` is the upper
+     * bound. Absent when the name is unambiguous.
+     */
+    ambiguity?: {
+      reason: 'unresolved-receiver-type' | 'shared-short-name';
+      shortName: string;
+      sharedByDefinitions: number;
+      nameCallsites: number;
+      note: string;
+    };
   };
   /** Route preview for this handler symbol; bounded to keep the packet compact. */
   routes: Array<{ method: string; path: string; framework: string }>;
@@ -112,6 +131,12 @@ export interface ContextPacket {
     indirect: number;
     namingMatches: number;
     sameFileMatches: number;
+    /** Count of name-based heuristic (type-unresolved) test sites. */
+    heuristicMatches: number;
+    /** Coverage state — distinguishes proven links from heuristic guesses or gaps. */
+    testCoverageState: string;
+    /** True when the ONLY test evidence is heuristic (treat as a hint, not proof). */
+    lowConfidence: boolean;
     preview: Array<{
       name: string; qualifiedName: string | null; file: string; lineStart: number;
       relationship: string; assertionCount: number; specificity: number;
@@ -255,6 +280,30 @@ export function buildContext(
     } catch { return null; }
   })();
 
+  // Honest blast-radius bounds for short-name-ambiguous symbols (C/C++ member
+  // calls lose the receiver type, so id-resolution undercounts). Mirrors
+  // seer_callers' ambiguity block.
+  const blastAmbiguity = (() => {
+    const shortName = target.name;
+    if (!shortName) return undefined;
+    let sharedDefs = 0;
+    let nameCallsites = 0;
+    try {
+      sharedDefs = store.countDefinitionsByShortName(shortName);
+      nameCallsites = store.countCallers(shortName);
+    } catch { return undefined; }
+    if (sharedDefs <= 1 || nameCallsites <= totalCallers) return undefined;
+    const lc = target.filePath.toLowerCase();
+    const dot = lc.lastIndexOf('.');
+    const ext = dot === -1 ? '' : lc.slice(dot);
+    const cppExts = new Set(['.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.h++', '.inl', '.ino']);
+    const reason = cppExts.has(ext) ? 'unresolved-receiver-type' as const : 'shared-short-name' as const;
+    const note = reason === 'unresolved-receiver-type'
+      ? `Likely undercount. "${shortName}" is defined by ${sharedDefs} symbols and ${nameCallsites} call sites invoke some "${shortName}". C/C++ member calls (obj->${shortName}()) lose the receiver's static type, so directCallers/directCallsites are a LOWER bound; the true caller set is between ${totalCallers} and ${nameCallsites}. Use seer_callers includeNameMatches=true or grep the receiver type for the full surface.`
+      : `"${shortName}" is defined by ${sharedDefs} symbols and ${nameCallsites} call sites use the bare name; only ${totalCallers} resolved to THIS definition. The remainder bound to other same-named symbols.`;
+    return { reason, shortName, sharedByDefinitions: sharedDefs, nameCallsites, note };
+  })();
+
   // Risk (reuses behavior + history + signals computed above; cheaper to
   // recompute than to share through a back-channel.)
   const risk = computeRisk(store, target.id, { callerDepth })!;
@@ -294,9 +343,11 @@ export function buildContext(
     },
     blastRadius: {
       directCallers: directSet.size,
+      directCallsites: totalCallers,
       transitiveCallers: transitive.length,
       topAffected,
       maxDepth: callerDepth,
+      ...(blastAmbiguity ? { ambiguity: blastAmbiguity } : {}),
     },
     routes,
     routesTotal: allRoutes.length,
@@ -335,6 +386,9 @@ export function buildContext(
       indirect: behavior?.indirect ?? 0,
       namingMatches: behavior?.namingMatches ?? 0,
       sameFileMatches: behavior?.sameFileMatches ?? 0,
+      heuristicMatches: behavior?.heuristicMatches ?? 0,
+      testCoverageState: behavior?.testCoverageState ?? 'no-indexed-tests',
+      lowConfidence: behavior?.lowConfidence ?? false,
       preview: (behavior?.tests ?? []).map(t => ({
         name: t.testSymbol.name,
         qualifiedName: t.testSymbol.qualifiedName,

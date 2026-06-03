@@ -99,6 +99,13 @@ export interface RiskResult {
 
 interface RiskOptions {
   callerDepth?: number;
+  /**
+   * Disambiguates a bare name to one definition (absolute path, exact rel_path,
+   * or trailing path fragment). Without it an ambiguous name resolved to the
+   * highest-PageRank definition, so the risk profile could describe the wrong
+   * symbol. Mirrors seer_context / seer_callers disambiguation.
+   */
+  filePath?: string;
 }
 
 export function computeRisk(
@@ -111,7 +118,7 @@ export function computeRisk(
   if (typeof nameOrId === 'number') {
     target = store.getSymbolById(nameOrId);
   } else {
-    const defs = store.getDefinition(nameOrId);
+    const defs = store.getDefinition(nameOrId, { filePath: options.filePath });
     if (defs.length === 0) return null;
     target = defs[0];
   }

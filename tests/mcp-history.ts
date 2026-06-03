@@ -108,14 +108,70 @@ async function main(): Promise<void> {
     } else {
       bad('seer_history auto-built or omitted historyIndex', beforeParsed);
     }
+    // Cold read must carry an actionable buildHint naming the scoped build path.
+    if (typeof beforeParsed.buildHint === 'string'
+        && beforeParsed.buildHint.includes('seer_symbol_history_build')
+        && beforeParsed.buildHint.includes('historyTarget')) {
+      ok('seer_history surfaces a scoped buildHint when nothing is built');
+    } else {
+      bad('seer_history missing/!scoped buildHint on cold index', beforeParsed.buildHint);
+    }
+
+    // A scoped request that resolves no files must NOT silently fall through to
+    // a full build. It should no-op with unresolvedSymbols and leave the global
+    // history index unbuilt.
+    const unresolvedScoped = await call('tools/call', {
+      name: 'seer_symbol_history_build',
+      arguments: { symbols: ['missingHistoryTarget'], gitCommandTimeoutMs: 5000 },
+    }, 5_000);
+    const unresolvedScopedParsed = JSON.parse(unresolvedScoped.result?.content?.[0]?.text ?? '{}');
+    if (unresolvedScopedParsed.scoped === true
+        && unresolvedScopedParsed.scopedFiles === 0
+        && unresolvedScopedParsed.historyRowsInserted === 0
+        && Array.isArray(unresolvedScopedParsed.unresolvedSymbols)
+        && unresolvedScopedParsed.historyIndex?.lastHistoryHeadSha == null) {
+      ok('unresolved scoped history build no-ops instead of falling through to a full build');
+    } else {
+      bad('unresolved scoped history build fell through or returned the wrong contract', unresolvedScopedParsed);
+    }
+
+    // Thrust A: SCOPED on-demand build of just this symbol's file. Must report
+    // scoped:true and NOT stamp the global index as fully built.
+    const scoped = await call('tools/call', {
+      name: 'seer_symbol_history_build',
+      arguments: { symbols: ['historyTarget'], gitCommandTimeoutMs: 5000 },
+    }, 15_000);
+    const scopedParsed = JSON.parse(scoped.result?.content?.[0]?.text ?? '{}');
+    // Scoped build populates rows but must NOT stamp the global HEAD
+    // (lastHistoryHeadSha stays null — that is the "fully built" signal).
+    if (scopedParsed.scoped === true && scopedParsed.historyRowsInserted >= 1
+        && scopedParsed.historyIndex?.lastHistoryHeadSha == null) {
+      ok('seer_symbol_history_build scoped path builds one symbol without marking the index fully built');
+    } else {
+      bad('scoped build did not behave as expected', scopedParsed);
+    }
+
+    // After the scoped build, seer_history has rows AND drops the buildHint,
+    // even though the GLOBAL index is still not fully built.
+    const mid = await call('tools/call', {
+      name: 'seer_history',
+      arguments: { symbol: 'historyTarget', limit: 5 },
+    }, 5_000);
+    const midParsed = JSON.parse(mid.result?.content?.[0]?.text ?? '{}');
+    if (midParsed.results?.[0]?.returned >= 1 && midParsed.buildHint === undefined
+        && midParsed.historyIndex?.lastHistoryHeadSha == null) {
+      ok('seer_history reads scoped-built rows and drops the buildHint (global still unbuilt)');
+    } else {
+      bad('seer_history did not reflect scoped build', midParsed);
+    }
 
     const build = await call('tools/call', {
       name: 'seer_symbol_history_build',
       arguments: { maxSeconds: 5, maxFiles: 1, gitCommandTimeoutMs: 5000, force: true },
     }, 15_000);
     const buildParsed = JSON.parse(build.result?.content?.[0]?.text ?? '{}');
-    if (buildParsed.completed === true && buildParsed.historyRowsInserted >= 1) {
-      ok('seer_symbol_history_build completes bounded explicit build');
+    if (buildParsed.completed === true && buildParsed.historyRowsInserted >= 1 && buildParsed.scoped === false) {
+      ok('seer_symbol_history_build completes bounded explicit FULL build');
     } else {
       bad('seer_symbol_history_build failed to populate history', buildParsed);
     }

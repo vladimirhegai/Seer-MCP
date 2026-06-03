@@ -107,11 +107,21 @@ async function main(): Promise<void> {
       `${n} advertises core read-only MCP hints`, t);
   }
   // §5a: build tools rebranded as advanced
-  for (const n of ['seer_modules_build', 'seer_shape_hash_build', 'seer_symbol_history_build']) {
+  for (const n of ['seer_modules_build', 'seer_shape_hash_build']) {
     const d = tools.find(t => t.name === n)?.description ?? '';
     check(/advanced/i.test(d), `${n} description marked advanced/automatic`, d);
     check(tools.find(t => t.name === n)?.annotations?.readOnlyHint === false,
       `${n} is not advertised as read-only`, tools.find(t => t.name === n));
+  }
+  // seer_symbol_history_build: scoped path is now a sanctioned cheap agent build,
+  // so the description signals it WRITES and distinguishes scoped vs full rather
+  // than blanket "advanced". It must still be side-effecting (not read-only).
+  {
+    const d = tools.find(t => t.name === 'seer_symbol_history_build')?.description ?? '';
+    check(/write/i.test(d) && /scoped/i.test(d),
+      'seer_symbol_history_build description signals it writes and offers a scoped path', d);
+    check(tools.find(t => t.name === 'seer_symbol_history_build')?.annotations?.readOnlyHint === false,
+      'seer_symbol_history_build is not advertised as read-only', tools.find(t => t.name === 'seer_symbol_history_build'));
   }
   for (const n of ['seer_modules', 'seer_duplicates', 'seer_continuity']) {
     check(tools.find(t => t.name === n)?.annotations?.readOnlyHint === false,

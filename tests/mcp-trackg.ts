@@ -190,8 +190,9 @@ async function main(): Promise<void> {
   const depsSummary = await callTool('seer_trace_service_dependencies', {
     from: 'processPayment', maxDepth: 4, maxNodes: 50, summaryOnly: true,
   });
-  if (depsSummary.ok && depsSummary.items === undefined && depsSummary.returned === 0)
-    ok('trace_service_dependencies summaryOnly omits raw items');
+  if (depsSummary.ok && depsSummary.items === undefined && depsSummary.returned === undefined
+      && depsSummary.rows?.omittedByMode === true)
+    ok('trace_service_dependencies summaryOnly omits raw items (rows.omittedByMode)');
   else bad('trace_service_dependencies summaryOnly returned item payload', depsSummary);
 
   const bounded = await callTool('seer_trace_service_dependencies', {
@@ -216,8 +217,9 @@ async function main(): Promise<void> {
   const modDepsSummary = await callTool('seer_trace_module_service_dependencies', {
     moduleId: 1, maxDepth: 2, maxNodes: 10, summaryOnly: true,
   });
-  if (modDepsSummary.ok && modDepsSummary.items === undefined && modDepsSummary.returned === 0)
-    ok('trace_module_service_dependencies summaryOnly omits raw items');
+  if (modDepsSummary.ok && modDepsSummary.items === undefined && modDepsSummary.returned === undefined
+      && modDepsSummary.rows?.omittedByMode === true)
+    ok('trace_module_service_dependencies summaryOnly omits raw items (rows.omittedByMode)');
   else bad('trace_module_service_dependencies summaryOnly returned item payload', modDepsSummary);
 
   // seer_health surfaces v9 fields

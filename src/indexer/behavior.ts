@@ -98,6 +98,14 @@ export interface BehaviorResult {
   heuristicMatches: number;
   /** Which of the test-coverage states applies — see BehaviorTestState. */
   testCoverageState: BehaviorTestState;
+  /**
+   * Top-level "do not trust this as proof" flag. True when the ONLY evidence is
+   * name-based heuristic (type-unresolved C/C++ member calls) — i.e.
+   * testCoverageState === 'heuristic-only'. Lets tooling branch on one boolean
+   * instead of string-matching the state, so an agent doesn't read a name guess
+   * as verified coverage.
+   */
+  lowConfidence: boolean;
   /** Total indexed test files (−1 when role classification is unavailable). */
   testsIndexed: number;
   /** Human-readable explanation of testCoverageState. */
@@ -133,6 +141,13 @@ export function rankedBehavior(
     includeNamingConvention?: boolean;
     includeSameFile?: boolean;
     /**
+     * Disambiguates a bare name to one definition (absolute path, exact
+     * rel_path, or trailing path fragment). Without it an ambiguous name like
+     * `add_child` silently resolved to the highest-PageRank definition, so
+     * seer_behavior could describe the wrong symbol's tests.
+     */
+    filePath?: string;
+    /**
      * Name-based heuristic coverage for type-unresolved member calls (C/C++).
      * On by default; only fires when the target lives in a C/C++ file so other
      * languages (with resolvable receivers) keep precise-only behavior.
@@ -150,10 +165,10 @@ export function rankedBehavior(
   if (typeof nameOrId === 'number') {
     target = store.getSymbolById(nameOrId);
   } else {
-    const candidates = store.getDefinition(nameOrId);
+    const candidates = store.getDefinition(nameOrId, { filePath: options.filePath });
     if (candidates.length === 0) {
       // Try with includeDeclarations so we don't miss method-prototype targets.
-      const decl = store.getDefinition(nameOrId, { includeDeclarations: true });
+      const decl = store.getDefinition(nameOrId, { filePath: options.filePath, includeDeclarations: true });
       target = decl[0] ?? null;
     } else {
       target = candidates[0];
@@ -446,6 +461,7 @@ export function rankedBehavior(
     sameFileMatches,
     heuristicMatches,
     testCoverageState,
+    lowConfidence: testCoverageState === 'heuristic-only',
     testsIndexed,
     testCoverageNote,
     tests: out.slice(0, limit),

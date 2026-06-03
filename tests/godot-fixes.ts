@@ -29,6 +29,7 @@ import { spawn } from 'child_process';
 import { Store, symbolNameVariants, ftsQuery } from '../src/db/store';
 import { Indexer } from '../src/indexer/index';
 import { rankedBehavior } from '../src/indexer/behavior';
+import { computeRisk } from '../src/indexer/risk';
 import { buildContext } from '../src/indexer/context';
 import { preflight } from '../src/indexer/preflight';
 
@@ -85,6 +86,23 @@ function writeCppFixture(dir: string, opts: { withTests: boolean }): void {
     '// A FREE function (no owner scope). The member-gate must keep the C/C++',
     '// heuristic from firing for it even though a test calls a same-named func.',
     'void shared_util(int x) { (void)x; }',
+    '',
+  ].join('\n'));
+  // A SECOND non-test class that also defines `add_child`. This makes the bare
+  // short name `add_child` genuinely ambiguous among NON-test definitions
+  // (Node + Tree), which is what the nameAmbiguity hint warns about. Uncalled,
+  // so it does not disturb the caller-count / heuristic assertions above.
+  fs.writeFileSync(path.join(dir, 'tree.h'), [
+    '#pragma once',
+    'class Tree {',
+    'public:',
+    '  void add_child(int idx);',
+    '};',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'tree.cpp'), [
+    '#include "tree.h"',
+    'void Tree::add_child(int idx) { (void)idx; }',
     '',
   ].join('\n'));
   if (opts.withTests) {
@@ -216,6 +234,61 @@ async function storeLevelTests(): Promise<string> {
   assert(!store.findCallersById(nodeAddId).some(c => c.callerName === 'TestNode'),
     'the qualified/by-id path stays narrow (TestNode resolved to Harness, not Node)',
     store.findCallersById(nodeAddId).map(c => c.callerName));
+
+  // ── Audit round 2: caller-count provenance + honest blast-radius bounds ──
+  // The receiver-type gap means `node->add_child(...)` scatters across same-named
+  // defs, so the id-resolved count is a LOWER bound. Surface both bounds + the
+  // unique-vs-callsite distinction rather than a falsely-precise small number.
+  console.log('\n── Audit2: caller provenance + ambiguity bounds ──');
+  assert(store.countUniqueCallersById(nodeAddId) === store.findCallersById(nodeAddId).length,
+    'countUniqueCallersById matches distinct id-resolved callers',
+    { unique: store.countUniqueCallersById(nodeAddId), rows: store.findCallersById(nodeAddId).length });
+  const addChildDefs = store.countDefinitionsByShortName('add_child');
+  assert(addChildDefs >= 2,
+    'countDefinitionsByShortName sees the multiple add_child definitions (excludes the header declaration)', addChildDefs);
+  const nameCallsites = store.countCallers('add_child');
+  assert(nameCallsites > store.countCallersById(nodeAddId),
+    'more call sites use the bare short name than resolved to Node.add_child (the undercount)',
+    { nameCallsites, resolved: store.countCallersById(nodeAddId) });
+  const ctxAmb = buildContext(store, 'Node.add_child')!;
+  assert(ctxAmb.blastRadius.directCallsites === store.countCallersById(nodeAddId),
+    'context.blastRadius.directCallsites equals id-resolved call sites', ctxAmb.blastRadius.directCallsites);
+  assert(ctxAmb.blastRadius.ambiguity != null
+    && ctxAmb.blastRadius.ambiguity.reason === 'unresolved-receiver-type'
+    && ctxAmb.blastRadius.ambiguity.nameCallsites === nameCallsites,
+    'context.blastRadius.ambiguity reports the unresolved-receiver undercount with the name-level upper bound',
+    ctxAmb.blastRadius.ambiguity);
+  // A free function with a unique name must NOT get an ambiguity block.
+  const orphanCtx = buildContext(store, 'orphan_method')!;
+  assert(orphanCtx.blastRadius.ambiguity === undefined,
+    'unambiguous symbol carries no ambiguity block', orphanCtx.blastRadius.ambiguity);
+  // Behavior low-confidence flag mirrors the heuristic-only state.
+  const behLow = rankedBehavior(store, 'Node.add_child', { includeNamingConvention: false, includeSameFile: false })!;
+  assert(behLow.testCoverageState === 'heuristic-only' && behLow.lowConfidence === true,
+    'behavior.lowConfidence is true exactly when evidence is heuristic-only', { state: behLow.testCoverageState, low: behLow.lowConfidence });
+  const behHigh = rankedBehavior(store, 'Node.add_child')!;
+  assert(behHigh.testCoverageState === 'graph-linked' && behHigh.lowConfidence === false,
+    'behavior.lowConfidence is false when a precise link exists', { state: behHigh.testCoverageState, low: behHigh.lowConfidence });
+
+  // ── Audit3: file disambiguation for seer_behavior / seer_risk ────────────
+  // A bare ambiguous name (`add_child` is defined by Node AND the test's local
+  // Harness) used to silently resolve to the highest-PageRank definition, so
+  // behavior/risk could describe the WRONG symbol. `filePath` must pin it.
+  console.log('\n── Audit3: behavior/risk file disambiguation ──');
+  assert(store.countDefinitionsByShortName('add_child') >= 2,
+    'fixture has an ambiguous add_child (precondition for the disambiguation test)');
+  const behPinned = rankedBehavior(store, 'add_child', { filePath: 'node.cpp' })!;
+  assert(behPinned != null && behPinned.symbol.id === nodeAddId,
+    'rankedBehavior(add_child, file=node.cpp) pins Node.add_child instead of the highest-PageRank sibling',
+    { got: behPinned?.symbol?.id, want: nodeAddId });
+  const riskPinned = computeRisk(store, 'add_child', { filePath: 'node.cpp' })!;
+  assert(riskPinned != null && riskPinned.symbol.id === nodeAddId,
+    'computeRisk(add_child, file=node.cpp) pins Node.add_child instead of the highest-PageRank sibling',
+    { got: riskPinned?.symbol?.id, want: nodeAddId });
+  // The no-file path must still resolve *a* definition (no crash / regression).
+  const behNoFile = rankedBehavior(store, 'add_child');
+  assert(behNoFile != null && typeof behNoFile.symbol.id === 'number',
+    'rankedBehavior(add_child) without file still resolves a definition', behNoFile?.symbol?.id);
 
   // ── Fix 4: heuristic name-call test evidence (C/C++) ─────────────────────
   console.log('\n── Fix 4: heuristic test evidence for unresolved C++ member calls ──');
@@ -383,6 +456,39 @@ async function mcpLevelTests(ws: string): Promise<void> {
     const crColon = await callTool('seer_callers', { symbol: 'Node::add_child' });
     assert(crColon.target?.qualifiedName === 'Node.add_child' && (crColon.total ?? 0) === (cr.total ?? -1),
       'seer_callers `::` spelling resolves to the same target and count', { colon: crColon.total, dot: cr.total });
+
+    // Audit2: seer_callers reports uniqueCallers (functions) vs total (call sites)
+    // and an ambiguity block for the type-unresolved undercount.
+    assert(typeof cr.uniqueCallers === 'number',
+      'seer_callers reports uniqueCallers (distinct caller functions) alongside total (call sites)', cr.uniqueCallers);
+    assert(cr.ambiguity != null && cr.ambiguity.reason === 'unresolved-receiver-type'
+      && cr.ambiguity.nameCallsites > (cr.total ?? 0),
+      'seer_callers flags the C/C++ receiver-type undercount with a name-level upper bound', cr.ambiguity);
+    const crNames = await callTool('seer_callers', { symbol: 'Node.add_child', includeNameMatches: true });
+    assert(crNames.nameMatches != null && (crNames.nameMatches.items?.length ?? 0) >= 1
+      && crNames.nameMatches.total >= (cr.total ?? 0),
+      'seer_callers includeNameMatches returns the by-name caller upper bound', crNames.nameMatches?.total);
+
+    // Audit2: trace summary mode no longer emits a bare `returned: 0` that reads
+    // like "0 results" — it nests an explicit rows.omittedByMode marker instead.
+    const trcSum = await callTool('seer_trace_callers', { symbol: 'add_child', mode: 'summary' });
+    assert(trcSum.returned === undefined && trcSum.rows?.omittedByMode === true,
+      'seer_trace_callers summary omits the misleading top-level returned:0 (uses rows.omittedByMode)', { returned: trcSum.returned, rows: trcSum.rows });
+
+    // Audit3: a BARE ambiguous name must carry a nameAmbiguity hint so the agent
+    // knows it got the highest-PageRank def (not necessarily the one it meant);
+    // passing `file` resolves it and the hint disappears (no token waste).
+    const ctxBare = await callTool('seer_context', { symbol: 'add_child' });
+    assert(ctxBare.nameAmbiguity != null
+      && /defined by \d+ symbols/.test(ctxBare.nameAmbiguity.note ?? '')
+      && Array.isArray(ctxBare.nameAmbiguity.otherDefinitions),
+      'seer_context on a bare ambiguous name surfaces a nameAmbiguity hint', ctxBare.nameAmbiguity);
+    const ctxPinned = await callTool('seer_context', { symbol: 'add_child', file: 'node.cpp' });
+    assert(ctxPinned.nameAmbiguity === undefined && ctxPinned.symbol?.qualifiedName === 'Node.add_child',
+      'seer_context with file resolves the symbol and drops the nameAmbiguity hint', ctxPinned.symbol?.qualifiedName);
+    const trcAmb = await callTool('seer_trace_callers', { symbol: 'add_child', mode: 'summary' });
+    assert(trcAmb.nameAmbiguity != null,
+      'seer_trace_callers on a bare ambiguous name also carries the nameAmbiguity hint', trcAmb.nameAmbiguity?.note);
 
     // Fix 3: seer_definition `symbol` alias.
     const defAlias = await callTool('seer_definition', { symbol: 'Node.add_child' });

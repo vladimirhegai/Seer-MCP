@@ -30,6 +30,9 @@ import {
 
 const TMP = path.join(os.tmpdir(), `seer-symhist-${Date.now()}`);
 const REPO = path.join(TMP, 'repo');
+const ROOT = path.resolve(__dirname, '..');
+const TSX = path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+const CLI_SRC = path.join(ROOT, 'src', 'cli', 'index.ts');
 
 let passed = 0;
 let failed = 0;
@@ -56,6 +59,17 @@ function write(rel: string, content: string): void {
   const full = path.join(REPO, rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, content, 'utf8');
+}
+function runCli(args: string[]): { stdout: string; stderr: string; status: number } {
+  const r = spawnSync(process.execPath, [TSX, CLI_SRC, ...args], {
+    cwd: ROOT,
+    encoding: 'utf8',
+  });
+  return {
+    stdout: r.stdout ?? '',
+    stderr: r.stderr ?? '',
+    status: r.status ?? 1,
+  };
 }
 
 let dbCounter = 0;
@@ -235,7 +249,9 @@ async function run(): Promise<void> {
   ]) {
     const label = path.basename(fileAbs);
     const oldCommits = await commitsForFile(REPO, fileAbs, { limit: 200 });
-    const newCommits = await commitsWithDiffsForFile(REPO, fileAbs, { limit: 200, assumeRepo: true });
+    // follow:true reproduces the old --follow two-step exactly (the parity
+    // contract). The new DEFAULT is follow:false (B2) — covered separately below.
+    const newCommits = await commitsWithDiffsForFile(REPO, fileAbs, { limit: 200, assumeRepo: true, follow: true });
     assert(oldCommits.length === newCommits.length && newCommits.length > 0,
       `${label}: same non-zero commit count (old=${oldCommits.length} new=${newCommits.length})`);
     let contentParity = oldCommits.length === newCommits.length;
@@ -262,10 +278,26 @@ async function run(): Promise<void> {
     }
   }
 
-  // gamma.ts must have followed the rename back to its add as beta.ts.
-  const gammaCombined = await commitsWithDiffsForFile(REPO, gammaAbs, { limit: 200, assumeRepo: true });
+  // gamma.ts WITH follow:true must reach its add as beta.ts.
+  const gammaCombined = await commitsWithDiffsForFile(REPO, gammaAbs, { limit: 200, assumeRepo: true, follow: true });
   assert(gammaCombined.some(c => c.sha === shaAdd && c.isFileAddition),
-    'gamma.ts: --follow reached the original add (as beta.ts) and flagged it as a file addition');
+    'gamma.ts (follow:true): --follow reached the original add (as beta.ts) and flagged it as a file addition');
+
+  // ── 2b. B2: no-follow DEFAULT stops at the rename boundary ────────────────────
+  console.log('\n── B2: --follow opt-out (default) ──');
+  {
+    const gammaFollow = await commitsWithDiffsForFile(REPO, gammaAbs, { limit: 200, assumeRepo: true, follow: true });
+    const gammaNoFollow = await commitsWithDiffsForFile(REPO, gammaAbs, { limit: 200, assumeRepo: true });
+    assert(gammaNoFollow.length < gammaFollow.length,
+      `default (no-follow) sees fewer commits than --follow across a rename (no-follow=${gammaNoFollow.length} follow=${gammaFollow.length})`);
+    assert(!gammaNoFollow.some(c => c.sha === shaAdd),
+      'default (no-follow): gamma.ts does NOT reach the pre-rename add commit (continuity bridges it instead)');
+    // alpha.ts has no rename, so follow vs no-follow are identical for it.
+    const alphaFollow = await commitsWithDiffsForFile(REPO, alphaAbs, { limit: 200, assumeRepo: true, follow: true });
+    const alphaNoFollow = await commitsWithDiffsForFile(REPO, alphaAbs, { limit: 200, assumeRepo: true });
+    assert(alphaFollow.length === alphaNoFollow.length,
+      'no rename → follow and no-follow agree on commit count for alpha.ts');
+  }
 
   // ── 3. Store.insertSymbolHistoryBatch idempotency + count ────────────────────
   console.log('\n── batched writes ──');
@@ -455,6 +487,152 @@ async function run(): Promise<void> {
     assert(maxHandled === r.filesProcessed + r.filesSkippedResume,
       'final filesHandled equals processed + skipped');
     store.close();
+  }
+
+  // ── 7. B1: concurrency parity — same rows regardless of lane count ───────────
+  console.log('\n── B1: parallel-walk parity ──');
+  {
+    const serialStore = freshIndexedStore();
+    await indexInto(serialStore);
+    await buildSymbolHistory(REPO, serialStore, { skipIfHeadUnchanged: false, concurrency: 1, log: () => {} });
+    const serialRows = (serialStore.rawDb().prepare('SELECT COUNT(*) AS c FROM symbol_history').get() as any).c;
+    const serialKeys = (serialStore.rawDb()
+      .prepare('SELECT symbol_key, commit_sha FROM symbol_history ORDER BY symbol_key, commit_sha').all() as any[])
+      .map(r => `${r.symbol_key}@${r.commit_sha}`).join('|');
+    serialStore.close();
+
+    const parStore = freshIndexedStore();
+    await indexInto(parStore);
+    await buildSymbolHistory(REPO, parStore, { skipIfHeadUnchanged: false, concurrency: 8, log: () => {} });
+    const parRows = (parStore.rawDb().prepare('SELECT COUNT(*) AS c FROM symbol_history').get() as any).c;
+    const parKeys = (parStore.rawDb()
+      .prepare('SELECT symbol_key, commit_sha FROM symbol_history ORDER BY symbol_key, commit_sha').all() as any[])
+      .map(r => `${r.symbol_key}@${r.commit_sha}`).join('|');
+    parStore.close();
+
+    assert(serialRows === parRows && serialRows > 0,
+      `concurrency 1 and 8 insert the same row count (serial=${serialRows} par=${parRows})`);
+    assert(serialKeys === parKeys, 'concurrency 1 and 8 produce byte-identical (symbol_key, commit_sha) sets');
+  }
+
+  // ── 8. replaceSymbolHistoryForSymbols: delete-then-insert is exact ───────────
+  console.log('\n── replace semantics ──');
+  {
+    const store = freshIndexedStore();
+    await indexInto(store);
+    const sym = store.getDefinition('alphaOne')[0];
+    const mk = (sha: string, at: number) => ({
+      symbolId: sym.id, symbolKey: 'k', commitSha: sha, authorName: 'A', authorEmail: 'a@e',
+      committedAt: at, message: 'm', linesAdded: 1, linesRemoved: 0, prNumber: null, prUrl: null,
+      matchStrategy: 'overlap', confidence: 1,
+    });
+    store.replaceSymbolHistoryForSymbols([sym.id], [mk('aaa', 1), mk('bbb', 2)]);
+    assert(store.countSymbolHistory(sym.id) === 2, 'replace inserts the initial set');
+    // Replace with a DIFFERENT set — the old rows must be gone, not unioned.
+    store.replaceSymbolHistoryForSymbols([sym.id], [mk('ccc', 3)]);
+    const after = store.getSymbolHistory(sym.id, { limit: 10 });
+    assert(after.length === 1 && after[0].commitSha === 'ccc',
+      `replace removes stale rows (no union); got [${after.map(h => h.commitSha).join(',')}]`);
+    // Empty replace clears.
+    store.replaceSymbolHistoryForSymbols([sym.id], []);
+    assert(store.countSymbolHistory(sym.id) === 0, 'replace with no rows clears the symbol history');
+    store.close();
+  }
+
+  // ── 9. Thrust A: scoped (on-demand) build ────────────────────────────────────
+  console.log('\n── scoped / on-demand build ──');
+  {
+    const store = freshIndexedStore();
+    await indexInto(store);
+    const scoped = await buildSymbolHistory(REPO, store, { onlyPaths: [alphaAbs], log: () => {} });
+    assert(scoped.completed && scoped.filesProcessed === 1 && scoped.filesTotal === 1,
+      `scoped build touched only the one requested file (proc=${scoped.filesProcessed} total=${scoped.filesTotal})`);
+    assert(store.getGitIndexState()?.lastHistoryHeadSha == null,
+      'scoped build does NOT stamp the global history HEAD (index not falsely marked fully built)');
+    assert(store.getSymbolHistoryWatermarks(REPO).has(alphaAbs),
+      'scoped build still writes the per-file watermark (a later full build reuses it)');
+    assert(store.getSymbolHistory(store.getDefinition('alphaOne')[0].id).length > 0,
+      'scoped build populated alphaOne history');
+    // A subsequent FULL build skips the scoped file and finishes the rest.
+    const full = await buildSymbolHistory(REPO, store, { log: () => {} });
+    assert(full.completed && full.filesSkippedResume === 1,
+      `full build after scoped reuses the scoped file's watermark (skipped=${full.filesSkippedResume})`);
+    assert(store.getGitIndexState()?.lastHistoryHeadSha != null,
+      'full build DOES stamp the global history HEAD');
+    store.close();
+  }
+
+  // ── 10. Incremental auto-update: a new commit refreshes only its file ────────
+  console.log('\n── incremental auto-update on new commit ──');
+  {
+    const store = freshIndexedStore();
+    await indexInto(store);
+    await buildSymbolHistory(REPO, store, { log: () => {} });
+    const beforeId = store.getDefinition('alphaOne')[0].id;
+    const beforeCount = store.countSymbolHistory(beforeId);
+
+    // New commit touching alphaOne only.
+    write('alpha.ts', 'export function alphaOne(): number { return 31337; }\nexport function alphaTwo(): number { return 222; }\n');
+    const shaEdit3 = commit('Bump alphaOne again (#42)', 'Bob <bob@example.com>');
+    await indexInto(store); // alpha.ts hash flips; its symbols (and cascade history) are replaced
+
+    const inc = await buildSymbolHistory(REPO, store, { log: () => {} });
+    assert(!inc.skipped, 'HEAD moved → incremental build runs (not skipped)');
+    assert(inc.filesProcessed === 1 && inc.filesSkippedResume === 1,
+      `incremental reprocesses only the changed file, skips the rest (proc=${inc.filesProcessed} skip=${inc.filesSkippedResume})`);
+    const afterId = store.getDefinition('alphaOne')[0].id;
+    const newHist = store.getSymbolHistory(afterId, { limit: 50 });
+    assert(newHist.some(h => h.commitSha === shaEdit3),
+      'the new commit appears in alphaOne history after the incremental refresh');
+    assert(store.countSymbolHistory(afterId) >= beforeCount,
+      `history grew or held with the new commit (before=${beforeCount} after=${store.countSymbolHistory(afterId)})`);
+    // restore working tree to the new HEAD's content (clean tree)
+    store.close();
+  }
+
+  // ── 11. CLI index auto-refresh preserves persisted follow=true ──────────────
+  console.log('\n── CLI auto-refresh preserves follow=true ──');
+  {
+    const dbPath = path.join(TMP, `cli-follow-${Date.now()}.db`);
+    const seed = new Store(dbPath);
+    await indexInto(seed);
+    seed.close();
+
+    const fullBuild = runCli(['symbol-history', '--workspace', REPO, '--db', dbPath, '--follow']);
+    assert(fullBuild.status === 0,
+      `CLI full --follow build succeeds (status=${fullBuild.status})`);
+
+    const mixStore = new Store(dbPath);
+    const stateAfterFull = mixStore.getGitIndexState();
+    assert(stateAfterFull?.lastHistoryFollow === true,
+      `full CLI build persists lastHistoryFollow=true (got ${String(stateAfterFull?.lastHistoryFollow)})`);
+    // Deliberately create a mixed watermark set: scoped build uses the default
+    // follow=false on alpha.ts only. Auto-refresh must IGNORE this mixed state
+    // and use the persisted full-build follow=true from git_index_state.
+    await buildSymbolHistory(REPO, mixStore, { onlyPaths: [alphaAbs], log: () => {} });
+    mixStore.close();
+
+    write('gamma.ts', 'export function betaOne(): number { return 11; }\nexport function betaTwo(): number { return 20; }\n');
+    const shaEdit4 = commit('Bump betaOne after follow build', 'Bob <bob@example.com>');
+
+    const reindex = runCli(['index', REPO, '--db', dbPath]);
+    assert(reindex.status === 0,
+      `CLI index with auto-refresh succeeds (status=${reindex.status})`);
+    assert(/Refreshing symbol history \(incremental\)\.\.\./.test(reindex.stdout),
+      'CLI index ran the auto history refresh path');
+
+    const verify = new Store(dbPath);
+    const stateAfterRefresh = verify.getGitIndexState();
+    assert(stateAfterRefresh?.lastHistoryFollow === true,
+      `auto-refresh keeps lastHistoryFollow=true (got ${String(stateAfterRefresh?.lastHistoryFollow)})`);
+    const beta = verify.getDefinition('betaOne').find(d => /gamma\.ts$/.test(d.filePath));
+    assert(beta != null, 'betaOne resolves in gamma.ts after CLI reindex');
+    const betaHist = beta ? verify.getSymbolHistory(beta.id, { limit: 20 }) : [];
+    assert(betaHist.some(h => h.commitSha === shaAdd),
+      'CLI auto-refresh preserved follow=true semantics: pre-rename add commit is still present for gamma.ts');
+    assert(betaHist.some(h => h.commitSha === shaEdit4),
+      'CLI auto-refresh also captured the new gamma.ts commit');
+    verify.close();
   }
 
   console.log(`\n══════════════════════════════════════════════════════════════`);

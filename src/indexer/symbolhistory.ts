@@ -1,6 +1,8 @@
+import os from 'os';
+import path from 'path';
 import { Store } from '../db/store.js';
 import {
-  commitsWithDiffsForFile, isGitRepo, gitHeadSha, gitRemoteUrl,
+  commitsWithDiffsForFile, isGitRepo, isShallowRepo, gitHeadSha, gitRemoteUrl,
   extractPrNumber, githubPrUrl,
 } from './git.js';
 import { buildContinuity } from './continuity.js';
@@ -12,16 +14,28 @@ import type { SymbolHistoryInsert } from '../types.js';
  * diff hunks overlap the symbol's current line span.
  *
  * Performance (see SYMBOL_HISTORY_PERF_PLAN.md):
- *   - One `git log --follow -U0 -p` subprocess per file (combined log+patch)
- *     instead of one `git log` plus one `git show` per commit. Spawns drop from
- *     ~F*C to F while keeping per-file `--follow` rename precision.
+ *   - One `git log -U0 -p` subprocess per file (combined log+patch) instead of
+ *     one `git log` plus one `git show` per commit. Spawns drop from ~F*C to F.
+ *   - The per-file walks run through a bounded concurrency pool (B1): N git
+ *     subprocesses are in flight at once (N = `concurrency`, default ~CPU count).
+ *     Git spawns are I/O-bound and independent, so this is near-linear on the
+ *     spawn-bound portion. ALL SQLite writes still happen on the single main
+ *     thread — JS is single-threaded and each write section is synchronous, so
+ *     concurrent lanes' writes serialize naturally (SQLite is single-writer).
+ *   - `--follow` is OFF by default (B2): it re-runs rename detection at every
+ *     step and is the most expensive common log flag. The continuity pass bridges
+ *     rename boundaries instead. Pass `follow: true` for unbroken raw rename
+ *     chains. The `follow` choice is part of the options fingerprint, so toggling
+ *     it invalidates watermarks and reprocesses cleanly.
  *   - The repo is validated once; per-file helpers run with assumeRepo so they
  *     don't re-spawn `git rev-parse` on every call.
- *   - Each file's rows are written in one batched transaction via a cached
- *     prepared statement, not one autocommit per row.
+ *   - Each file's rows are written DELETE-then-INSERT in one transaction
+ *     (replaceSymbolHistoryForSymbols) so a reprocess yields exactly the current
+ *     set, never a stale union.
  *   - A per-file resume watermark (symbol_history_progress) lets an interrupted
  *     or budgeted build skip already-finished files on the next run, and makes a
- *     HEAD-moved rerun reprocess only files whose content changed.
+ *     HEAD-moved rerun reprocess only files whose content changed (incremental
+ *     auto-update — see `onlyPaths` for the scoped/on-demand entry point).
  *   - Progress is reported through `onProgress` so the CLI can render a bar; the
  *     module itself never writes to stdout.
  *
@@ -31,15 +45,12 @@ import type { SymbolHistoryInsert } from '../types.js';
  *     commit. The symbol_key column captures `kind:qualified_name` so a
  *     future enhancement (key-match on historical AST parse) could recover
  *     pre-rename history without touching this schema.
- *   - File renames: `git log --follow` is used per-file so file renames
- *     ARE preserved; but cross-file moves are not. A PURE rename (the file moved
- *     with no content change) is represented as a rename — it contributes no
- *     history row, and the symbols' creation stays attributed to the original
- *     add commit. (The previous two-step `git show -U0 <sha> -- <newpath>` walk
- *     mis-saw a pure rename as a fresh file addition, fabricating a file-addition
- *     row at the rename commit; the combined `--follow -p` walk no longer does.
- *     Rename-with-content-change commits are unchanged — their hunks attribute as
- *     before. Rename *linkage* across the boundary is the continuity pass's job.)
+ *   - File renames: by default (`follow:false`) a file rename cuts off raw
+ *     history at the rename commit ("history starts here"); the continuity pass
+ *     bridges the boundary with shape-hash evidence. Pass `follow:true` to thread
+ *     raw rows through file renames at a per-file cost. Cross-file moves are not
+ *     followed in either mode. A PURE rename (file moved with no content change)
+ *     contributes no history row in either mode.
  *   - Line numbers shift across history. We compare a commit's hunks against
  *     the current symbol's line range — older overlaps are approximate.
  *     match_strategy = 'overlap' / confidence < 1.0 reflect that.
@@ -48,11 +59,13 @@ import type { SymbolHistoryInsert } from '../types.js';
 /**
  * Bump when the matching semantics change (overlap rule, confidence formula,
  * file-addition handling, candidate symbol kinds). It is part of every resume
- * watermark, so a bump invalidates stale watermarks and forces a rebuild. The
- * v11 combined-helper change did NOT alter row output (parity-tested), so it
- * stays at 1.
+ * watermark, so a bump invalidates stale watermarks and forces a rebuild.
+ *   - v1: original `--follow`-always overlap matcher.
+ *   - v2: `--follow` is opt-out (default off) and per-file writes are
+ *     DELETE-then-INSERT. The default no-follow output differs from v1 at file
+ *     renames, so this is a real semantic change, not just a refactor.
  */
-export const HISTORY_ALGORITHM_VERSION = 1;
+export const HISTORY_ALGORITHM_VERSION = 2;
 
 export interface SymbolHistoryProgress {
   /** Coarse phase of the build. */
@@ -78,6 +91,28 @@ export interface SymbolHistoryOptions {
   maxCommitsPerFile?: number;
   /** Cap history-since lookback in seconds. Default no limit. */
   since?: number;
+  /**
+   * Thread `git log --follow` through file renames in the RAW history (B2).
+   * Default false: the walk stops at a file's rename boundary and the continuity
+   * pass bridges it. Set true for unbroken raw rename chains at a per-file cost.
+   * Part of the options fingerprint, so toggling it reprocesses cleanly.
+   */
+  follow?: boolean;
+  /**
+   * Number of per-file `git log` walks in flight at once (B1). Defaults to the
+   * CPU count (clamped to [1, 16]); env SEER_HISTORY_CONCURRENCY overrides.
+   * Writes always stay on the main thread regardless of this value.
+   */
+  concurrency?: number;
+  /**
+   * Scope the build to just these files (absolute or repo-relative paths). When
+   * set, this is a SCOPED / on-demand build: it processes only the requested
+   * files, does NOT stamp the global history HEAD (so the index is not falsely
+   * marked fully-built), and SKIPS the global continuity pass. Per-file
+   * watermarks are still written, so a later full build reuses the work for free.
+   * This is the agent's cheap "history of one symbol" path.
+   */
+  onlyPaths?: string[];
   /** Only re-run if HEAD differs from `git_index_state.last_history_head_sha`. Default true. */
   skipIfHeadUnchanged?: boolean;
   /**
@@ -99,6 +134,15 @@ export interface SymbolHistoryOptions {
   onProgress?: (p: SymbolHistoryProgress) => void;
 }
 
+/** Resolve the effective per-file walk concurrency (B1). */
+function resolveConcurrency(opt: number | undefined): number {
+  const env = Number(process.env.SEER_HISTORY_CONCURRENCY);
+  const raw = (opt && opt > 0) ? opt
+    : (Number.isFinite(env) && env > 0) ? env
+    : (os.cpus()?.length || 4);
+  return Math.max(1, Math.min(16, Math.floor(raw)));
+}
+
 export interface SymbolHistoryResult {
   completed: boolean;
   filesProcessed: number;
@@ -111,12 +155,22 @@ export interface SymbolHistoryResult {
   skipped: boolean;
   elapsedMs: number;
   reason?: string;
+  /** True when the repo is a shallow clone (little/no history available). */
+  shallow?: boolean;
+  /**
+   * Set when the build did real work (processed files) but inserted 0 history
+   * rows — usually a shallow/zip checkout, or files not tracked by the resolved
+   * git repo. Surfaces the likely cause instead of an unexplained empty history.
+   */
+  diagnostic?: string;
 }
 
 /** Stable fingerprint of the options that affect which/what rows get written.
- *  Part of the resume watermark — if it changes, prior watermarks are ignored. */
-function optionsFingerprint(maxCommits: number, since: number | undefined): string {
-  return `mc=${maxCommits};since=${since ?? ''}`;
+ *  Part of the resume watermark — if it changes, prior watermarks are ignored.
+ *  `follow` is included because it changes which commits attribute to a symbol
+ *  at rename boundaries, so flipping it must reprocess. */
+function optionsFingerprint(maxCommits: number, since: number | undefined, follow: boolean): string {
+  return `mc=${maxCommits};since=${since ?? ''};follow=${follow ? 1 : 0}`;
 }
 
 export async function buildSymbolHistory(
@@ -130,6 +184,7 @@ export async function buildSymbolHistory(
     : Number.POSITIVE_INFINITY;
   let stopReason: string | null = null;
   const log = options.log ?? ((m: string) => process.stderr.write(`[symbol-history] ${m}\n`));
+  const shallow = isGitRepo(repoRoot) && isShallowRepo(repoRoot);
   const done = (
     completed: boolean,
     filesProcessed: number,
@@ -139,18 +194,30 @@ export async function buildSymbolHistory(
     historyRowsInserted: number,
     skipped: boolean,
     reason?: string,
-  ): SymbolHistoryResult => ({
-    completed,
-    filesProcessed,
-    filesTotal,
-    filesRemaining: Math.max(0, filesTotal - filesProcessed - filesSkippedResume),
-    filesSkippedResume,
-    symbolsProcessed,
-    historyRowsInserted,
-    skipped,
-    elapsedMs: Date.now() - start,
-    ...(reason ? { reason } : {}),
-  });
+  ): SymbolHistoryResult => {
+    // Explain a "did work but found nothing" outcome rather than leaving the
+    // agent staring at historyRowsInserted: 0 (the Godot-audit confusion).
+    let diagnostic: string | undefined;
+    if (!skipped && filesProcessed > 0 && historyRowsInserted === 0) {
+      diagnostic = shallow
+        ? 'Processed files but inserted 0 history rows: this is a SHALLOW git clone (git clone --depth N), which carries almost no commit history. Re-clone with full history (git fetch --unshallow) to build symbol history.'
+        : 'Processed files but inserted 0 history rows. Likely causes: the workspace is a zip/snapshot download with no .git, the files are not tracked by the resolved git repo (e.g. a sub-directory inside a different repo), or git history does not overlap current symbol line ranges. Confirm `git -C <workspace> log -- <a source file>` returns commits.';
+    }
+    return {
+      completed,
+      filesProcessed,
+      filesTotal,
+      filesRemaining: Math.max(0, filesTotal - filesProcessed - filesSkippedResume),
+      filesSkippedResume,
+      symbolsProcessed,
+      historyRowsInserted,
+      skipped,
+      elapsedMs: Date.now() - start,
+      ...(reason ? { reason } : {}),
+      ...(shallow ? { shallow: true } : {}),
+      ...(diagnostic ? { diagnostic } : {}),
+    };
+  };
   const deadlineExceeded = (): boolean => Date.now() >= deadlineAt;
   const noteTimeout = (command: string): void => {
     const timeout = options.gitCommandTimeoutMs ?? (Number(process.env.SEER_GIT_TIMEOUT_MS) || 15000);
@@ -171,14 +238,29 @@ export async function buildSymbolHistory(
   // can't masquerade as a completed history build.
   const remote = gitRemoteUrl(repoRoot);
   const maxCommits = options.maxCommitsPerFile ?? 200;
-  const fingerprint = optionsFingerprint(maxCommits, options.since);
+  const follow = options.follow === true;
+  const concurrency = resolveConcurrency(options.concurrency);
+  const fingerprint = optionsFingerprint(maxCommits, options.since, follow);
+
+  // Scoped / on-demand build (Thrust A): restrict to the requested files, don't
+  // touch the global HEAD stamp, and skip the global continuity pass. `onlyPaths`
+  // may be absolute or repo-relative; normalize to the absolute keys the symbol
+  // table uses so the IN-filter matches.
+  const scoped = Array.isArray(options.onlyPaths) && options.onlyPaths.length > 0;
+  const scopedAbs = scoped
+    ? options.onlyPaths!.map(p => (path.isAbsolute(p) ? p : path.resolve(repoRoot, p)))
+    : [];
+
   // `--force` (skipIfHeadUnchanged===false) disables resume too unless a caller
   // overrides explicitly; a forced rebuild then wipes stale watermarks so the
-  // next interrupted run resumes against the fresh set.
+  // next interrupted run resumes against the fresh set. A scoped build never
+  // force-clears the whole repo's watermarks (it isn't the whole repo).
   const useResume = options.useResumeWatermarks ?? (options.skipIfHeadUnchanged !== false);
-  if (!useResume) store.clearSymbolHistoryWatermarks(repoRoot);
+  if (!useResume && !scoped) store.clearSymbolHistoryWatermarks(repoRoot);
 
-  const symbols = store.listSymbolsForHistoryIndex();
+  const symbols = scoped
+    ? store.listSymbolsForHistoryIndexForFiles(scopedAbs)
+    : store.listSymbolsForHistoryIndex();
   if (symbols.length === 0) {
     return done(true, 0, 0, 0, 0, 0, false);
   }
@@ -203,7 +285,7 @@ export async function buildSymbolHistory(
   // changed fingerprint or an edited+reindexed file flips a watermark and makes
   // `allCurrent` false, so a same-HEAD rerun that actually needs work falls
   // through to the loop (which still per-file-skips the unchanged files cheaply).
-  if (options.skipIfHeadUnchanged !== false && head !== null && state?.lastHistoryHeadSha === head) {
+  if (!scoped && options.skipIfHeadUnchanged !== false && head !== null && state?.lastHistoryHeadSha === head) {
     let allCurrent = true; // fileOrder is non-empty here (symbols.length > 0 above)
     for (const filePath of fileOrder) {
       const wm = watermarks.get(filePath);
@@ -238,48 +320,18 @@ export async function buildSymbolHistory(
   };
   emit('scan', '');
 
-  for (const filePath of fileOrder) {
-    const { fileHash, symbols: fileSymbols } = byFile.get(filePath)!;
-    if (deadlineExceeded()) {
-      stopReason = `deadline exceeded after ${options.deadlineMs}ms`;
-      break;
-    }
-    // Resume skip: a watermark whose file content, options fingerprint, AND
-    // algorithm version all still match proves this file's rows would be
-    // recomputed identically — safe to skip without git work. (See the
-    // symbol_history_progress schema comment for why HEAD is not the key.)
-    const wm = watermarks.get(filePath);
-    if (wm && wm.fileHash === fileHash && wm.optionsFingerprint === fingerprint
-        && wm.algorithmVersion === HISTORY_ALGORITHM_VERSION) {
-      skippedResume++;
-      emit('history', relOf(repoRoot, filePath));
-      continue;
-    }
-    if (processedFiles >= maxFiles) {
-      stopReason = `stopped after maxFiles=${maxFiles}`;
-      break;
-    }
-    processedFiles++;
-
-    // One subprocess: commits touching this file AND their diffs, newest first.
-    const commits = await commitsWithDiffsForFile(repoRoot, filePath, {
-      limit: maxCommits,
-      since: options.since,
-      timeoutMs: options.gitCommandTimeoutMs,
-      onTimeout: noteTimeout,
-      assumeRepo: true,
-    });
-    if (stopReason) break;
-
+  // Compute one file's history rows from its commit walk. Pure (no DB writes,
+  // no shared-state mutation beyond the returned values), so it is safe to run
+  // many of these concurrently — the writes happen back on the main lane.
+  const computeFileRows = (
+    fileSymbols: typeof symbols, commits: Awaited<ReturnType<typeof commitsWithDiffsForFile>>,
+  ): { rows: SymbolHistoryInsert[]; commitsCounted: number; complete: boolean } => {
     const fileRows: SymbolHistoryInsert[] = [];
-    let fileComplete = true;
+    let counted = 0;
+    let complete = true;
     for (const c of commits) {
-      if (deadlineExceeded()) {
-        stopReason = `deadline exceeded after ${options.deadlineMs}ms`;
-        fileComplete = false;
-        break;
-      }
-      commitsProcessed++;
+      if (deadlineExceeded()) { complete = false; break; }
+      counted++;
       if (c.hunks.length === 0 && !c.isFileAddition) continue;
       const totalAdded = c.hunks.reduce((acc, h) => acc + h.newLines, 0);
       const totalRemoved = c.hunks.reduce((acc, h) => acc + h.oldLines, 0);
@@ -323,27 +375,100 @@ export async function buildSymbolHistory(
         });
       }
     }
+    return { rows: fileRows, commitsCounted: counted, complete };
+  };
 
-    // Flush this file's rows in one transaction. Even a partial (deadline-cut)
-    // batch is safe to write — INSERT OR IGNORE dedupes on the next run. We only
-    // stamp the watermark when the file finished, so an interrupted file is
-    // reprocessed (and completed) next time rather than wrongly skipped.
-    const inserted = store.insertSymbolHistoryBatch(fileRows);
-    totalInserts += inserted;
-    if (fileComplete && !stopReason) {
-      // Record the ACTUAL inserted count (INSERT OR IGNORE may drop duplicates on
-      // a rerun / duplicate-heavy file), not the attempted row count.
-      store.upsertSymbolHistoryWatermark(
-        repoRoot, filePath, fileHash, fingerprint, HISTORY_ALGORITHM_VERSION, head, inserted,
-      );
+  // Synchronously claim the next file that actually needs git work. This walks
+  // past resume-skips (counting them) and enforces the maxFiles cap. Because it
+  // contains no `await`, lanes can't interleave inside it, so processedFiles /
+  // the cursor stay consistent and maxFiles stays exact under concurrency.
+  let cursor = 0;
+  const claimNext = (): { filePath: string; fileHash: string; fileSymbols: typeof symbols } | null => {
+    while (cursor < fileOrder.length) {
+      if (stopReason) return null;
+      if (deadlineExceeded()) {
+        stopReason = `deadline exceeded after ${options.deadlineMs}ms`;
+        return null;
+      }
+      const filePath = fileOrder[cursor++];
+      const { fileHash, symbols: fileSymbols } = byFile.get(filePath)!;
+      // Resume skip: a watermark whose file content, options fingerprint, AND
+      // algorithm version all still match proves this file's rows would be
+      // recomputed identically — safe to skip without git work. (See the
+      // symbol_history_progress schema comment for why HEAD is not the key.)
+      const wm = watermarks.get(filePath);
+      if (wm && wm.fileHash === fileHash && wm.optionsFingerprint === fingerprint
+          && wm.algorithmVersion === HISTORY_ALGORITHM_VERSION) {
+        skippedResume++;
+        emit('history', relOf(repoRoot, filePath));
+        continue;
+      }
+      if (processedFiles >= maxFiles) {
+        stopReason = `stopped after maxFiles=${maxFiles}`;
+        return null;
+      }
+      processedFiles++;
+      return { filePath, fileHash, fileSymbols };
     }
-    emit('history', relOf(repoRoot, filePath));
-    if (stopReason) break;
-  }
+    return null;
+  };
+
+  // One lane: claim → git walk (concurrent) → write (serialized on the main
+  // thread). The git walk is the only awaited step, so up to `concurrency`
+  // subprocesses run at once while writes stay single-threaded.
+  const lane = async (): Promise<void> => {
+    for (;;) {
+      const job = claimNext();
+      if (!job) return;
+      // Detect THIS file's git timeout locally: a sibling lane's stop (maxFiles
+      // or its own deadline) must not be mistaken for this file failing.
+      let timedOut = false;
+      const commits = await commitsWithDiffsForFile(repoRoot, job.filePath, {
+        limit: maxCommits,
+        since: options.since,
+        timeoutMs: options.gitCommandTimeoutMs,
+        onTimeout: (cmd) => { noteTimeout(cmd); timedOut = true; },
+        assumeRepo: true,
+        follow,
+      });
+      // This file's own walk timed out — leave it unwatermarked so the next run
+      // reprocesses it. noteTimeout already set the global stopReason.
+      if (timedOut) return;
+      const { rows, commitsCounted, complete } = computeFileRows(job.fileSymbols, commits);
+      commitsProcessed += commitsCounted;
+      // DELETE-then-INSERT in one transaction so a reprocess (option change,
+      // algo bump, force) yields exactly the current set. Synchronous, so
+      // concurrent lanes' writes serialize naturally.
+      const inserted = store.replaceSymbolHistoryForSymbols(job.fileSymbols.map(s => s.id), rows);
+      totalInserts += inserted;
+      // Stamp on PER-FILE completion, independent of the global stopReason: a
+      // file that fully walked its commits is done even if a sibling lane has
+      // since hit maxFiles/deadline. `complete` is only false when THIS file's
+      // commit loop was cut mid-way by the deadline.
+      if (complete) {
+        store.upsertSymbolHistoryWatermark(
+          repoRoot, job.filePath, job.fileHash, fingerprint, HISTORY_ALGORITHM_VERSION, head, inserted,
+        );
+      }
+      emit('history', relOf(repoRoot, job.filePath));
+      if (stopReason) return;
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, filesTotal)) }, () => lane()));
 
   if (stopReason) {
     log(`partial: ${processedFiles}/${filesTotal} files (${skippedResume} resume-skipped), ${totalInserts} history rows (${stopReason})`);
     return done(false, processedFiles, filesTotal, skippedResume, symbols.length, totalInserts, false, stopReason);
+  }
+
+  // A scoped (on-demand) build is intentionally partial: it only touched the
+  // requested files, so it must NOT run the global continuity pass and must NOT
+  // stamp the global history HEAD (that would falsely mark the whole repo built).
+  // Per-file watermarks were still written, so a later full build reuses them.
+  if (scoped) {
+    log(`scoped: ${processedFiles} files processed, ${skippedResume} resume-skipped, ${totalInserts} history rows`);
+    return done(true, processedFiles, filesTotal, skippedResume, symbols.length, totalInserts, false);
   }
 
   // v10 — run the continuity heuristics for symbols whose recorded history is
@@ -361,7 +486,7 @@ export async function buildSymbolHistory(
 
   // Stamp the history-specific HEAD marker (not the generic one) so a future
   // run can skip this work without colliding with file-level churn's stamp.
-  store.setHistoryHeadSha(repoRoot, head, remote);
+  store.setHistoryHeadSha(repoRoot, head, remote, options.follow ?? false);
   log(`done: ${processedFiles} files processed, ${skippedResume} resume-skipped, ${totalInserts} history rows`);
   return done(true, processedFiles, filesTotal, skippedResume, symbols.length, totalInserts, false);
 }

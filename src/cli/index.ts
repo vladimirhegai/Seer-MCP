@@ -82,7 +82,8 @@ program
   .option('--parallel', 'Force worker-thread parsing even for tiny repositories')
   .option('--no-parallel', 'Disable worker-thread parsing; auto mode uses workers for normal/large repos')
   .option('--jobs <n>', 'Worker thread count when worker parsing is active (default: cores - 1, capped at 8)')
-  .action(async (repoPath: string, opts: { db?: string; verbose?: boolean; reset?: boolean; maxFileKb: string; includeVendor?: boolean; includeGenerated?: boolean; mode?: string; parallel?: boolean; jobs?: string }) => {
+  .option('--no-history-refresh', 'Skip the incremental symbol-history refresh after indexing (only runs if history was already built)')
+  .action(async (repoPath: string, opts: { db?: string; verbose?: boolean; reset?: boolean; maxFileKb: string; includeVendor?: boolean; includeGenerated?: boolean; mode?: string; parallel?: boolean; jobs?: string; historyRefresh?: boolean }) => {
     const absRepo = path.resolve(repoPath);
     if (!fs.existsSync(absRepo)) {
       console.error(`Path not found: ${absRepo}`);
@@ -130,6 +131,34 @@ program
       if (result.pagerankRecomputed) console.log(`   PageRank computed`);
       else                            console.log(`   PageRank reused (graph unchanged)`);
       console.log(`\n  Done in ${(result.elapsedMs / 1000).toFixed(1)}s`);
+
+      // Auto-update symbol history: ONLY when a history index already exists
+      // (the user opted in by building it before). Re-running buildSymbolHistory
+      // is incremental — files whose content is unchanged are resume-skipped, so
+      // after a `git pull` + index this just refreshes the handful of files that
+      // actually changed (their old rows were already cascade-cleared when their
+      // symbols were reindexed). Opt out with --no-history-refresh.
+      const histState = store.getGitIndexState();
+      if (opts.historyRefresh !== false && histState?.lastHistoryHeadSha) {
+        try {
+          const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+          // Replicate the --follow choice from the last full build. This is
+          // stored authoritatively in git_index_state.last_history_follow (written
+          // by setHistoryHeadSha at full-build completion). Watermarks are NOT used
+          // here because scoped/partial builds can leave mixed follow=0/1 rows that
+          // make watermark-scanning non-deterministic.
+          const followFromState = histState.lastHistoryFollow ?? false;
+          process.stdout.write(`\n  Refreshing symbol history (incremental)...`);
+          const hr = await buildSymbolHistory(absRepo, store, {
+            follow: followFromState,
+            log: () => {},
+          });
+          if (hr.skipped) console.log(` up to date.`);
+          else console.log(` ${hr.historyRowsInserted} rows across ${hr.filesProcessed} changed file(s).`);
+        } catch (err) {
+          console.log(`\n  (symbol-history refresh skipped: ${(err as Error).message})`);
+        }
+      }
     } finally {
       store.close();
     }
@@ -728,17 +757,21 @@ program
 
 program
   .command('symbol-history')
-  .description('Index per-symbol git history (opt-in; can take a few minutes)')
+  .description('Index per-symbol git history (opt-in; incremental on re-run)')
   .option('--db <path>', 'Database path')
   .option('--workspace <path>', 'Workspace path (defaults to cwd)')
   .option('--max-commits <n>', 'Max commits per file', '200')
   .option('--max-files <n>', 'Stop after this many files (partial build)')
   .option('--max-seconds <n>', 'Wall-clock budget; partial builds resume next run')
+  .option('--paths <list>', 'Comma-separated files to build (scoped build of just these)')
+  .option('--follow', 'Thread git --follow through file renames (slower; default off)')
+  .option('--concurrency <n>', 'Parallel per-file git walks (default ~CPU count)')
   .option('--force', 'Re-run from scratch even if HEAD unchanged (ignores resume watermarks)')
   .option('--no-resume', 'Ignore per-file resume watermarks (reprocess every file)')
   .action(async (opts: {
     db?: string; workspace?: string; maxCommits: string;
-    maxFiles?: string; maxSeconds?: string; force?: boolean; resume?: boolean;
+    maxFiles?: string; maxSeconds?: string; paths?: string; follow?: boolean;
+    concurrency?: string; force?: boolean; resume?: boolean;
   }) => {
     const workspace = path.resolve(opts.workspace ?? process.cwd());
     const dbPath = opts.db ?? findDbFromCwd();
@@ -749,11 +782,17 @@ program
       const { writeProgress, clearProgress } = await import('../indexer/progress.js');
       // commander sets `resume` to false only when --no-resume is passed.
       const useResume = opts.resume === false ? false : (opts.force ? false : undefined);
+      const onlyPaths = opts.paths
+        ? opts.paths.split(',').map(p => p.trim()).filter(Boolean)
+        : undefined;
       let lastLog = 0;
       const r = await buildSymbolHistory(workspace, store, {
         maxCommitsPerFile: parseInt(opts.maxCommits, 10) || 200,
         maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
         deadlineMs: opts.maxSeconds ? (parseInt(opts.maxSeconds, 10) || 0) * 1000 : undefined,
+        follow: opts.follow === true,
+        concurrency: opts.concurrency ? parseInt(opts.concurrency, 10) || undefined : undefined,
+        ...(onlyPaths ? { onlyPaths } : {}),
         skipIfHeadUnchanged: !opts.force,
         useResumeWatermarks: useResume,
         log: (m) => { clearProgress(); console.log(`  ${m}`); },
