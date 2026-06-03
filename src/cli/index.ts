@@ -9,7 +9,20 @@ import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
 import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
 
-const VERSION = '0.1.12';
+// Read the version from package.json at runtime so it never drifts from the
+// published release the way a hardcoded literal does. `__dirname` resolves to
+// dist/cli (built) or src/cli (tsx/dev); `../../package.json` is the package
+// root in both, and npm always ships package.json regardless of the `files`
+// allowlist. Falls back to a literal if the file can't be read.
+const VERSION: string = (() => {
+  try {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
+    ) as { version?: unknown };
+    if (typeof pkg.version === 'string' && pkg.version) return pkg.version;
+  } catch { /* fall through to the literal below */ }
+  return '0.1.15';
+})();
 
 const KNOWN_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gemini', 'antigravity', 'windsurf'];
 
@@ -317,7 +330,14 @@ program
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
     try {
-      const target = opts.file ? store.getDefinition(symbol, { filePath: opts.file })[0] : null;
+      // Resolve a specific id when the input is disambiguating — a `--file` was
+      // given, or the symbol is qualified (`Node.add_child` / `Node::add_child`)
+      // — then read callers by id. A bare short name stays on the broad name
+      // path so `callers run` still lists callers of every `run`.
+      const qualified = symbol.includes('.') || symbol.includes('::');
+      const target = (opts.file || qualified)
+        ? store.getDefinition(symbol, { filePath: opts.file })[0] ?? null
+        : null;
       if (opts.file && !target) {
         console.log(`No symbol "${symbol}" found in ${opts.file}`);
         return;
@@ -340,14 +360,26 @@ program
   .command('callees <symbol>')
   .description('Find all symbols called by a symbol')
   .option('--db <path>', 'Database path')
+  .option('--file <path>', 'Disambiguate the caller symbol by definition file')
   .option('-n, --limit <n>', 'Max results', '40')
-  .action((symbol: string, opts: { db?: string; limit: string }) => {
+  .action((symbol: string, opts: { db?: string; file?: string; limit: string }) => {
     const dbPath = opts.db ?? findDbFromCwd();
     const store = openStore(dbPath);
     try {
-      const callees = store.findCallees(symbol);
+      // Resolve a specific id when disambiguating (mirrors `callers`): a `--file`
+      // was given, or the caller is qualified (`Node.add_child` /
+      // `Node::add_child`) — then read callees by id. A bare short name stays on
+      // the broad name path. The name-keyed findCallees only matched the short
+      // name, so qualified inputs used to return nothing.
+      const qualified = symbol.includes('.') || symbol.includes('::');
+      const target = (opts.file || qualified)
+        ? store.getDefinition(symbol, { filePath: opts.file })[0] ?? null
+        : null;
+      if (opts.file && !target) { console.log(`No symbol "${symbol}" found in ${opts.file}`); return; }
+      const callees = target ? store.findCalleesById(target.id) : store.findCallees(symbol);
       if (callees.length === 0) { console.log(`No callees found for "${symbol}"`); return; }
-      console.log(`\nCallees of '${symbol}'  (${callees.length} found)\n`);
+      const label = target ? `${target.qualifiedName ?? target.name}` : symbol;
+      console.log(`\nCallees of '${label}'  (${callees.length} found)\n`);
       const limit = Math.min(parseInt(opts.limit, 10), callees.length);
       for (const c of callees.slice(0, limit)) {
         const loc = c.calleeFile ? `${c.calleeFile}:${(c.calleeLineStart ?? 0) + 1}` : '(unresolved)';
@@ -700,20 +732,47 @@ program
   .option('--db <path>', 'Database path')
   .option('--workspace <path>', 'Workspace path (defaults to cwd)')
   .option('--max-commits <n>', 'Max commits per file', '200')
-  .option('--force', 'Re-run even if HEAD unchanged')
-  .action(async (opts: { db?: string; workspace?: string; maxCommits: string; force?: boolean }) => {
+  .option('--max-files <n>', 'Stop after this many files (partial build)')
+  .option('--max-seconds <n>', 'Wall-clock budget; partial builds resume next run')
+  .option('--force', 'Re-run from scratch even if HEAD unchanged (ignores resume watermarks)')
+  .option('--no-resume', 'Ignore per-file resume watermarks (reprocess every file)')
+  .action(async (opts: {
+    db?: string; workspace?: string; maxCommits: string;
+    maxFiles?: string; maxSeconds?: string; force?: boolean; resume?: boolean;
+  }) => {
     const workspace = path.resolve(opts.workspace ?? process.cwd());
     const dbPath = opts.db ?? findDbFromCwd();
     if (!fs.existsSync(dbPath)) { console.error(`No index at ${dbPath}`); process.exit(1); }
     const store = new Store(dbPath);
     try {
       const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+      const { writeProgress, clearProgress } = await import('../indexer/progress.js');
+      // commander sets `resume` to false only when --no-resume is passed.
+      const useResume = opts.resume === false ? false : (opts.force ? false : undefined);
+      let lastLog = 0;
       const r = await buildSymbolHistory(workspace, store, {
         maxCommitsPerFile: parseInt(opts.maxCommits, 10) || 200,
+        maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
+        deadlineMs: opts.maxSeconds ? (parseInt(opts.maxSeconds, 10) || 0) * 1000 : undefined,
         skipIfHeadUnchanged: !opts.force,
-        log: (m) => console.log(`  ${m}`),
+        useResumeWatermarks: useResume,
+        log: (m) => { clearProgress(); console.log(`  ${m}`); },
+        onProgress: (p) => {
+          if (process.stdout.isTTY) {
+            writeProgress(p.filesHandled, p.filesTotal, p.currentFile || p.phase);
+          } else {
+            const now = Date.now();
+            if (now - lastLog > 2000 || p.filesHandled >= p.filesTotal) {
+              lastLog = now;
+              console.log(`  [${p.phase}] ${p.filesHandled}/${p.filesTotal} files, ${p.rowsInserted} rows`);
+            }
+          }
+        },
       });
-      console.log(`\nSymbol history: ${r.historyRowsInserted} rows across ${r.filesProcessed} files (${r.elapsedMs}ms)`);
+      clearProgress();
+      const skipNote = r.filesSkippedResume > 0 ? `, ${r.filesSkippedResume} resume-skipped` : '';
+      const partial = r.completed ? '' : ` — PARTIAL (${r.reason ?? 'budget reached'}); rerun to resume`;
+      console.log(`\nSymbol history: ${r.historyRowsInserted} rows across ${r.filesProcessed} files${skipNote} (${r.elapsedMs}ms)${partial}`);
     } finally { store.close(); }
   });
 
@@ -903,7 +962,8 @@ program
       });
       if (!r) { console.log(`No symbol "${symbol}"`); return; }
       console.log(`\nBehavior for ${r.symbol.qualifiedName ?? r.symbol.name}  (${r.symbol.kind})  ${r.symbol.file}`);
-      console.log(`  direct=${r.direct}  indirect=${r.indirect}  naming=${r.namingMatches}  same-file=${r.sameFileMatches}\n`);
+      console.log(`  direct=${r.direct}  indirect=${r.indirect}  naming=${r.namingMatches}  same-file=${r.sameFileMatches}  heuristic=${r.heuristicMatches}`);
+      console.log(`  coverage: ${r.testCoverageState} — ${r.testCoverageNote}\n`);
       for (const t of r.tests) {
         const dist = t.graphDistance == null ? '  ' : String(t.graphDistance).padStart(2);
         console.log(
@@ -955,7 +1015,10 @@ program
       console.log(`  Complexity: loc=${c.complexity.loc ?? ''}  cyclomatic=${c.complexity.cyclomatic ?? ''}  cognitive=${c.complexity.cognitive ?? ''}`);
       console.log(`  Callers: ${c.callers.total} total; Callees: ${c.callees.total}; Blast radius (depth ${c.blastRadius.maxDepth}): direct=${c.blastRadius.directCallers}, transitive=${c.blastRadius.transitiveCallers}`);
       console.log(`  Behavior: direct=${c.behavior.direct}  indirect=${c.behavior.indirect}  naming=${c.behavior.namingMatches}  same-file=${c.behavior.sameFileMatches}`);
-      console.log(`  Routes: ${c.routes.length}  Config: ${c.configKeys.length}  History: ${c.recentHistory.total}`);
+      const histNote = c.historyIndex.built ? '' : ' (history index not built)';
+      const routesNote = c.routesTruncated ? ` (${c.routes.length} shown)` : '';
+      const configNote = c.configKeysTruncated ? ` (${c.configKeys.length} shown)` : '';
+      console.log(`  Routes: ${c.routesTotal}${routesNote}  Config: ${c.configKeysTotal}${configNote}  History: ${c.recentHistory.total}${histNote}`);
       console.log(`  Risk: ${c.risk.risk.toUpperCase()} (score ${c.risk.score.toFixed(2)})`);
       console.log(`\n  Signal contributions:`);
       for (const sc of c.risk.signalContributions) {

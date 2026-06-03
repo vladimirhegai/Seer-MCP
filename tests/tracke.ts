@@ -57,7 +57,7 @@ async function run(): Promise<void> {
   console.log('── Schema ──');
   const schema = store.schemaInfo();
   assertEq(schema.current, true, 'schema is current');
-  assertEq(schema.dbVersion, 10, 'schema version is v10');
+  assertEq(schema.dbVersion, 11, 'schema version is v11');
 
   // ── Modules: clustering built automatically ───────────────────────────────
   console.log('\n── Module clustering ──');
@@ -263,6 +263,27 @@ async function run(): Promise<void> {
   const ctxRoute = buildContext(store, 'chargeCustomer');
   if (ctxRoute) {
     assert(ctxRoute.routes.length >= 1, 'context for chargeCustomer includes its route');
+    assert(ctxRoute.routesTotal >= ctxRoute.routes.length, 'context exposes route total alongside the preview');
+    assert(ctxRoute.configKeysTotal >= ctxRoute.configKeys.length, 'context exposes config-key total alongside the preview');
+  }
+
+  // Context packet keeps route/config previews compact on high-fanout symbols
+  // while still exposing the true totals. Inject extra rows directly rather
+  // than bloating fixtures permanently.
+  const chargeCtx = store.getDefinition('chargeCustomer')[0];
+  if (chargeCtx) {
+    for (let i = 0; i < 20; i++) {
+      store.insertRoute(chargeCtx.fileId, 'GET', `/context-preview-${i}`, 'express', 'chargeCustomer', chargeCtx.lineStart + i);
+      store.insertConfigKey(`CTX_PREVIEW_KEY_${i}`, 'env', chargeCtx.fileId, chargeCtx.id, chargeCtx.lineStart + i);
+    }
+    store.resolveRouteHandlers();
+    const compact = buildContext(store, 'chargeCustomer');
+    if (compact) {
+      assert(compact.routesTotal > compact.routes.length, 'context caps route preview but keeps the total');
+      assert(compact.routesTruncated === true, 'context flags truncated route previews');
+      assert(compact.configKeysTotal > compact.configKeys.length, 'context caps config-key preview but keeps the total');
+      assert(compact.configKeysTruncated === true, 'context flags truncated config-key previews');
+    }
   }
 
   // Context for a non-existent symbol returns null.

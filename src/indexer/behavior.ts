@@ -34,7 +34,29 @@ export type BehaviorRelationship =
   | 'direct-call'
   | 'indirect-call'
   | 'naming-convention'
-  | 'same-file';
+  | 'same-file'
+  | 'heuristic-name-call';
+
+/**
+ * Distinguishes the "why are there (no) graph-linked tests?" cases so an agent
+ * can tell a genuine coverage gap — or precise coverage — from a name-based
+ * guess or an indexing limitation:
+ *   - graph-linked              — at least one PRECISE test link (call graph,
+ *                                 naming, or path convention) was found.
+ *   - heuristic-only            — the ONLY evidence is name-based heuristic
+ *                                 (type-unresolved C/C++ member calls). A hint,
+ *                                 not proof — never report this as precise.
+ *   - tests-indexed-no-link     — test files exist, but none link to THIS symbol.
+ *   - no-indexed-tests          — the workspace has zero indexed test files.
+ *   - test-indexing-unavailable — the DB lacks file-role classification, so
+ *                                 "test" can't be determined at all.
+ */
+export type BehaviorTestState =
+  | 'graph-linked'
+  | 'heuristic-only'
+  | 'tests-indexed-no-link'
+  | 'no-indexed-tests'
+  | 'test-indexing-unavailable';
 
 export interface RankedBehaviorTest {
   testSymbol: {
@@ -51,6 +73,12 @@ export interface RankedBehaviorTest {
   assertionCount: number;
   specificity: number;
   recentCommitAt: number | null;
+  /**
+   * True for name-based, type-unresolved evidence (C/C++ member calls whose
+   * receiver type tree-sitter can't infer). Lower confidence — the test calls
+   * SOME method of this name, not provably THIS symbol. See namedCallTestSites.
+   */
+  heuristic?: boolean;
 }
 
 export interface BehaviorResult {
@@ -66,6 +94,14 @@ export interface BehaviorResult {
   indirect: number;
   namingMatches: number;
   sameFileMatches: number;
+  /** Count of name-based heuristic (type-unresolved) test sites. */
+  heuristicMatches: number;
+  /** Which of the test-coverage states applies — see BehaviorTestState. */
+  testCoverageState: BehaviorTestState;
+  /** Total indexed test files (−1 when role classification is unavailable). */
+  testsIndexed: number;
+  /** Human-readable explanation of testCoverageState. */
+  testCoverageNote: string;
   tests: RankedBehaviorTest[];
   source: 'tree-sitter';
 }
@@ -96,12 +132,19 @@ export function rankedBehavior(
     indirectDepth?: number;
     includeNamingConvention?: boolean;
     includeSameFile?: boolean;
+    /**
+     * Name-based heuristic coverage for type-unresolved member calls (C/C++).
+     * On by default; only fires when the target lives in a C/C++ file so other
+     * languages (with resolvable receivers) keep precise-only behavior.
+     */
+    includeHeuristicCalls?: boolean;
   } = {},
 ): BehaviorResult | null {
   const limit = options.limit ?? 30;
   const indirectDepth = options.indirectDepth ?? 2;
   const includeNaming = options.includeNamingConvention ?? true;
   const includeSameFile = options.includeSameFile ?? true;
+  const includeHeuristicCalls = options.includeHeuristicCalls ?? true;
 
   let target: SymbolRow | null = null;
   if (typeof nameOrId === 'number') {
@@ -320,6 +363,47 @@ export function rankedBehavior(
     }
   }
 
+  // ── HEURISTIC name-call coverage (type-unresolved C/C++ member calls) ────
+  // C/C++ member calls (`node->add_child(child)`) carry only the method's short
+  // name in the call edge — tree-sitter can't infer the receiver's static type,
+  // so the edge never resolves to THIS specific `Node.add_child` id and every
+  // precise pass above misses it. When the target lives in a C/C++ file we
+  // surface a clearly-labeled, lower-confidence signal: test functions that
+  // call SOME method of the same name. It's name-based, not type-resolved
+  // (`Tree::add_child` would match too), so it ranks below resolved signals and
+  // every row is flagged `heuristic: true`. The precision path is a SCIP
+  // overlay that resolves the receiver and promotes these to real DIRECT edges.
+  if (
+    includeHeuristicCalls &&
+    isUnresolvedReceiverLang(target.filePath) &&
+    isMemberLikeTarget(target.qualifiedName) &&
+    target.name
+  ) {
+    const heuristicRows = store.namedCallTestSites(target.name, target.id, 200);
+    for (const r of heuristicRows) {
+      if (seenCallerIds.has(r.callerId)) continue;
+      seenCallerIds.add(r.callerId);
+      const assertionCount = assertionsForRange(r.callerFile, r.callerLineStart, r.callerLineEnd);
+      out.push({
+        testSymbol: {
+          id: r.callerId,
+          name: r.callerName,
+          qualifiedName: r.callerQualifiedName,
+          kind: r.callerKind,
+          file: r.callerFile,
+          lineStart: r.callerLineStart,
+          lineEnd: r.callerLineEnd,
+        },
+        relationship: 'heuristic-name-call',
+        graphDistance: null,
+        assertionCount,
+        specificity: scoreSpecificity('heuristic-name-call', null, assertionCount),
+        recentCommitAt: recentCommitForFile(store, r.callerFile),
+        heuristic: true,
+      });
+    }
+  }
+
   // Sort and slice.
   out.sort((a, b) => {
     if (b.specificity !== a.specificity) return b.specificity - a.specificity;
@@ -336,6 +420,16 @@ export function rankedBehavior(
   const indirect = out.filter(t => t.relationship === 'indirect-call').length;
   const namingMatches = out.filter(t => t.relationship === 'naming-convention').length;
   const sameFileMatches = out.filter(t => t.relationship === 'same-file').length;
+  const heuristicMatches = out.filter(t => t.relationship === 'heuristic-name-call').length;
+
+  // Distinguish a real coverage gap from an indexing limitation so the agent
+  // doesn't read "0 tests" as "this code is untested" when tests simply can't
+  // be classified (or none were indexed). Heuristic (name-based) matches are
+  // passed separately so a symbol whose ONLY evidence is heuristic reads as
+  // `heuristic-only`, never the precise-sounding `graph-linked`.
+  const preciseLinked = out.length - heuristicMatches;
+  const { testCoverageState, testsIndexed, testCoverageNote } =
+    classifyTestCoverage(store, preciseLinked, heuristicMatches);
 
   return {
     symbol: {
@@ -350,6 +444,10 @@ export function rankedBehavior(
     indirect,
     namingMatches,
     sameFileMatches,
+    heuristicMatches,
+    testCoverageState,
+    testsIndexed,
+    testCoverageNote,
     tests: out.slice(0, limit),
     source: 'tree-sitter',
   };
@@ -372,6 +470,9 @@ function scoreSpecificity(
     case 'naming-convention': base = 60; break;
     case 'same-file':         base = 40; break;
     case 'indirect-call':     base = Math.max(0, 50 - 10 * ((distance ?? 2) - 1)); break;
+    // Name-based, type-unresolved: ranks below every resolved signal so it only
+    // surfaces when nothing better exists, and never outranks a real test.
+    case 'heuristic-name-call': base = 20; break;
   }
   // Each assertion line adds a small boost (capped at 20). A test that
   // exercises the symbol AND has assertions is a stronger contract than one
@@ -448,6 +549,92 @@ function candidateTestFilesForProduction(prodPath: string): string[] {
     out.push(`tests/${base}.rs`);
   }
   return Array.from(new Set(out));
+}
+
+/**
+ * C/C++ files are the ones where tree-sitter can't resolve a member call's
+ * receiver type (`obj->method()` yields just `method`), so the name-based
+ * heuristic earns its keep. Other indexed languages resolve receivers well
+ * enough that adding name-only matches would only add noise.
+ */
+const UNRESOLVED_RECEIVER_EXTS = new Set([
+  '.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.h++', '.inl', '.ino',
+]);
+function isUnresolvedReceiverLang(filePath: string): boolean {
+  const lc = filePath.toLowerCase();
+  const dot = lc.lastIndexOf('.');
+  if (dot === -1) return false;
+  return UNRESOLVED_RECEIVER_EXTS.has(lc.slice(dot));
+}
+
+/**
+ * The receiver-type-loss problem is specific to MEMBER calls (`obj->method()`):
+ * a free-function call (`foo()` / `ns::foo()`) carries its own name and resolves
+ * fine, so the name heuristic would only add noise for it. We approximate
+ * "member" as "the symbol carries an owner scope" — a qualified name with a
+ * non-empty dotted owner segment AND a leaf (`Node.add_child`, `A.B.compute`).
+ * A bare, scope-less name (`compute`) is treated as a free function and skipped,
+ * so the heuristic no longer fires on every function defined in a C/C++ file.
+ *
+ * A namespaced free function (`ns::foo` → `ns.foo`) also looks "owned" here; we
+ * accept that imprecision because (a) tree-sitter gives us no scope KIND to tell
+ * a namespace from a class, and (b) `namedCallTestSites` already excludes edges
+ * that resolved to the target, so a uniquely-named free function surfaces
+ * nothing to gate anyway.
+ */
+function isMemberLikeTarget(qualifiedName: string | null): boolean {
+  if (!qualifiedName) return false;
+  const dot = qualifiedName.lastIndexOf('.');
+  // Need a non-empty owner segment before the dot and a non-empty leaf after it.
+  return dot > 0 && dot < qualifiedName.length - 1;
+}
+
+/**
+ * Decide which test-coverage state applies.
+ *   - `preciseLinkedCount` — tests linked via a RESOLVED signal (call graph,
+ *     naming, or path convention). These justify the precise `graph-linked`.
+ *   - `heuristicCount` — name-based, type-unresolved matches only. On their own
+ *     they earn the weaker `heuristic-only`, never `graph-linked`, so the agent
+ *     doesn't mistake a name guess for proven coverage.
+ */
+function classifyTestCoverage(
+  store: Store, preciseLinkedCount: number, heuristicCount: number,
+): { testCoverageState: BehaviorTestState; testsIndexed: number; testCoverageNote: string } {
+  if (!store.hasTestRoleClassification()) {
+    return {
+      testCoverageState: 'test-indexing-unavailable',
+      testsIndexed: -1,
+      testCoverageNote: 'This index lacks file-role classification, so test files can\'t be identified. Re-index with a current Seer build to enable test evidence.',
+    };
+  }
+  const testsIndexed = store.countTestFiles();
+  if (testsIndexed === 0) {
+    return {
+      testCoverageState: 'no-indexed-tests',
+      testsIndexed,
+      testCoverageNote: 'No test files are indexed in this workspace, so no behavioral coverage can be linked.',
+    };
+  }
+  if (preciseLinkedCount > 0) {
+    return {
+      testCoverageState: 'graph-linked',
+      testsIndexed,
+      testCoverageNote: `${preciseLinkedCount} test(s) linked to this symbol via call graph, naming, or path convention.`
+        + (heuristicCount > 0 ? ` (+${heuristicCount} lower-confidence heuristic match(es).)` : ''),
+    };
+  }
+  if (heuristicCount > 0) {
+    return {
+      testCoverageState: 'heuristic-only',
+      testsIndexed,
+      testCoverageNote: `${heuristicCount} name-based heuristic match(es) only — a test calls a method of this name, but the receiver type is unresolved (typical for C/C++ member calls). Treat as a hint, not proof of coverage; confirm the receiver before relying on it.`,
+    };
+  }
+  return {
+    testCoverageState: 'tests-indexed-no-link',
+    testsIndexed,
+    testCoverageNote: `${testsIndexed} test file(s) are indexed, but none link to this symbol via call graph, naming, or path convention. Absence of a link is not proof the symbol is untested (e.g. unresolved cross-language or dynamic calls).`,
+  };
 }
 
 function recentCommitForFile(store: Store, filePath: string): number | null {

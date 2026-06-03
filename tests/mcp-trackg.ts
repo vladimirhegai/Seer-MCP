@@ -183,6 +183,16 @@ async function main(): Promise<void> {
   if ((deps.items ?? []).some((i: any) => i.qualifiedName === 'chargeHandler'))
     ok('processPayment reaches chargeHandler');
   else bad('chargeHandler not in reached set', deps.items);
+  if ((deps.returned ?? 0) <= (deps.limit ?? 25))
+    ok('trace_service_dependencies returns a bounded preview');
+  else bad('trace_service_dependencies preview exceeded limit', deps);
+
+  const depsSummary = await callTool('seer_trace_service_dependencies', {
+    from: 'processPayment', maxDepth: 4, maxNodes: 50, summaryOnly: true,
+  });
+  if (depsSummary.ok && depsSummary.items === undefined && depsSummary.returned === 0)
+    ok('trace_service_dependencies summaryOnly omits raw items');
+  else bad('trace_service_dependencies summaryOnly returned item payload', depsSummary);
 
   const bounded = await callTool('seer_trace_service_dependencies', {
     from: 'processPayment', maxDepth: 4, maxNodes: 1,
@@ -203,11 +213,17 @@ async function main(): Promise<void> {
   if (modDeps.ok && Array.isArray(modDeps.items))
     ok(`trace_module_service_dependencies returned ${modDeps.items.length} items`);
   else bad('trace_module_service_dependencies failed', modDeps);
+  const modDepsSummary = await callTool('seer_trace_module_service_dependencies', {
+    moduleId: 1, maxDepth: 2, maxNodes: 10, summaryOnly: true,
+  });
+  if (modDepsSummary.ok && modDepsSummary.items === undefined && modDepsSummary.returned === 0)
+    ok('trace_module_service_dependencies summaryOnly omits raw items');
+  else bad('trace_module_service_dependencies summaryOnly returned item payload', modDepsSummary);
 
   // seer_health surfaces v9 fields
   const health = await callTool('seer_health', {});
-  if (health.schemaVersion === 10) ok('seer_health.schemaVersion = 10');
-  else bad('seer_health.schemaVersion not 9', health);
+  if (health.schemaVersion === 11) ok('seer_health.schemaVersion = 11');
+  else bad('seer_health.schemaVersion not 11', health);
 
   proc.stdin.end(); proc.kill();
   await new Promise(r => setTimeout(r, 200));

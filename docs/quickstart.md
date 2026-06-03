@@ -102,13 +102,17 @@ npx seer-mcp symbols runInit --top 5
 ## Tool Loading
 
 Seer writes client config, but the client decides how MCP tools are loaded.
+Seer marks query/navigation tools with standard MCP read-only annotations and
+marks maintenance/build tools as not read-only.
 
 - Antigravity: no eager flag. Seer keeps the setup workspace-local, pins
-  `--workspace`/`cwd`, and writes strong agent instructions.
+  `--workspace`/`cwd`, writes strong agent instructions, and advertises
+  read-only tool metadata.
 - Claude Code: Seer marks the core tools as `anthropic/alwaysLoad`; larger
   specialist tools stay discoverable on demand.
 - Codex, Cursor, VS Code, Gemini, Windsurf: Seer writes the supported MCP
-  config shape and relies on the client to expose tools after reload.
+  config shape and standard MCP tool annotations, then relies on the client to
+  expose tools after reload.
 
 ## Where Seer Stores Data
 

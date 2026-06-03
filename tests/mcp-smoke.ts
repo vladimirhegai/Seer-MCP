@@ -131,9 +131,24 @@ async function main(): Promise<void> {
     if (toolNames.includes(e)) ok(`tools/list includes ${e}`);
     else bad(`tools/list missing ${e}`, toolNames);
   }
-  const healthTool = (list.result?.tools ?? []).find((t: any) => t.name === 'seer_health');
+  const listedTools = list.result?.tools ?? [];
+  const healthTool = listedTools.find((t: any) => t.name === 'seer_health');
   if (healthTool?._meta?.['anthropic/alwaysLoad'] === true) ok('core tools advertise Claude alwaysLoad hint');
   else bad('core tools missing Claude alwaysLoad hint', healthTool);
+  if (healthTool?.annotations?.readOnlyHint === true && healthTool?.annotations?.openWorldHint === false) {
+    ok('core tools advertise standard MCP read-only annotations');
+  } else bad('core tools missing standard MCP read-only annotations', healthTool);
+  const contextTool = listedTools.find((t: any) => t.name === 'seer_context');
+  const preflightTool = listedTools.find((t: any) => t.name === 'seer_preflight');
+  if (contextTool?._meta?.['anthropic/alwaysLoad'] === true && contextTool?.annotations?.readOnlyHint === true) {
+    ok('seer_context is marked as a core read-only tool');
+  } else bad('seer_context missing core/read-only hints', contextTool);
+  if (preflightTool?._meta?.['anthropic/alwaysLoad'] === true && preflightTool?.annotations?.readOnlyHint === true) {
+    ok('seer_preflight is marked as a core read-only tool');
+  } else bad('seer_preflight missing core/read-only hints', preflightTool);
+  const reindexTool = listedTools.find((t: any) => t.name === 'seer_reindex');
+  if (reindexTool?.annotations?.readOnlyHint === false) ok('maintenance tools are not advertised as read-only');
+  else bad('maintenance tool read-only annotation wrong', reindexTool);
 
   // seer_health
   const health = await call('tools/call', { name: 'seer_health', arguments: {} });

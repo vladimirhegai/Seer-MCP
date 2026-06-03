@@ -108,6 +108,17 @@ export interface PreflightResult {
   serviceImpact: PreflightServiceImpact;
   contractChanges?: ContractDiff;
   history: PreflightHistoryRow[];
+  /**
+   * Whether the per-symbol git history index exists. When `built` is false an
+   * empty `history` means "history not indexed", NOT "no commits touched these
+   * symbols" — surface that distinction rather than implying a clean slate.
+   */
+  historyIndex: {
+    built: boolean;
+    rows: number;
+    lastHistoryHeadSha: string | null;
+    lastHistoryAt: number | null;
+  };
   warnings: string[];
   module: { id: number; label: string } | null;
   /** v10 — boundaries the touched symbol(s) live in or cross into. */
@@ -168,6 +179,7 @@ export async function preflight(
     likelyTests: [],
     serviceImpact: { inbound: [], outbound: [] },
     history: [],
+    historyIndex: store.getHistoryIndexInfo(),
     warnings: ['no input provided'],
     module: null,
     boundaries: { primary: null, crossed: [] },
@@ -199,6 +211,7 @@ function preflightForSymbol(
       likelyTests: [],
       serviceImpact: { inbound: [], outbound: [] },
       history: [],
+      historyIndex: store.getHistoryIndexInfo(),
       warnings: [`symbol "${options.symbol}" not found in index`],
       module: null,
       boundaries: { primary: null, crossed: [] },
@@ -256,6 +269,7 @@ function preflightForSymbol(
     likelyTests,
     serviceImpact,
     history,
+    historyIndex: ctx.historyIndex,
     warnings,
     module: ctx.module,
     boundaries: {
@@ -280,6 +294,7 @@ async function preflightForRange(
       likelyTests: [],
       serviceImpact: { inbound: [], outbound: [] },
       history: [],
+      historyIndex: store.getHistoryIndexInfo(),
       warnings: ['missing workspace path for range preflight'],
       module: null,
       boundaries: { primary: null, crossed: [] },
@@ -308,6 +323,7 @@ async function preflightForRange(
       likelyTests: [],
       serviceImpact: { inbound: [], outbound: [] },
       history: [],
+      historyIndex: store.getHistoryIndexInfo(),
       warnings: ['no symbol-bearing changes detected in range'],
       module: null,
       boundaries: { primary: null, crossed: [] },
@@ -440,6 +456,7 @@ async function preflightForRange(
     serviceImpact,
     contractChanges,
     history: dedupedHistory,
+    historyIndex: store.getHistoryIndexInfo(),
     warnings,
     module: moduleRow,
     boundaries: {

@@ -391,6 +391,153 @@ export async function fileDiffInfo(
 }
 
 /**
+ * A commit that touched a file, with its diff hunks parsed inline. Produced by
+ * the combined `git log -p` walk (one subprocess per file) — the performant
+ * replacement for the old `commitsForFile()` + per-commit `fileDiffInfo()`
+ * pair that spawned ~F*C `git show` processes.
+ *
+ * No `pathAtCommit`: with `--follow -p` the patch is emitted inline at the
+ * correct historical path, so there is no second lookup to disambiguate. Pure
+ * renames (no content change) yield `hunks: []`, `isFileAddition: false`.
+ * This intentionally differs from the old two-step path, whose
+ * `git show -U0 <sha> -- <newPath>` lookup could mis-see a pure rename as a
+ * file addition because the pathspec hides the source side of the rename.
+ */
+export interface CommitWithDiff {
+  sha: string;
+  authorName: string | null;
+  authorEmail: string | null;
+  committedAt: number; // unix seconds
+  message: string;
+  hunks: DiffHunk[];
+  isFileAddition: boolean;
+}
+
+/**
+ * Walk a single file's history AND its diffs in one subprocess.
+ *
+ * `git log --follow -U0 -p` emits, per commit: the `__C__` header line, the
+ * message body (terminated by `__BODY_END__`), then the unified diff for the
+ * followed path. We deliberately DO NOT pass `--name-status`: combined with a
+ * custom `--pretty=format:` and `-p`, git emits the name-status summary and
+ * SUPPRESSES the patch (verified empirically), which would silently drop every
+ * hunk. `--follow` already threads the diff through renames, so the per-commit
+ * path the old code resolved from `--name-status` is no longer needed.
+ *
+ * Spawns drop from `F*C` (one `git show` per file-commit pair) to `F` (one walk
+ * per file) while preserving per-file `--follow` rename precision.
+ *
+ * `assumeRepo` lets a caller that already validated the repo skip the redundant
+ * blocking `isGitRepo()` spawn on every call.
+ */
+export async function commitsWithDiffsForFile(
+  repoRoot: string,
+  filePath: string,
+  options: {
+    limit?: number; since?: number; timeoutMs?: number;
+    onTimeout?: (command: string) => void; assumeRepo?: boolean;
+  } = {},
+): Promise<CommitWithDiff[]> {
+  if (!options.assumeRepo && !isGitRepo(repoRoot)) return [];
+  const rel = path.relative(repoRoot, filePath);
+  const args = ['-C', repoRoot, 'log',
+    '--pretty=format:__C__%H%x09%an%x09%ae%x09%aI%n%B%n__BODY_END__',
+    '--no-merges',
+    '--follow',
+    '-U0',
+    '-p',
+  ];
+  if (options.limit) args.push(`-n${options.limit}`);
+  if (options.since) args.push(`--since=${new Date(options.since * 1000).toISOString()}`);
+  args.push('--', rel);
+
+  return new Promise((resolve) => {
+    let timedOut = false;
+    const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.(`git log -p --follow -- ${rel}`);
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
+    let buf = '';
+    proc.stdout.on('data', (c: Buffer) => { buf += c.toString('utf8'); });
+    proc.stderr.on('data', () => { /* */ });
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve([]);
+    });
+    proc.on('close', () => {
+      clearTimeout(timer);
+      resolve(timedOut ? [] : parseFollowLogWithPatches(buf));
+    });
+  });
+}
+
+/**
+ * Parse the `git log --follow -U0 -p` stream (same `__C__` / `__BODY_END__`
+ * envelope as parseFollowLog) into one CommitWithDiff per `__C__` header.
+ *
+ * A commit record is emitted when the NEXT `__C__` header or EOF is reached —
+ * not at `__BODY_END__` — because the diff hunks follow the body terminator.
+ * Within a commit's diff section we scan for `@@` hunk headers and the
+ * file-addition markers (`new file mode` / `--- /dev/null`). Diff content lines
+ * are `+`/`-`-prefixed under `-U0`, so a `^@@`/`^---`/`^new file` match can only
+ * be a real diff header, never source content — and a literal `__C__` inside a
+ * commit message is consumed as body text before `__BODY_END__`, so it can
+ * never be mistaken for a header. Exposed for tests.
+ */
+export function parseFollowLogWithPatches(buf: string): CommitWithDiff[] {
+  const out: CommitWithDiff[] = [];
+  const lines = buf.replace(/\r\n/g, '\n').split('\n');
+  const hunkRe = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+  let i = 0;
+  while (i < lines.length) {
+    if (!lines[i].startsWith('__C__')) { i++; continue; }
+    const headerParts = lines[i].slice('__C__'.length).split('\t');
+    if (headerParts.length < 4) { i++; continue; }
+    const [sha, author, email, dateStr] = headerParts;
+    const committedAt = Math.floor(Date.parse(dateStr) / 1000);
+    if (!sha || isNaN(committedAt)) { i++; continue; }
+    // Message body, terminated by __BODY_END__.
+    i++;
+    const msgLines: string[] = [];
+    while (i < lines.length && lines[i] !== '__BODY_END__') {
+      msgLines.push(lines[i]);
+      i++;
+    }
+    if (i < lines.length) i++; // skip __BODY_END__
+    // Diff section, until the next __C__ header or EOF.
+    const hunks: DiffHunk[] = [];
+    let isFileAddition = false;
+    while (i < lines.length && !lines[i].startsWith('__C__')) {
+      const ln = lines[i];
+      const m = hunkRe.exec(ln);
+      if (m) {
+        hunks.push({
+          oldStart: parseInt(m[1], 10),
+          oldLines: m[2] ? parseInt(m[2], 10) : 1,
+          newStart: parseInt(m[3], 10),
+          newLines: m[4] ? parseInt(m[4], 10) : 1,
+        });
+      } else if (ln === '--- /dev/null' || ln.startsWith('new file mode')) {
+        isFileAddition = true;
+      }
+      i++;
+    }
+    out.push({
+      sha,
+      authorName: author || null,
+      authorEmail: email || null,
+      committedAt,
+      message: msgLines.join('\n').trimEnd(),
+      hunks,
+      isFileAddition,
+    });
+  }
+  return out;
+}
+
+/**
  * Diff numstat for one commit: returns added/removed line counts per file
  * (or aggregated when filePath is given).
  */

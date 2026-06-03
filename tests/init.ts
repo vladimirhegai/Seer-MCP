@@ -11,7 +11,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { runInit, runUpdate, ClientId } from '../src/cli/init';
+import { runInit, runUpdate, detectAutoClients, ClientId } from '../src/cli/init';
 
 let passed = 0;
 let failed = 0;
@@ -34,6 +34,17 @@ function antigravitySeerEntry(config: any): { key: string; entry: any } {
   const root = config.mcpServers ?? {};
   const key = Object.keys(root).find((k) => /^seer[_-]/.test(k) || k === 'seer') ?? '';
   return { key, entry: key ? root[key] : undefined };
+}
+
+function withEnv(name: string, value: string, fn: () => void): void {
+  const old = process.env[name];
+  process.env[name] = value;
+  try {
+    fn();
+  } finally {
+    if (old === undefined) delete process.env[name];
+    else process.env[name] = old;
+  }
 }
 
 function main(): void {
@@ -113,6 +124,25 @@ function main(): void {
     check(preview.entry.cwd === ws, '6b.antigravity dry-run entry includes cwd', preview.entry);
     check(!fs.existsSync(path.join(ws, '.agents', 'mcp_config.json')),
       '6b.--print does not write antigravity workspace config');
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('antigravity-auto');
+    withEnv('VSCODE_CWD', path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'Antigravity IDE'), () => {
+      const autoClients = detectAutoClients(ws);
+      check(autoClients.length === 1 && autoClients[0] === 'antigravity',
+        '6e.--auto in Antigravity selects only antigravity', autoClients);
+
+      const r = runInit({ workspace: ws, auto: true, print: true });
+      const files = r.entries.map((e) => e.file.replace(/\\/g, '/'));
+      check(files.some((f) => f.endsWith('/.agents/mcp_config.json')),
+        '6e.antigravity --auto plans workspace config', files);
+      check(!files.some((f) => f.endsWith('/.cursor/mcp.json')),
+        '6e.antigravity --auto does not plan Cursor config', files);
+      check(!files.some((f) => f.endsWith('/.vscode/mcp.json')),
+        '6e.antigravity --auto does not plan VS Code config', files);
+    });
     fs.rmSync(ws, { recursive: true, force: true });
   }
 

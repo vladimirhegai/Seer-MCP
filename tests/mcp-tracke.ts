@@ -117,6 +117,8 @@ async function main(): Promise<void> {
   const members = await callTool('seer_module_members', { id: authModule.id });
   if (members.files?.total >= 2) ok(`seer_module_members(auth) files=${members.files.total}`);
   else bad('auth module has < 2 files', members);
+  if (typeof members.files?.returned === 'number') ok('seer_module_members reports returned file count');
+  else bad('seer_module_members missing returned file count', members.files);
   if (members.topSymbols?.items?.some((s: any) => s.name === 'AuthService'))
     ok('seer_module_members topSymbols includes AuthService');
   else bad('no AuthService in topSymbols', members.topSymbols);
@@ -154,12 +156,24 @@ async function main(): Promise<void> {
   if (fdep.items?.some((c: any) => c.relPath?.includes('auth/AuthService')))
     ok('seer_trace_file_dependencies reaches auth/AuthService.ts');
   else bad('file closure missing auth', fdep);
+  if ((fdep.returned ?? 0) <= (fdep.limit ?? 50)) ok('seer_trace_file_dependencies returns a bounded preview');
+  else bad('seer_trace_file_dependencies preview exceeded limit', fdep);
+  const fdepSummary = await callTool('seer_trace_file_dependencies', {
+    file: 'billing/Billing.ts', maxDepth: 3, summaryOnly: true,
+  });
+  if (fdepSummary.totalReachable >= 1 && fdepSummary.items === undefined) ok('seer_trace_file_dependencies summaryOnly omits raw items');
+  else bad('seer_trace_file_dependencies summaryOnly returned item payload', fdepSummary);
 
   // seer_trace_module_dependencies — billing → auth
   const mdep = await callTool('seer_trace_module_dependencies', { label: 'billing', direction: 'out' });
   if (mdep.items?.some((m: any) => m.label === 'auth'))
     ok('seer_trace_module_dependencies(billing, out) reaches auth');
   else bad('module trace missing auth', mdep);
+  const mdepPaged = await callTool('seer_trace_module_dependencies', {
+    label: 'billing', direction: 'out', limit: 1,
+  });
+  if ((mdepPaged.returned ?? 0) <= 1) ok('seer_trace_module_dependencies paginates with limit');
+  else bad('seer_trace_module_dependencies ignored limit', mdepPaged);
 
   // seer_trace_callers — validateCredentials has transitive callers
   const trc = await callTool('seer_trace_callers', { symbol: 'validateCredentials', maxDepth: 4 });
@@ -203,6 +217,10 @@ async function main(): Promise<void> {
   else bad('seer_context callers empty', ctx.callers);
   if (Array.isArray(ctx.behavior?.preview)) ok('seer_context.behavior present');
   else bad('seer_context behavior missing', ctx.behavior);
+  if (typeof ctx.routesTotal === 'number' && Array.isArray(ctx.routes)) ok('seer_context exposes route total + preview');
+  else bad('seer_context route preview metadata missing', ctx);
+  if (typeof ctx.configKeysTotal === 'number' && Array.isArray(ctx.configKeys)) ok('seer_context exposes config-key total + preview');
+  else bad('seer_context config-key preview metadata missing', ctx);
   if (Array.isArray(ctx.risk?.signalContributions)) ok('seer_context.risk.signalContributions present');
   else bad('seer_context risk missing', ctx.risk);
   if (Array.isArray(ctx.blastRadius?.topAffected)) ok('seer_context.blastRadius present');

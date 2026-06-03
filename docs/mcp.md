@@ -91,13 +91,15 @@ If you skip this, Seer builds `<repo>/.seer/graph.db` on the first MCP query.
 ## Tool Loading
 
 MCP clients decide whether tools are visible immediately or discovered on
-demand. Seer does not write undocumented eager flags.
+demand. Seer marks query/navigation tools with standard MCP read-only
+annotations, marks maintenance/build tools as not read-only, and does not write
+undocumented eager flags.
 
 | Client | Seer behavior |
 |---|---|
-| Antigravity IDE / CLI | No eager flag. Seer uses workspace-local config, `--workspace`, `cwd`, repo-specific server ids, and agent instructions. |
+| Antigravity IDE / CLI | No eager flag. Seer uses workspace-local config, `--workspace`, `cwd`, repo-specific server ids, agent instructions, and MCP read-only annotations. |
 | Claude Code CLI | Seer marks core tools with `_meta["anthropic/alwaysLoad"]`; large/specialist tools remain on demand. |
-| Codex CLI / extension | Seer writes supported MCP config. No verified eager/always-load setting. |
+| Codex CLI / extension | Seer writes supported MCP config and standard MCP read-only annotations. No verified Codex eager/always-load setting. |
 | Cursor / VS Code / Gemini / Windsurf | Seer writes supported MCP config. Use client allow/disable controls if available. |
 
 ## History Tools

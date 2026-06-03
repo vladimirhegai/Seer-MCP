@@ -248,6 +248,30 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
   },
 };
 
+const ANTIGRAVITY_ENV_KEYS = [
+  'ANTIGRAVITY',
+  'ANTIGRAVITY_IDE',
+  'GOOGLE_ANTIGRAVITY',
+  'VSCODE_CWD',
+  'VSCODE_CODE_CACHE_PATH',
+  'VSCODE_USER_DATA_DIR',
+];
+
+function envLooksLikeAntigravity(): boolean {
+  return ANTIGRAVITY_ENV_KEYS.some((key) =>
+    typeof process.env[key] === 'string' && /antigravity/i.test(process.env[key] ?? ''),
+  );
+}
+
+function workspaceHasAntigravityConfig(workspace: string): boolean {
+  const projectPath = CLIENTS.antigravity.projectPath;
+  return projectPath ? fs.existsSync(targetPath(workspace, projectPath)) : false;
+}
+
+function isAntigravityInstall(workspace: string): boolean {
+  return envLooksLikeAntigravity() || workspaceHasAntigravityConfig(workspace);
+}
+
 interface TargetSpec {
   file: string;
   isGlobal: boolean;
@@ -322,6 +346,7 @@ function clientTargets(client: ClientId, workspace: string, scope: 'init' | 'all
 }
 
 export function detectAutoClients(_workspace: string): ClientId[] {
+  if (isAntigravityInstall(_workspace)) return ['antigravity'];
   const selected = new Set<ClientId>(DEFAULT_CLIENTS);
   // `--auto` is intentionally workspace-local. Do not add user-level-only
   // clients here; they can shadow other repos and need explicit opt-in.

@@ -3,7 +3,7 @@ import { DatabaseSync, StatementSync } from 'node:sqlite';
 import { CURRENT_SCHEMA_VERSION, SCHEMA_SQL } from './schema.js';
 import type {
   SymbolDef, SymbolKind, SymbolRole, SymbolRow, CallerRow, CalleeRow, StatsRow,
-  RouteRow, ExternalDepRow, ConfigKeyRow, FileChurnRow, SymbolHistoryRow,
+  RouteRow, ExternalDepRow, ConfigKeyRow, FileChurnRow, SymbolHistoryRow, SymbolHistoryInsert,
 } from '../types.js';
 
 /**
@@ -253,6 +253,7 @@ export class Store {
   private stmtInsertFilesFts!: StatementSync;
   private stmtDeleteSymbolsFtsForFile!: StatementSync;
   private stmtDeleteFilesFtsForFile!: StatementSync;
+  private stmtInsertSymbolHistory!: StatementSync;
 
   constructor(dbPath: string, options: StoreOptions = {}) {
     this.readonly = Boolean(options.readonly);
@@ -658,6 +659,23 @@ export class Store {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_calls_external_bundle ON service_calls(external_bundle_id) WHERE external_bundle_id IS NOT NULL');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_service_links_external_bundle ON service_links(external_bundle_id) WHERE external_bundle_id IS NOT NULL');
 
+    // v11: per-file resume watermark for the symbol-history build. CREATE TABLE
+    // IF NOT EXISTS is the migration; absence on an older DB just means the next
+    // build starts with no resume info (it writes watermarks as it goes).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS symbol_history_progress (
+        repo_root            TEXT    NOT NULL,
+        file_path            TEXT    NOT NULL,
+        file_hash            TEXT    NOT NULL,
+        options_fingerprint  TEXT    NOT NULL,
+        algorithm_version    INTEGER NOT NULL DEFAULT 1,
+        head_sha             TEXT,
+        rows_inserted        INTEGER NOT NULL DEFAULT 0,
+        processed_at         INTEGER NOT NULL,
+        PRIMARY KEY (repo_root, file_path)
+      );
+    `);
+
     // v4 backfill — required because upsertFileWithCache() short-circuits on
     // unchanged content hash, so a v3 DB upgraded to v4 would never get
     // symbol_key populated (nor FTS rebuilt) for any file whose source hadn't
@@ -835,6 +853,13 @@ export class Store {
     this.stmtDeleteFilesFtsForFile = this.db.prepare(
       'DELETE FROM files_fts WHERE rowid = ?',
     );
+
+    this.stmtInsertSymbolHistory = this.db.prepare(`
+      INSERT OR IGNORE INTO symbol_history
+        (symbol_id, symbol_key, commit_sha, author_name, author_email, committed_at, message,
+         lines_added, lines_removed, pr_number, pr_url, match_strategy, confidence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
   }
 
   // ── Write operations ────────────────────────────────────────────────────────
@@ -1375,6 +1400,11 @@ export class Store {
 
   findCallers(symbolName: string, limit?: number): CallerRow[] {
     const hasLimit = typeof limit === 'number' && limit > 0;
+    // Match any spelling variant of the callee name (`Node::add_child` →
+    // `Node.add_child`). A `::`-free name produces one variant so `IN (?)`
+    // behaves exactly like the previous `= ?`.
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
     const sql = hasLimit
       ? `
         SELECT
@@ -1387,7 +1417,7 @@ export class Store {
         FROM edges e
         JOIN symbols s ON s.id = e.from_id
         JOIN files   f ON f.id = s.file_id
-        WHERE e.to_name = ? AND e.kind = 'call'
+        WHERE e.to_name IN (${inPh}) AND e.kind = 'call'
         LIMIT ?
       `
       : `
@@ -1401,13 +1431,13 @@ export class Store {
         FROM edges e
         JOIN symbols s ON s.id = e.from_id
         JOIN files   f ON f.id = s.file_id
-        WHERE e.to_name = ? AND e.kind = 'call'
+        WHERE e.to_name IN (${inPh}) AND e.kind = 'call'
         ORDER BY f.path, e.line
       `;
     const stmt = this.db.prepare(sql);
     const rows = (hasLimit
-      ? stmt.all(symbolName, limit)
-      : stmt.all(symbolName)) as Row[];
+      ? stmt.all(...variants, limit)
+      : stmt.all(...variants)) as Row[];
 
     const out = rows.map(r => ({
       callerName: toStr(r.callerName),
@@ -1429,9 +1459,11 @@ export class Store {
   }
 
   countCallers(symbolName: string): number {
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
     const row = this.db.prepare(
-      "SELECT COUNT(*) AS c FROM edges WHERE to_name = ? AND kind = 'call'",
-    ).get(symbolName) as Row;
+      `SELECT COUNT(*) AS c FROM edges WHERE to_name IN (${inPh}) AND kind = 'call'`,
+    ).get(...variants) as Row;
     return toNum(row.c);
   }
 
@@ -1531,6 +1563,13 @@ export class Store {
   }
 
   findCallees(symbolName: string): CalleeRow[] {
+    // Name-keyed fallback (the id-keyed `findCalleesById` is preferred when a
+    // definition resolves). Also match `qualified_name` so a qualified caller
+    // like `Node.add_child` works — the short-name-only predicate silently
+    // returned nothing for those. Variants fold `Node::add_child` → the stored
+    // `Node.add_child`; a `::`-free short name keeps the prior behavior.
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
     const rows = this.db.prepare(`
       SELECT
         e.to_name        AS calleeName,
@@ -1542,9 +1581,9 @@ export class Store {
       JOIN symbols s  ON s.id  = e.from_id
       LEFT JOIN symbols s2 ON s2.id = e.to_id
       LEFT JOIN files   f2 ON f2.id = s2.file_id
-      WHERE s.name = ? AND e.kind = 'call'
+      WHERE (s.name IN (${inPh}) OR s.qualified_name IN (${inPh})) AND e.kind = 'call'
       ORDER BY e.line
-    `).all(symbolName) as Row[];
+    `).all(...variants, ...variants) as Row[];
 
     return rows.map(r => ({
       calleeName: toStr(r.calleeName),
@@ -1574,14 +1613,21 @@ export class Store {
   findSymbols(name: string, options: SymbolSearchOptions = {}): SymbolRow[] {
     const limit = Math.max(1, options.limit ?? 50);
     const filter = this.filterClauseFromOptions(options);
+    // OR each spelling variant so a `Node::add_child` query also LIKE-matches
+    // the stored `Node.add_child`. A `::`-free name yields one variant, keeping
+    // the SQL identical to the previous single-pair form.
+    const variants = symbolNameVariants(name);
+    const likeClause = variants.map(() => '(s.name LIKE ? OR s.qualified_name LIKE ?)').join(' OR ');
+    const likeArgs: string[] = [];
+    for (const v of variants) likeArgs.push(`%${v}%`, `%${v}%`);
     const rows = this.db.prepare(`
       SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
-      WHERE (s.name LIKE ? OR s.qualified_name LIKE ?)
+      WHERE (${likeClause})
         ${filter}
       ORDER BY s.pagerank DESC
       LIMIT ?
-    `).all(`%${name}%`, `%${name}%`, limit) as Row[];
+    `).all(...likeArgs, limit) as Row[];
 
     return rows.map(toSymbolRow);
   }
@@ -1695,16 +1741,21 @@ export class Store {
       fileClause = 'AND (f.path = ? OR f.rel_path = ? OR f.rel_path LIKE ? ESCAPE \'\\\')';
       fileArgs = [fp, norm, suffix];
     }
+    // Match any spelling variant (e.g. `Node::add_child` also matches the stored
+    // `Node.add_child`). For a `::`-free name this is a single value, so the
+    // `IN (?)` collapses to the previous `= ?` semantics exactly.
+    const variants = symbolNameVariants(name);
+    const ph = variants.map(() => '?').join(', ');
     const stmt = this.db.prepare(`
       SELECT ${symbolSelectCols(this.hasComplexityColumns, this.hasSymbolRoleColumn)}
       FROM symbols s JOIN files f ON f.id = s.file_id
-      WHERE (s.name = ? OR s.qualified_name = ?)
+      WHERE (s.name IN (${ph}) OR s.qualified_name IN (${ph}))
         ${filter}
         ${fileClause}
       ORDER BY s.pagerank DESC
       LIMIT 50
     `);
-    const rows = stmt.all(name, name, ...fileArgs) as Row[];
+    const rows = stmt.all(...variants, ...variants, ...fileArgs) as Row[];
 
     return rows.map(toSymbolRow);
   }
@@ -1720,11 +1771,17 @@ export class Store {
 
   countSymbols(name: string, options: SymbolSearchOptions = {}): number {
     const filter = this.filterClauseFromOptions(options);
+    // Mirror findSymbols' variant matching so the search-tool total never
+    // disagrees with the rows it counts for a `::`-bearing query.
+    const variants = symbolNameVariants(name);
+    const likeClause = variants.map(() => '(s.name LIKE ? OR s.qualified_name LIKE ?)').join(' OR ');
+    const likeArgs: string[] = [];
+    for (const v of variants) likeArgs.push(`%${v}%`, `%${v}%`);
     const row = this.db.prepare(`
       SELECT COUNT(*) AS c
       FROM symbols s JOIN files f ON f.id = s.file_id
-      WHERE (s.name LIKE ? OR s.qualified_name LIKE ?) ${filter}
-    `).get(`%${name}%`, `%${name}%`) as Row;
+      WHERE (${likeClause}) ${filter}
+    `).get(...likeArgs) as Row;
     return toNum(row.c);
   }
 
@@ -2943,13 +3000,43 @@ export class Store {
     prNumber: number | null, prUrl: string | null,
     matchStrategy: string, confidence: number,
   ): void {
-    this.db.prepare(`
-      INSERT OR IGNORE INTO symbol_history
-        (symbol_id, symbol_key, commit_sha, author_name, author_email, committed_at, message,
-         lines_added, lines_removed, pr_number, pr_url, match_strategy, confidence)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(symbolId, symbolKey, commitSha, authorName, authorEmail, committedAt, message,
-           linesAdded, linesRemoved, prNumber, prUrl, matchStrategy, confidence);
+    // Cached prepared statement (see prepare()) — no per-row recompile.
+    this.stmtInsertSymbolHistory.run(
+      symbolId, symbolKey, commitSha, authorName, authorEmail, committedAt, message,
+      linesAdded, linesRemoved, prNumber, prUrl, matchStrategy, confidence);
+  }
+
+  /**
+   * Batched, transactional symbol-history insert. One cached prepared statement
+   * reused across the batch, wrapped in a single transaction. Built for the
+   * per-file row batches the history indexer produces: it turns each file's
+   * writes from N autocommits into one commit.
+   *
+   * `INSERT OR IGNORE` against `UNIQUE(symbol_id, commit_sha)` keeps it
+   * idempotent — re-running a file (resume, overlapping budgets) never
+   * duplicates. Returns the number of rows ACTUALLY inserted (SQLite `changes`
+   * is 0 for an ignored row), which the caller uses for honest progress/result
+   * counts rather than counting attempts.
+   */
+  insertSymbolHistoryBatch(rows: SymbolHistoryInsert[]): number {
+    if (rows.length === 0) return 0;
+    const stmt = this.stmtInsertSymbolHistory;
+    let inserted = 0;
+    this.db.exec('BEGIN');
+    try {
+      for (const r of rows) {
+        const res = stmt.run(
+          r.symbolId, r.symbolKey, r.commitSha, r.authorName, r.authorEmail,
+          r.committedAt, r.message, r.linesAdded, r.linesRemoved,
+          r.prNumber, r.prUrl, r.matchStrategy, r.confidence);
+        if (Number(res.changes) > 0) inserted++;
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return inserted;
   }
 
   getSymbolHistory(symbolId: number, options: { limit?: number; since?: number } = {}): SymbolHistoryRow[] {
@@ -3082,11 +3169,13 @@ export class Store {
     return rows.map(toSymbolRow);
   }
 
-  /** Iterate over (id, file_id, line_start, line_end, symbol_key) — used by
-   *  the symbol-history indexer to map historical line ranges to current ids. */
-  listSymbolsForHistoryIndex(): Array<{ id: number; fileId: number; filePath: string; relPath: string; lineStart: number; lineEnd: number; symbolKey: string }> {
+  /** Iterate over (id, file_id, line_start, line_end, symbol_key, file hash) —
+   *  used by the symbol-history indexer to map historical line ranges to current
+   *  ids and to key the per-file resume watermark on file content. */
+  listSymbolsForHistoryIndex(): Array<{ id: number; fileId: number; filePath: string; relPath: string; fileHash: string; lineStart: number; lineEnd: number; symbolKey: string }> {
     const rows = this.db.prepare(`
       SELECT s.id, s.file_id AS fileId, f.path AS filePath, f.rel_path AS relPath,
+             f.hash AS fileHash,
              s.line_start AS lineStart, s.line_end AS lineEnd, s.symbol_key AS symbolKey
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE s.symbol_key IS NOT NULL
@@ -3095,9 +3184,71 @@ export class Store {
     return rows.map(r => ({
       id: toNum(r.id), fileId: toNum(r.fileId),
       filePath: toStr(r.filePath), relPath: toStr(r.relPath),
+      fileHash: toStr(r.fileHash),
       lineStart: toNum(r.lineStart), lineEnd: toNum(r.lineEnd),
       symbolKey: toStr(r.symbolKey),
     }));
+  }
+
+  // ── Symbol-history resume watermarks (v11) ──────────────────────────────────
+
+  /**
+   * Load every per-file resume watermark for a repo into a Map keyed by
+   * file_path. The history build consults this once up front to decide which
+   * files it can safely skip. See the symbol_history_progress schema comment
+   * for why file_hash + options_fingerprint + algorithm_version (NOT head_sha)
+   * is the correctness key.
+   */
+  getSymbolHistoryWatermarks(
+    repoRoot: string,
+  ): Map<string, { fileHash: string; optionsFingerprint: string; algorithmVersion: number; headSha: string | null }> {
+    const out = new Map<string, { fileHash: string; optionsFingerprint: string; algorithmVersion: number; headSha: string | null }>();
+    if (!this.hasColumn('symbol_history_progress', 'file_hash')) return out;
+    const rows = this.db.prepare(`
+      SELECT file_path AS filePath, file_hash AS fileHash,
+             options_fingerprint AS optionsFingerprint,
+             algorithm_version AS algorithmVersion, head_sha AS headSha
+      FROM symbol_history_progress WHERE repo_root = ?
+    `).all(repoRoot) as Row[];
+    for (const r of rows) {
+      out.set(toStr(r.filePath), {
+        fileHash: toStr(r.fileHash),
+        optionsFingerprint: toStr(r.optionsFingerprint),
+        algorithmVersion: toNum(r.algorithmVersion),
+        headSha: toNullStr(r.headSha),
+      });
+    }
+    return out;
+  }
+
+  /** Upsert one file's resume watermark after its history rows have been
+   *  committed. Keyed (repo_root, file_path) so re-processing overwrites. */
+  upsertSymbolHistoryWatermark(
+    repoRoot: string, filePath: string, fileHash: string,
+    optionsFingerprint: string, algorithmVersion: number,
+    headSha: string | null, rowsInserted: number,
+  ): void {
+    this.db.prepare(`
+      INSERT INTO symbol_history_progress
+        (repo_root, file_path, file_hash, options_fingerprint, algorithm_version,
+         head_sha, rows_inserted, processed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(repo_root, file_path) DO UPDATE SET
+        file_hash           = excluded.file_hash,
+        options_fingerprint = excluded.options_fingerprint,
+        algorithm_version   = excluded.algorithm_version,
+        head_sha            = excluded.head_sha,
+        rows_inserted       = excluded.rows_inserted,
+        processed_at        = excluded.processed_at
+    `).run(repoRoot, filePath, fileHash, optionsFingerprint, algorithmVersion,
+           headSha, rowsInserted, Date.now());
+  }
+
+  /** Drop all resume watermarks for a repo — used by a forced full rebuild so
+   *  the next run reprocesses every file from scratch. */
+  clearSymbolHistoryWatermarks(repoRoot: string): void {
+    if (!this.hasColumn('symbol_history_progress', 'file_hash')) return;
+    this.db.prepare('DELETE FROM symbol_history_progress WHERE repo_root = ?').run(repoRoot);
   }
 
   // ── PageRank helpers ────────────────────────────────────────────────────────
@@ -3706,6 +3857,106 @@ export class Store {
   }
 
   /**
+   * HEURISTIC, name-based test sites for a method's short name.
+   *
+   * C/C++ member calls (`node->add_child(child)`) carry only the method's short
+   * name in the call edge — tree-sitter can't infer the receiver's static type,
+   * so the edge never resolves to the specific `Node.add_child` id and the
+   * precise `directTestEdgesForId` pass misses it entirely. This returns the
+   * test-file functions that call *some* method whose name matches, excluding
+   * edges already resolved to `excludeId` (those are real direct coverage).
+   *
+   * Lower-confidence by construction: a `Tree.add_child` call matches too, so
+   * the caller MUST surface these as clearly-labeled heuristic evidence, never
+   * as resolved coverage. The precision path is a SCIP overlay that resolves
+   * the receiver type and promotes these to real `tests` edges.
+   */
+  namedCallTestSites(name: string, excludeId: number, limit = 200): Array<{
+    callerId: number; callerName: string; callerQualifiedName: string | null;
+    callerKind: string; callerFile: string; callerLineStart: number; callerLineEnd: number;
+    edgeLine: number;
+  }> {
+    if (!this.hasRoleColumns) return [];
+    const variants = symbolNameVariants(name);
+    const inPh = variants.map(() => '?').join(', ');
+    try {
+      const rows = this.db.prepare(`
+        SELECT
+          s.id             AS callerId,
+          s.name           AS callerName,
+          s.qualified_name AS callerQualifiedName,
+          s.kind           AS callerKind,
+          f.path           AS callerFile,
+          s.line_start     AS callerLineStart,
+          s.line_end       AS callerLineEnd,
+          MIN(e.line)      AS edgeLine
+        FROM edges e
+        JOIN symbols s ON s.id = e.from_id
+        JOIN files f ON f.id = s.file_id
+        WHERE e.to_name IN (${inPh}) AND e.kind = 'call' AND f.role = 'test'
+          AND s.kind IN ('function','method')
+          AND (e.to_id IS NULL OR e.to_id <> ?)
+        GROUP BY s.id
+        ORDER BY f.path, edgeLine
+        LIMIT ?
+      `).all(...variants, excludeId, limit) as Row[];
+      return rows.map(r => ({
+        callerId: toNum(r.callerId),
+        callerName: toStr(r.callerName),
+        callerQualifiedName: toNullStr(r.callerQualifiedName),
+        callerKind: toStr(r.callerKind),
+        callerFile: toStr(r.callerFile),
+        callerLineStart: toNum(r.callerLineStart),
+        callerLineEnd: toNum(r.callerLineEnd),
+        edgeLine: toNum(r.edgeLine),
+      }));
+    } catch { return []; }
+  }
+
+  /** True when the DB carries the file-role columns needed to classify tests. */
+  hasTestRoleClassification(): boolean {
+    return this.hasRoleColumns;
+  }
+
+  /** Count of files classified role='test' (0 when role columns are absent). */
+  countTestFiles(): number {
+    if (!this.hasRoleColumns) return 0;
+    try {
+      const row = this.db.prepare("SELECT COUNT(*) AS c FROM files WHERE role = 'test'").get() as Row;
+      return toNum(row.c);
+    } catch { return 0; }
+  }
+
+  /**
+   * Workspace-level "has the per-symbol git history index been built?" summary,
+   * git-HEAD-agnostic so context/preflight can surface `built` without needing
+   * the workspace path (the MCP `seer_history` status adds live-HEAD staleness
+   * on top). `built` is true when history rows exist OR the history-HEAD marker
+   * was stamped — a repo with zero qualifying commits still counts as "built,
+   * just empty", which is distinct from "never built".
+   */
+  getHistoryIndexInfo(): {
+    built: boolean; rows: number;
+    lastHistoryHeadSha: string | null; lastHistoryAt: number | null;
+  } {
+    if (!this.hasV4Tables) {
+      return { built: false, rows: 0, lastHistoryHeadSha: null, lastHistoryAt: null };
+    }
+    let rows = 0;
+    try {
+      rows = toNum((this.db.prepare('SELECT COUNT(*) AS c FROM symbol_history').get() as Row).c);
+    } catch { /* */ }
+    const state = this.getGitIndexState();
+    const builtHead = state?.lastHistoryHeadSha ?? null;
+    return {
+      built: rows > 0 || builtHead != null,
+      rows,
+      lastHistoryHeadSha: builtHead,
+      lastHistoryAt: state?.lastHistoryAt ?? null,
+    };
+  }
+
+  /**
    * Count how many distinct routes have this symbol as their resolved handler.
    * Used by seer_risk for the "route exposure" signal.
    */
@@ -4213,20 +4464,54 @@ export function makeSymbolKey(kind: string, qualifiedName: string): string {
 }
 
 /**
+ * Lookup variants for a symbol query. Seer stores qualified names dot-joined
+ * (`Node.add_child`), but agents routinely paste the source-language spelling —
+ * C++/Rust `Node::add_child`. We never rewrite what's stored; instead we expand
+ * the *query* into the equivalent spellings and match any of them.
+ *
+ * The original always comes first (so exact hits keep their order/ranking), and
+ * a query with no `::` returns a single-element array — meaning every call site
+ * stays byte-identical to the previous `= ?` / `LIKE ?` behavior unless the
+ * input actually carried a `::`.
+ *
+ * The original is added unconditionally (even when empty), so the result is
+ * never an empty array: callers build `IN (${variants.map(()=>'?')})`
+ * placeholders, and `[]` would emit a syntactically invalid `IN ()`. An empty
+ * input therefore yields `['']`, which is valid SQL that matches nothing.
+ */
+export function symbolNameVariants(name: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (v: string): void => {
+    if (!seen.has(v)) { seen.add(v); out.push(v); }
+  };
+  add(name);
+  if (name.includes('::')) add(name.replace(/::/g, '.'));
+  return out;
+}
+
+/**
  * Build an FTS5 MATCH expression from a free-text query. Strategy:
+ *   - normalize C++/Rust `::` to the dot form Seer stores
  *   - lower-case
  *   - split on whitespace and identifier punctuation
  *   - quote each non-empty token and OR them together with `*` for prefix
+ *
+ * Tokens that still carry a `:` are dropped: `splitIdentifierTokens` already
+ * emits the clean sub-tokens, and a `"node::add_child"*` phrase leans on
+ * tokenizer quirks (and can read as an FTS5 column filter) — neither belongs in
+ * the MATCH expression.
  *
  * Empty / invalid → null (the caller falls back to LIKE).
  */
 export function ftsQuery(input: string): string | null {
   if (!input) return null;
-  const tokens = splitIdentifierTokens(input)
+  const normalized = input.replace(/::/g, '.');
+  const tokens = splitIdentifierTokens(normalized)
     .split(/\s+/)
     .filter(t => t.length > 0 && /^[a-z0-9]/i.test(t))
     .map(t => t.replace(/["'*]/g, ''))
-    .filter(t => t.length > 0);
+    .filter(t => t.length > 0 && !t.includes(':'));
   if (tokens.length === 0) return null;
   return tokens.map(t => `"${t}"*`).join(' OR ');
 }

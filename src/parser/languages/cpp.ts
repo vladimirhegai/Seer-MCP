@@ -195,6 +195,18 @@ export const cppExtractor: LanguageExtractor = {
     if (funcNode.type === 'identifier') return funcNode.text;
 
     // obj.method()  or  obj->method()
+    //
+    // We emit only the method's SHORT name (`add_child`), never a qualified
+    // `Node.add_child`: tree-sitter has no type system, so the receiver's
+    // static type (`obj`'s class) is unknowable from syntax alone. The edge's
+    // `to_name` therefore can't be attributed to a specific overload, and the
+    // scope-aware resolver may bind it to any same-named method. Two
+    // deterministic compensations live downstream:
+    //   1. behavior.ts surfaces these as clearly-labeled `heuristic-name-call`
+    //      test evidence (name-based, lower confidence) so a `node->add_child()`
+    //      in a test isn't invisible to `seer_behavior`.
+    //   2. A SCIP precision overlay (provenance="scip") resolves the real
+    //      receiver type and promotes the edge to a precise, type-resolved link.
     if (funcNode.type === 'field_expression') {
       return funcNode.childForFieldName('field')?.text ?? null;
     }

@@ -101,7 +101,7 @@ async function run(): Promise<void> {
   console.log('\n── Schema v9 (v7 columns intact) ──');
   const schema = store.schemaInfo();
   assertEq(schema.current, true, 'schema is current');
-  assertEq(schema.dbVersion, 10, 'schema version is v10');
+  assertEq(schema.dbVersion, 11, 'schema version is v11');
   assertEq(store.hasV7(), true, 'hasV7() reports true');
 
   const cols = store.rawDb().prepare("PRAGMA table_info('symbols')").all() as Array<{ name: string }>;
@@ -156,7 +156,7 @@ async function run(): Promise<void> {
   const exp = await exportBundle(TMP_DB, FIXTURES, { out: bundleOut, compressionLevel: 9 });
   assert(fs.existsSync(bundleOut), 'bundle file exists on disk');
   assert(exp.bytes > 100, `bundle has meaningful size (${exp.bytes} bytes)`);
-  assertEq(exp.manifest.schemaVersion, 10, 'manifest.schemaVersion = 10');
+  assertEq(exp.manifest.schemaVersion, 11, 'manifest.schemaVersion = 11');
   assertEq(exp.manifest.bundleFormatVersion, 1, 'manifest.bundleFormatVersion = 1');
   assert(exp.manifest.source.rosterHash.length === 64, 'rosterHash is sha256-length');
   assert(exp.manifest.dbSha256.length === 64, 'dbSha256 is sha256-length');
@@ -186,7 +186,7 @@ async function run(): Promise<void> {
       'imported DB has the same symbol count as the manifest');
     assertEq(istat.edges, exp.manifest.index.edges,
       'imported DB has the same edge count as the manifest');
-    assertEq(imported.schemaInfo().dbVersion, 10, 'imported DB is schema v9');
+    assertEq(imported.schemaInfo().dbVersion, 11, 'imported DB is schema v11');
   } finally { imported.close(); }
 
   // Refuse-to-overwrite contract.
@@ -361,7 +361,7 @@ async function run(): Promise<void> {
   const restored = await importBundle(bundleOut, {
     repoRoot: FIXTURES, dbOut: idleDb,
   });
-  assertEq(restored.manifest.schemaVersion, 10, 'restored DB schema v9');
+  assertEq(restored.manifest.schemaVersion, 11, 'restored DB schema v11');
   const restoredStore = Store.openReadOnly(idleDb);
   try {
     const rstat = restoredStore.getStats();

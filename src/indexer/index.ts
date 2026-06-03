@@ -13,6 +13,7 @@ import { buildShapeHashes } from './shapehash.js';
 import { normalizeHttpTarget, resolveServiceLinks } from './serviceLinks.js';
 import { scanProtoFiles } from './protoScanner.js';
 import { scanServiceHosts } from './serviceHostScanner.js';
+import { writeProgress } from './progress.js';
 import type { Language, FileExtraction } from '../types.js';
 
 export interface IndexOptions {
@@ -1114,15 +1115,4 @@ export class Indexer {
 
 function sha256(content: string): string {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16);
-}
-
-function writeProgress(current: number, total: number, label: string): void {
-  if (!process.stdout.isTTY) return;
-  const width = 28;
-  const pct = total > 0 ? current / total : 0;
-  const filled = Math.round(pct * width);
-  const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
-  const pctStr = Math.round(pct * 100).toString().padStart(3);
-  const short = label.length > 35 ? '…' + label.slice(-34) : label.padEnd(35);
-  process.stdout.write(`\r  [${bar}] ${pctStr}% (${current}/${total}) ${short}`);
 }

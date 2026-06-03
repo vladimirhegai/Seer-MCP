@@ -99,7 +99,14 @@
 //     Hamming + signature similarity / shared file rename history) attach the
 //     historical previous_symbol_key with a confidence and a match_reasons
 //     blob. Never pretends rename continuity is certain.
-export const CURRENT_SCHEMA_VERSION = 10;
+//
+// v11 adds:
+//   - symbol_history_progress: per-file resume watermark for the symbol-history
+//     build. Lets an interrupted/budgeted build (Ctrl-C, deadline, maxFiles)
+//     resume without re-walking already-finished files, and makes a HEAD-moved
+//     rerun reprocess only the files whose content actually changed. Pure
+//     additive table; absence just means "no resume info yet".
+export const CURRENT_SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -368,6 +375,29 @@ CREATE TABLE IF NOT EXISTS git_index_state (
   algorithm_version        INTEGER NOT NULL DEFAULT 1,
   last_history_head_sha    TEXT,
   last_history_at          INTEGER
+);
+
+-- v11 symbol_history_progress — per-file resume watermark for the symbol-history
+-- build. A processed file is safely skippable on a later run ONLY when its
+-- content hash, the build's options fingerprint, AND the algorithm version all
+-- still match: those three together prove the rows would be recomputed
+-- identically. file_hash is the load-bearing key — an unchanged hash at a newer
+-- HEAD proves no commit touched the file since it was processed, so its
+-- "git log --follow" history and current symbol line ranges are unchanged. That
+-- is why a HEAD-only watermark (rejected in the perf plan) was unsafe: --max-commits,
+-- --since, a reindex, or a parser change could all leave HEAD identical while
+-- changing the correct output. head_sha is recorded for observability and the
+-- completion stamp, not used as the skip key.
+CREATE TABLE IF NOT EXISTS symbol_history_progress (
+  repo_root            TEXT    NOT NULL,
+  file_path            TEXT    NOT NULL,
+  file_hash            TEXT    NOT NULL,
+  options_fingerprint  TEXT    NOT NULL,
+  algorithm_version    INTEGER NOT NULL DEFAULT 1,
+  head_sha             TEXT,
+  rows_inserted        INTEGER NOT NULL DEFAULT 0,
+  processed_at         INTEGER NOT NULL,
+  PRIMARY KEY (repo_root, file_path)
 );
 
 -- v4 FTS5 virtual table over symbol names/qualified names + signatures.

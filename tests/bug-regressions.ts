@@ -114,7 +114,7 @@ async function bug1_v3MigrationBackfill(): Promise<void> {
   const ftsSyms = raw.prepare('SELECT COUNT(*) AS c FROM symbols_fts').get() as { c: number };
   const ftsFiles = raw.prepare('SELECT COUNT(*) AS c FROM files_fts').get() as { c: number };
 
-  assert(s.schemaInfo().dbVersion === 10, `schema migrated to v9 (got ${s.schemaInfo().dbVersion})`);
+  assert(s.schemaInfo().dbVersion === 11, `schema migrated to v11 (got ${s.schemaInfo().dbVersion})`);
   assert(nullKeys.c === 0, `symbol_key backfilled for every pre-v4 symbol (got ${nullKeys.c} NULL)`);
   assert(ftsSyms.c === 2, `symbols_fts rebuilt from existing symbols (got ${ftsSyms.c} rows, expected 2)`);
   assert(ftsFiles.c === 1, `files_fts rebuilt from existing files (got ${ftsFiles.c} rows, expected 1)`);

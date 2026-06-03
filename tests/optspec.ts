@@ -96,15 +96,26 @@ async function main(): Promise<void> {
 
   // ── tools/list advertises the new surface ──
   const list = await call('tools/list', {});
-  const tools: Array<{ name: string; description: string }> = list.result?.tools ?? [];
+  const tools: Array<{ name: string; description: string; annotations?: any; _meta?: any }> = list.result?.tools ?? [];
   const names = tools.map(t => t.name);
   for (const n of ['seer_skeleton', 'seer_trace', 'seer_batch']) {
     check(names.includes(n), `tools/list advertises ${n}`, names);
+  }
+  for (const n of ['seer_context', 'seer_preflight', 'seer_trace', 'seer_batch']) {
+    const t = tools.find(tool => tool.name === n);
+    check(t?.annotations?.readOnlyHint === true && t?._meta?.['anthropic/alwaysLoad'] === true,
+      `${n} advertises core read-only MCP hints`, t);
   }
   // §5a: build tools rebranded as advanced
   for (const n of ['seer_modules_build', 'seer_shape_hash_build', 'seer_symbol_history_build']) {
     const d = tools.find(t => t.name === n)?.description ?? '';
     check(/advanced/i.test(d), `${n} description marked advanced/automatic`, d);
+    check(tools.find(t => t.name === n)?.annotations?.readOnlyHint === false,
+      `${n} is not advertised as read-only`, tools.find(t => t.name === n));
+  }
+  for (const n of ['seer_modules', 'seer_duplicates', 'seer_continuity']) {
+    check(tools.find(t => t.name === n)?.annotations?.readOnlyHint === false,
+      `${n} can auto-build derived indexes and is not advertised as read-only`, tools.find(t => t.name === n));
   }
 
   // ── §3 seer_skeleton ──────────────────────────────────────────────────
@@ -186,6 +197,12 @@ async function main(): Promise<void> {
   const batchUnknown = await callTool('seer_batch', { calls: [{ tool: 'seer_nonexistent', args: {} }] });
   check(batchUnknown.results[0].ok === false && /unknown/i.test(batchUnknown.results[0].error),
     'seer_batch reports unknown tool without aborting', batchUnknown.results[0]);
+  const batchMaintenance = await callTool('seer_batch', { calls: [{ tool: 'seer_symbol_history_build', args: { maxSeconds: 1 } }] });
+  check(batchMaintenance.results[0].ok === false && /read-only|maintenance|derived-index/i.test(batchMaintenance.results[0].error),
+    'seer_batch refuses maintenance/build tools', batchMaintenance.results[0]);
+  const batchDerived = await callTool('seer_batch', { calls: [{ tool: 'seer_modules', args: {} }] });
+  check(batchDerived.results[0].ok === false && /read-only|derived-index/i.test(batchDerived.results[0].error),
+    'seer_batch refuses query tools that can auto-build derived indexes', batchDerived.results[0]);
 
   // ── §5a dependents still serve data (auto-build path doesn't break) ────
   const dup = await callTool('seer_duplicates', {});

@@ -345,6 +345,24 @@ export interface SymbolHistoryRow {
   confidence: number;
 }
 
+/** Input row for Store.insertSymbolHistoryBatch() — SymbolHistoryRow minus the
+ *  DB-assigned id. Keeps the batched-write call site readable vs. a 13-arg call. */
+export interface SymbolHistoryInsert {
+  symbolId: number;
+  symbolKey: string;
+  commitSha: string;
+  authorName: string | null;
+  authorEmail: string | null;
+  committedAt: number;
+  message: string | null;
+  linesAdded: number;
+  linesRemoved: number;
+  prNumber: number | null;
+  prUrl: string | null;
+  matchStrategy: string;
+  confidence: number;
+}
+
 /**
  * v8 Track G — row returned by Store.listServiceCalls(). The caller is the
  * AST-attributed enclosing function/method; the call always carries the raw

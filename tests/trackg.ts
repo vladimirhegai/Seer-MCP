@@ -43,14 +43,14 @@ async function main(): Promise<void> {
   console.log('===================================\n');
   fs.mkdirSync(TMP_DIR, { recursive: true });
 
-  // ── 1a: Fresh DB lands at CURRENT_SCHEMA_VERSION = 9 ───────────────────
+  // ── 1a: Fresh DB lands at CURRENT_SCHEMA_VERSION = 11 ──────────────────
   console.log('── Fresh DB schema ──');
   const freshDb = path.join(TMP_DIR, 'fresh.db');
   const fresh = new Store(freshDb);
   try {
-    assertEq(CURRENT_SCHEMA_VERSION, 10, 'CURRENT_SCHEMA_VERSION = 10');
+    assertEq(CURRENT_SCHEMA_VERSION, 11, 'CURRENT_SCHEMA_VERSION = 11');
     const info = fresh.schemaInfo();
-    assertEq(info.dbVersion, 10, 'fresh DB dbVersion = 9');
+    assertEq(info.dbVersion, 11, 'fresh DB dbVersion = 11');
     assertEq(info.current, true, 'fresh DB schema.current = true');
 
     const scCols = rawColumns(fresh, 'service_calls');
@@ -112,7 +112,7 @@ async function main(): Promise<void> {
   const migrated = new Store(migDb);
   try {
     const info = migrated.schemaInfo();
-    assertEq(info.dbVersion, 10, 'migrated DB version bumped to v9');
+    assertEq(info.dbVersion, 11, 'migrated DB version bumped to v11');
     const sc = migrated.rawDb().prepare('SELECT COUNT(*) AS c FROM service_calls').get() as { c: number };
     const sl = migrated.rawDb().prepare('SELECT COUNT(*) AS c FROM service_links').get() as { c: number };
     assertEq(sc.c, 0, 'service_calls exists after migration');
@@ -149,7 +149,7 @@ async function main(): Promise<void> {
   const v8Migrated = new Store(v8MigDb);
   try {
     const info = v8Migrated.schemaInfo();
-    assertEq(info.dbVersion, 10, 'v9 DB version bumped to v10 in-place');
+    assertEq(info.dbVersion, 11, 'v8 DB version bumped to v11 in-place');
     const after = v8Migrated.rawDb().prepare('SELECT COUNT(*) AS c FROM service_calls').get() as { c: number };
     const afterRoutes = v8Migrated.rawDb().prepare('SELECT COUNT(*) AS c FROM routes').get() as { c: number };
     assert(after.c > 0, 'v8 rows preserved through v9 migration');

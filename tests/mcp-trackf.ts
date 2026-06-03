@@ -105,8 +105,8 @@ async function main(): Promise<void> {
 
   // seer_health surfaces v7 fields
   const health = await callTool('seer_health', {});
-  if (health.schemaVersion === 10) ok(`seer_health.schemaVersion = 10`);
-  else bad(`seer_health.schemaVersion not 9`, health);
+  if (health.schemaVersion === 11) ok(`seer_health.schemaVersion = 11`);
+  else bad(`seer_health.schemaVersion not 11`, health);
   if (health.provenance && health.provenance.symbols)
     ok(`seer_health.provenance present`);
   else bad('seer_health.provenance missing', health);
@@ -148,12 +148,12 @@ async function main(): Promise<void> {
   else bad('seer_bundle_export wrong path', exp);
   if (fs.existsSync(bundleOut)) ok('seer_bundle_export bundle exists on disk');
   else bad('bundle not on disk', exp);
-  if (exp.manifest?.schemaVersion === 10) ok('exported manifest.schemaVersion=10');
+  if (exp.manifest?.schemaVersion === 11) ok('exported manifest.schemaVersion=11');
   else bad('exported manifest wrong', exp.manifest);
 
   // seer_bundle_info — manifest peek
   const info = await callTool('seer_bundle_info', { bundle: bundleOut });
-  if (info.schemaVersion === 10) ok('seer_bundle_info reads manifest');
+  if (info.schemaVersion === 11) ok('seer_bundle_info reads manifest');
   else bad('seer_bundle_info wrong', info);
   if (info.index?.symbols >= 3) ok('seer_bundle_info reports symbol count');
   else bad('seer_bundle_info missing symbols', info.index);
@@ -218,7 +218,7 @@ async function main(): Promise<void> {
 
   // Health after re-import still healthy.
   const health2 = await callTool('seer_health', {});
-  if (health2.schemaVersion === 10) ok('post-import seer_health.schemaVersion = 10');
+  if (health2.schemaVersion === 11) ok('post-import seer_health.schemaVersion = 11');
   else bad('post-import schema wrong', health2);
 
   // Bundle import refuses missing file
@@ -317,7 +317,7 @@ async function main(): Promise<void> {
         name: 'seer_health', arguments: {},
       });
       const health2 = JSON.parse(h2.result?.content?.[0]?.text ?? '{}');
-      if (health2.schemaVersion === 10 && health2.dbPath === customDb)
+      if (health2.schemaVersion === 11 && health2.dbPath === customDb)
         ok('post-import health.dbPath still equals --db override');
       else bad('post-import health did not honour --db', health2);
     }

@@ -95,7 +95,8 @@ The index lives at `<repo>/.seer/graph.db`. Add `.seer/` to `.gitignore` if
 it is not already ignored. If you skip `index .`, Seer builds the index on the
 first query.
 Claude Code gets Seer's core MCP tools marked as always-load. Antigravity has
-no eager flag; Seer relies on workspace-local config plus `--workspace`/`cwd`.
+no eager flag; Seer relies on workspace-local config, `--workspace`/`cwd`, and
+standard MCP read-only annotations for query tools.
 
 Update existing installs:
 

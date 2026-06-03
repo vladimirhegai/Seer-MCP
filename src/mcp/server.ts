@@ -100,6 +100,35 @@ const CORE_ALWAYS_LOAD_TOOLS = new Set([
   'seer_callers',
   'seer_callees',
   'seer_trace',
+  'seer_behavior',
+  'seer_history',
+  'seer_skeleton',
+  'seer_batch',
+]);
+
+const MAINTENANCE_TOOLS = new Set([
+  'seer_reindex',
+  'seer_churn',
+  'seer_symbol_history_build',
+  'seer_modules_build',
+  'seer_shape_hash_build',
+  'seer_bundle_export',
+  'seer_bundle_import',
+  'seer_scip_import',
+]);
+
+const SIDE_EFFECTING_TOOLS = new Set([
+  ...MAINTENANCE_TOOLS,
+  // These are query-shaped tools, but they can populate derived indexes on a
+  // cold DB before returning data. Do not advertise them as read-only, and keep
+  // them out of seer_batch's read-only fan-out contract.
+  'seer_modules',
+  'seer_module_members',
+  'seer_symbol_module',
+  'seer_module_dependencies',
+  'seer_trace_module_dependencies',
+  'seer_duplicates',
+  'seer_continuity',
 ]);
 
 const TRACE_PREVIEW_LIMIT = 20;
@@ -349,6 +378,13 @@ export class SeerMcpServer {
    * wrapper stores the raw handler and forwards to the SDK unchanged.
    */
   private handlers = new Map<string, (args: any) => Promise<any>>();
+  /**
+   * The zod object schema for each tool, reconstructed from its raw inputSchema
+   * shape. The MCP SDK validates protocol-level calls against this before the
+   * handler runs, but in-process delegation (seer_batch / seer_trace) bypasses
+   * that layer — so we re-run the same schema there. See validateToolArgs().
+   */
+  private toolSchemas = new Map<string, z.ZodTypeAny>();
 
   private registerTool(
     name: string,
@@ -363,7 +399,31 @@ export class SeerMcpServer {
       }
     };
     this.handlers.set(name, wrapped);
+    if (def.inputSchema && Object.keys(def.inputSchema).length > 0) {
+      try { this.toolSchemas.set(name, z.object(def.inputSchema)); } catch { /* */ }
+    }
     (this.mcp.registerTool as any)(name, this.withClientHints(name, def), wrapped);
+  }
+
+  /**
+   * Validate delegated args against a tool's declared schema before an
+   * in-process dispatch (seer_batch / seer_trace). Without this, a missing
+   * required field (e.g. a seer_definition call with no `name`) reached the
+   * store as `undefined` and surfaced as an opaque "cannot be bound to SQLite
+   * parameter" error instead of a clean validation message. Returns the parsed
+   * args (defaults applied, unknown keys stripped) on success.
+   */
+  private validateToolArgs(
+    toolName: string, rawArgs: unknown,
+  ): { ok: true; data: any } | { ok: false; error: string } {
+    const schema = this.toolSchemas.get(toolName);
+    if (!schema) return { ok: true, data: rawArgs ?? {} };
+    const parsed = schema.safeParse(rawArgs ?? {});
+    if (parsed.success) return { ok: true, data: parsed.data };
+    const issues = parsed.error.issues
+      .map(i => `${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('; ');
+    return { ok: false, error: `invalid args for ${toolName}: ${issues}` };
   }
 
   private toolTimeoutMs(name: string): number {
@@ -374,16 +434,11 @@ export class SeerMcpServer {
   }
 
   private isMaintenanceTool(name: string): boolean {
-    return new Set([
-      'seer_reindex',
-      'seer_churn',
-      'seer_symbol_history_build',
-      'seer_modules_build',
-      'seer_shape_hash_build',
-      'seer_bundle_export',
-      'seer_bundle_import',
-      'seer_scip_import',
-    ]).has(name);
+    return MAINTENANCE_TOOLS.has(name);
+  }
+
+  private isSideEffectingTool(name: string): boolean {
+    return SIDE_EFFECTING_TOOLS.has(name);
   }
 
   private async runToolWithTimeout(
@@ -437,13 +492,28 @@ export class SeerMcpServer {
     name: string,
     def: { description?: string; inputSchema?: Record<string, any>; [k: string]: any },
   ): { description?: string; inputSchema?: Record<string, any>; [k: string]: any } {
-    if (!CORE_ALWAYS_LOAD_TOOLS.has(name)) return def;
+    const sideEffecting = this.isSideEffectingTool(name);
+    const annotations = sideEffecting
+      ? {
+          readOnlyHint: false,
+          openWorldHint: false,
+          ...(def.annotations ?? {}),
+        }
+      : {
+          readOnlyHint: true,
+          openWorldHint: false,
+          ...(def.annotations ?? {}),
+        };
+    const meta = CORE_ALWAYS_LOAD_TOOLS.has(name)
+      ? {
+          ...(def._meta ?? {}),
+          'anthropic/alwaysLoad': true,
+        }
+      : def._meta;
     return {
       ...def,
-      _meta: {
-        ...(def._meta ?? {}),
-        'anthropic/alwaysLoad': true,
-      },
+      annotations,
+      ...(meta ? { _meta: meta } : {}),
     };
   }
 
@@ -733,18 +803,18 @@ export class SeerMcpServer {
   }
 
   private historyIndexStatus(): Record<string, unknown> {
-    const rows = this.countTableRows('symbol_history');
-    const state = this.store.getGitIndexState();
+    // Base built/rows/marker come from the store (shared with context/preflight
+    // so the `built` semantics never drift); the live-HEAD staleness check is
+    // server-only because it needs the workspace path.
+    const info = this.store.getHistoryIndexInfo();
     const head = gitHeadSha(this.workspace);
-    const builtHead = state?.lastHistoryHeadSha ?? null;
-    const built = rows > 0 || builtHead != null;
-    const stale = builtHead != null && head != null && builtHead !== head;
+    const stale = info.lastHistoryHeadSha != null && head != null && info.lastHistoryHeadSha !== head;
     return {
-      built,
-      rows,
+      built: info.built,
+      rows: info.rows,
       headSha: head,
-      lastHistoryHeadSha: builtHead,
-      lastHistoryAt: state?.lastHistoryAt ?? null,
+      lastHistoryHeadSha: info.lastHistoryHeadSha,
+      lastHistoryAt: info.lastHistoryAt,
       stale,
     };
   }
@@ -851,9 +921,10 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_definition', {
-      description: 'CORE lookup tool. Find exact symbol definitions by name or qualified name. Pass `file` to disambiguate common symbols; accepts absolute path, exact rel_path, or trailing path fragment. Excludes vendor/generated/test/declaration rows by default.',
+      description: 'CORE lookup tool. Find exact symbol definitions by name or qualified name. Pass `name` (or its alias `symbol`, for parity with the drill-down tools). Pass `file` to disambiguate common symbols; accepts absolute path, exact rel_path, or trailing path fragment. Excludes vendor/generated/test/declaration rows by default.',
       inputSchema: {
-        name: z.string(),
+        name: z.string().optional(),
+        symbol: z.string().optional().describe('Alias for `name` — accepted so a call shaped like the other tools (which take `symbol`) still resolves.'),
         file: z.string().optional(),
         includeVendor: z.boolean().optional(),
         includeGenerated: z.boolean().optional(),
@@ -863,9 +934,13 @@ export class SeerMcpServer {
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims items, keeping the highest-PageRank rows.'),
       },
-    }, async ({ name, file, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs, tokenBudget }) => {
+    }, async ({ name, symbol, file, includeVendor, includeGenerated, includeTests, includeDeclarations, includeTypeRefs, tokenBudget }) => {
       await this.ensureFresh();
-      const rows = this.store.getDefinition(name, {
+      const query = name ?? symbol;
+      if (!query) {
+        return this.text({ ok: false, error: 'seer_definition requires `name` (or its alias `symbol`).' });
+      }
+      const rows = this.store.getDefinition(query, {
         filePath: file,
         includeVendor: includeVendor ?? false,
         includeGenerated: includeGenerated ?? false,
@@ -875,7 +950,7 @@ export class SeerMcpServer {
       });
       // Suggestion-only fuzzy fallback: never substitute, just hint.
       if (rows.length === 0) {
-        const didYouMean = this.suggestSymbols(name);
+        const didYouMean = this.suggestSymbols(query);
         return this.text({ total: 0, items: [], source: 'tree-sitter',
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
@@ -920,7 +995,19 @@ export class SeerMcpServer {
       },
     }, async ({ symbol, file, limit, tokenBudget }) => {
       await this.ensureFresh();
-      const target = file ? this.store.getDefinition(symbol, { filePath: file })[0] : null;
+      // Resolve to a specific id when the input is DISAMBIGUATING: a `file` was
+      // given, or the symbol is qualified (`Node.add_child` / `Node::add_child`).
+      // Then findCallersById reads its precise resolved callers — the name-keyed
+      // findCallers fallback matched edges by `to_name` only, and member-call
+      // edges store the short name, so a qualified input silently found nothing.
+      // A BARE short name stays on the broad name path so `seer_callers run`
+      // still returns callers of every `run` (the documented "pass file to
+      // disambiguate" contract). We hard-fail only when a `file` was given but
+      // matched nothing.
+      const qualified = symbol.includes('.') || symbol.includes('::');
+      const target = (file || qualified)
+        ? this.store.getDefinition(symbol, { filePath: file })[0] ?? null
+        : null;
       if (file && !target) {
         const didYouMean = this.suggestSymbols(symbol);
         return this.text({ symbol, file, found: false, total: 0, returned: 0, items: [], source: 'tree-sitter',
@@ -951,16 +1038,33 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callees', {
-      description: 'CORE drill-down tool. Direct callees of a symbol.',
+      description: 'CORE drill-down tool. Direct callees of a symbol. Pass file to disambiguate common names or qualified names such as Class.method.',
       inputSchema: {
         symbol: z.string(),
+        file: z.string().optional(),
         limit: z.number().int().positive().max(500).optional(),
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims the callee list.'),
       },
-    }, async ({ symbol, limit, tokenBudget }) => {
+    }, async ({ symbol, file, limit, tokenBudget }) => {
       await this.ensureFresh();
-      const all = this.store.findCallees(symbol);
+      // Resolve to a specific id when the input is DISAMBIGUATING (mirrors
+      // seer_callers): a `file` was given, or the caller is qualified
+      // (`Node.add_child` / `Node::add_child`). Then we read its exact callees by
+      // id — the name-keyed findCallees only matched the short name, so qualified
+      // inputs silently returned nothing. A bare short name stays on the broad
+      // name path for symmetry with seer_callers.
+      const qualified = symbol.includes('.') || symbol.includes('::');
+      const target = (file || qualified)
+        ? this.store.getDefinition(symbol, { filePath: file })[0] ?? null
+        : null;
+      if (file && !target) {
+        const didYouMean = this.suggestSymbols(symbol);
+        return this.text({ symbol, file, found: false, total: 0, returned: 0, items: [], source: 'tree-sitter',
+          reason: `no symbol "${symbol}" in ${file}`,
+          ...(didYouMean.length > 0 ? { didYouMean } : {}) });
+      }
+      const all = target ? this.store.findCalleesById(target.id) : this.store.findCallees(symbol);
       const max = Math.min(all.length, limit ?? 40);
       const items = all.slice(0, max).map(c => ({
         calleeName: c.calleeName, calleeKind: c.calleeKind,
@@ -968,7 +1072,10 @@ export class SeerMcpServer {
         edgeKind: c.edgeKind,
         source: c.calleeFile ? 'tree-sitter' : 'unresolved',
       }));
-      return this.budgetedText({ symbol, total: all.length }, items, tokenBudget);
+      return this.budgetedText({ symbol, file, target: target ? {
+        id: target.id, name: target.name, qualifiedName: target.qualifiedName,
+        kind: target.kind, file: target.filePath, lineStart: target.lineStart,
+      } : undefined, total: all.length, source: 'tree-sitter' }, items, tokenBudget);
     });
 
     // Search: BM25 across symbols + files. Each symbol hit also gets enriched
@@ -1171,14 +1278,20 @@ export class SeerMcpServer {
         'v9 Track H — Bounded BFS over service-link edges from one symbol. ' +
         'Returns every handler reachable within maxDepth/maxNodes/maxFanout, ' +
         'each with its depth, the protocols carrying traffic, and the hop chain. ' +
+        'Default output is a compact preview; use summaryOnly for counts only and page with offset/limit for more rows. ' +
         '`cutoff` reports which limit fired (maxNodes / maxDepth / maxFanout) if any.',
       inputSchema: {
         from: z.string().describe('Source symbol name or qualified name'),
         maxDepth: z.number().int().positive().max(20).optional(),
         maxNodes: z.number().int().positive().max(2000).optional(),
         maxFanout: z.number().int().positive().max(200).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        summaryOnly: z.boolean().optional(),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals.'),
       },
-    }, async ({ from, maxDepth, maxNodes, maxFanout }) => {
+    }, async ({ from, maxDepth, maxNodes, maxFanout, limit, offset, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
       const fRows = this.store.getDefinition(from);
       if (fRows.length === 0) return this.text({ ok: false, error: `Source symbol not found: ${from}` });
@@ -1198,26 +1311,43 @@ export class SeerMcpServer {
           hops: x.hops,
         };
       });
-      return this.text({
+      const pageLimit = Math.min(limit ?? 25, 500);
+      const pageOffset = Math.min(offset ?? 0, items.length);
+      const pageItems = items.slice(pageOffset, pageOffset + pageLimit);
+      const hasNextPage = !summaryOnly && pageOffset + pageItems.length < items.length;
+      const base = {
         ok: true,
         from: { id: fRows[0].id, name: fRows[0].name, qualifiedName: fRows[0].qualifiedName },
         reached: items.length,
         cutoff: r.cutoff,
-        items,
-      });
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
+        source: 'tree-sitter',
+        note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
+      };
+      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_trace_module_service_dependencies', {
       description:
         'v9 Track H — Bounded BFS over cross-module service-link edges from one ' +
         'module. Returns each downstream module with hop depth, the protocols ' +
-        'carrying traffic, and the total cross-module link weight feeding it.',
+        'carrying traffic, and the total cross-module link weight feeding it. ' +
+        'Default output is a compact preview; use summaryOnly for counts only and page with offset/limit for more rows.',
       inputSchema: {
         moduleId: z.number().int().nonnegative(),
         maxDepth: z.number().int().positive().max(10).optional(),
         maxNodes: z.number().int().positive().max(500).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        summaryOnly: z.boolean().optional(),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals.'),
       },
-    }, async ({ moduleId, maxDepth, maxNodes }) => {
+    }, async ({ moduleId, maxDepth, maxNodes, limit, offset, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
       const r = this.store.traceModuleServiceDependencies(moduleId, { maxDepth, maxNodes });
       // Hydrate module metadata for the response so callers don't need a
@@ -1238,15 +1368,26 @@ export class SeerMcpServer {
         sizeFiles: metaById.get(x.moduleId)?.sizeFiles ?? 0,
         depth: x.depth,
         protocols: x.protocols,
-        viaLinks: x.viaLinks,
-      }));
-      return this.text({
+          viaLinks: x.viaLinks,
+        }));
+      const pageLimit = Math.min(limit ?? 25, 500);
+      const pageOffset = Math.min(offset ?? 0, items.length);
+      const pageItems = items.slice(pageOffset, pageOffset + pageLimit);
+      const hasNextPage = !summaryOnly && pageOffset + pageItems.length < items.length;
+      const base = {
         ok: true,
         fromModuleId: moduleId,
         reached: items.length,
         cutoff: r.cutoff,
-        items,
-      });
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
+        source: 'tree-sitter',
+        note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
+      };
+      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_dependencies', {
@@ -1622,11 +1763,22 @@ export class SeerMcpServer {
                 : label != null ? this.store.getModuleByLabel(label)
                 : null;
       if (!mod) return this.text({ found: false, reason: id != null ? `no module #${id}` : `no module "${label}"` });
-      const files = this.store.listModuleMembers(mod.id, fileLimit ?? 500);
+      const files = this.store.listModuleMembers(mod.id, fileLimit ?? 100);
       const symbols = this.store.listModuleTopSymbols(mod.id, symbolLimit ?? 25);
+      const totalFiles = typeof (mod as { sizeFiles?: unknown }).sizeFiles === 'number'
+        ? Number((mod as { sizeFiles?: unknown }).sizeFiles)
+        : files.length;
       return this.text({
         module: mod,
-        files: { total: files.length, items: files },
+        files: {
+          total: totalFiles,
+          returned: files.length,
+          truncated: files.length < totalFiles,
+          ...(files.length < totalFiles
+            ? { note: 'Compact file preview. Raise fileLimit for more rows.' }
+            : {}),
+          items: files,
+        },
         topSymbols: { returned: symbols.length, items: symbols.map(s => ({
           id: s.id, name: s.name, qualifiedName: s.qualifiedName,
           kind: s.kind, file: s.filePath, lineStart: s.lineStart,
@@ -1698,13 +1850,18 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_trace_file_dependencies', {
-      description: 'Bounded BFS over the resolved import graph starting at a file. Returns each reachable file with the depth at which it was first seen.',
+      description: 'Bounded BFS over the resolved import graph starting at a file. Default output is a compact preview; use summaryOnly for counts only and page with offset/limit for more rows.',
       inputSchema: {
         file: z.string(),
         maxDepth: z.number().int().positive().max(8).optional(),
         maxNodes: z.number().int().positive().max(20000).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        summaryOnly: z.boolean().optional(),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals.'),
       },
-    }, async ({ file, maxDepth, maxNodes }) => {
+    }, async ({ file, maxDepth, maxNodes, limit, offset, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
       const files = this.store.listFiles();
       const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
@@ -1715,24 +1872,40 @@ export class SeerMcpServer {
       if (!match) return this.text({ found: false, reason: `no indexed file matching "${file}"` });
       const closure = this.store.fileImportClosure(match.id, maxDepth ?? 4, maxNodes ?? 5000);
       closure.sort((a, b) => a.depth - b.depth || (a.relPath < b.relPath ? -1 : 1));
-      return this.text({
+      const pageLimit = Math.min(limit ?? 50, 500);
+      const pageOffset = Math.min(offset ?? 0, closure.length);
+      const pageItems = closure.slice(pageOffset, pageOffset + pageLimit)
+        .map(c => ({ id: c.id, relPath: c.relPath, language: c.language, depth: c.depth }));
+      const hasNextPage = !summaryOnly && pageOffset + pageItems.length < closure.length;
+      const base = {
         from: { id: match.id, path: match.path, relPath: match.relPath, language: match.language },
         maxDepth: maxDepth ?? 4,
         totalReachable: closure.length,
-        items: closure.map(c => ({ id: c.id, relPath: c.relPath, language: c.language, depth: c.depth })),
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
         source: 'tree-sitter',
-      });
+        note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
+      };
+      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_trace_module_dependencies', {
-      description: 'Bounded BFS over the module dependency graph. Returns each reachable module with the depth at which it was first seen.',
+      description: 'Bounded BFS over the module dependency graph. Default output is a compact preview; use summaryOnly for counts only and page with offset/limit for more rows.',
       inputSchema: {
         id: z.number().int().positive().optional(),
         label: z.string().optional(),
         maxDepth: z.number().int().positive().max(8).optional(),
         direction: z.enum(['in', 'out']).optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        offset: z.number().int().nonnegative().max(50000).optional(),
+        summaryOnly: z.boolean().optional(),
+        tokenBudget: z.number().int().positive().max(50000).optional()
+          .describe('Soft cap (~4 chars/token) that trims the returned row page, never the totals.'),
       },
-    }, async ({ id, label, maxDepth, direction }) => {
+    }, async ({ id, label, maxDepth, direction, limit, offset, summaryOnly, tokenBudget }) => {
       await this.ensureFresh();
       if (!this.ensureModules()) return this.text({
         ok: false,
@@ -1764,10 +1937,22 @@ export class SeerMcpServer {
         return { id: mid, label: m?.label ?? null, depth: d };
       });
       items.sort((a, b) => a.depth - b.depth || ((a.label ?? '') < (b.label ?? '') ? -1 : 1));
-      return this.text({
+      const pageLimit = Math.min(limit ?? 50, 500);
+      const pageOffset = Math.min(offset ?? 0, items.length);
+      const pageItems = items.slice(pageOffset, pageOffset + pageLimit);
+      const hasNextPage = !summaryOnly && pageOffset + pageItems.length < items.length;
+      const base = {
         from: mod, direction: dir, maxDepth: depth,
-        totalReachable: items.length, items, source: 'tree-sitter',
-      });
+        totalReachable: items.length,
+        offset: pageOffset,
+        limit: pageLimit,
+        truncated: hasNextPage,
+        nextOffset: hasNextPage ? pageOffset + pageItems.length : null,
+        source: 'tree-sitter',
+        note: 'Compact dependency preview. Use summaryOnly for counts only or page with offset/limit for more rows.',
+      };
+      if (summaryOnly) return this.text({ ...base, returned: 0 });
+      return this.budgetedText(base, pageItems, tokenBudget);
     });
 
     this.registerTool('seer_modules_build', {
@@ -2177,7 +2362,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_context', {
-      description: 'CORE pre-edit tool. One compact packet for a symbol: definition, callers, callees, routes, config, behavioral tests, history, complexity, module, blast radius, and deterministic risk. Use before reading/editing a known symbol, then drill in with seer_callers, seer_history, or seer_behavior.',
+      description: 'CORE pre-edit tool. One compact packet for a symbol: definition, callers, callees, bounded route/config previews with totals, behavioral tests, history, complexity, module, blast radius, and deterministic risk. Use before reading/editing a known symbol, then drill in with seer_callers, seer_history, or seer_behavior.',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
@@ -2251,10 +2436,13 @@ export class SeerMcpServer {
       const h = target ? this.handlers.get(target) : undefined;
       if (!h) return this.text({ ok: false, error: `unsupported scope "${scope}"` });
       // The umbrella accepts `args` as opaque (z.any()), so the delegate's own
-      // required-param schema isn't enforced by the SDK here. Catch its throws
-      // and return a clean, advisory error rather than a raw binding failure.
+      // required-param schema isn't enforced by the SDK here. Re-validate
+      // against the delegate's schema, then catch any throw — either way the
+      // agent gets a clean, advisory error rather than a raw binding failure.
+      const v = this.validateToolArgs(target, args ?? {});
+      if (!v.ok) return this.text({ ok: false, scope, error: v.error });
       try {
-        return await h(args ?? {});
+        return await h(v.data);
       } catch (err) {
         return this.text({ ok: false, scope, error: `seer_trace[${scope}] failed: ${(err as Error).message}` });
       }
@@ -2280,10 +2468,23 @@ export class SeerMcpServer {
           results.push({ tool: toolName, ok: false, error: 'missing tool name or nested seer_batch (disallowed)' });
           continue;
         }
+        if (this.isSideEffectingTool(toolName)) {
+          results.push({
+            tool: toolName,
+            ok: false,
+            error: 'seer_batch only dispatches read-only tools; run side-effecting or derived-index tools directly after user approval.',
+          });
+          continue;
+        }
         const h = this.handlers.get(toolName);
         if (!h) { results.push({ tool: toolName, ok: false, error: `unknown tool "${toolName}"` }); continue; }
+        // Re-validate against the tool's schema — in-process dispatch bypasses
+        // the SDK's protocol-level validation, so an entry missing a required
+        // field would otherwise reach the store as `undefined`.
+        const v = this.validateToolArgs(toolName, c.args);
+        if (!v.ok) { results.push({ tool: toolName, ok: false, error: v.error }); continue; }
         try {
-          const r = await h(c.args ?? {});
+          const r = await h(v.data);
           const raw = r?.content?.[0]?.text;
           let parsed: unknown;
           try { parsed = raw != null ? JSON.parse(raw) : null; } catch { parsed = raw ?? null; }

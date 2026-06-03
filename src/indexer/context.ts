@@ -61,8 +61,18 @@ export interface ContextPacket {
     topAffected: Array<{ id: number; name: string; qualifiedName: string | null; file: string; pagerank: number }>;
     maxDepth: number;
   };
+  /** Route preview for this handler symbol; bounded to keep the packet compact. */
   routes: Array<{ method: string; path: string; framework: string }>;
+  /** Exact total route count before preview truncation. */
+  routesTotal: number;
+  /** True when `routes` is a capped preview, not the full list. */
+  routesTruncated: boolean;
+  /** Config-read preview for this symbol; bounded to keep the packet compact. */
   configKeys: Array<{ key: string; source: string; line: number }>;
+  /** Exact total config-key count before preview truncation. */
+  configKeysTotal: number;
+  /** True when `configKeys` is a capped preview, not the full list. */
+  configKeysTruncated: boolean;
   /**
    * v8 Track-G — outbound service calls this symbol makes (preview, capped).
    * Empty array on Pre-Track-G DBs or symbols with no outgoing client calls.
@@ -116,6 +126,17 @@ export interface ContextPacket {
       prNumber: number | null; prUrl: string | null;
       confidence: number;
     }>;
+  };
+  /**
+   * Whether the per-symbol git history index exists. When `built` is false the
+   * empty `recentHistory` means "history not indexed", NOT "symbol has no
+   * commits" — the agent should not infer the symbol is new/untouched.
+   */
+  historyIndex: {
+    built: boolean;
+    rows: number;
+    lastHistoryHeadSha: string | null;
+    lastHistoryAt: number | null;
   };
   fileChurn: {
     commitCount: number;
@@ -203,9 +224,15 @@ export function buildContext(
     }));
   }
 
-  // Routes / config / behavior / history.
-  const routes = store.routesForHandler(target.id);
-  const configKeys = store.configKeysForSymbol(target.id);
+  // Routes / config / behavior / history. Routes + config reads are kept as
+  // bounded previews because hub handlers / bootstraps can otherwise dominate
+  // the packet with dozens of repetitive rows.
+  const ROUTE_PREVIEW_CAP = 12;
+  const CONFIG_KEY_PREVIEW_CAP = 12;
+  const allRoutes = store.routesForHandler(target.id);
+  const routes = allRoutes.slice(0, ROUTE_PREVIEW_CAP);
+  const allConfigKeys = store.configKeysForSymbol(target.id);
+  const configKeys = allConfigKeys.slice(0, CONFIG_KEY_PREVIEW_CAP);
   const behavior = rankedBehavior(store, target.id, { limit: testLimit });
 
   // v8 Track-G — service-link evidence. Capped previews so the packet stays
@@ -219,6 +246,7 @@ export function buildContext(
   const serviceLinksOutbound = store.serviceLinksForCaller(target.id, { limit: SERVICE_LINK_PREVIEW_CAP });
   const history = store.getSymbolHistory(target.id, { limit: historyLimit });
   const totalHistory = store.countSymbolHistory(target.id);
+  const historyIndex = store.getHistoryIndexInfo();
   const fileChurn = (() => {
     try {
       const c = store.getFileChurn(target.filePath);
@@ -271,7 +299,11 @@ export function buildContext(
       maxDepth: callerDepth,
     },
     routes,
+    routesTotal: allRoutes.length,
+    routesTruncated: routes.length < allRoutes.length,
     configKeys,
+    configKeysTotal: allConfigKeys.length,
+    configKeysTruncated: configKeys.length < allConfigKeys.length,
     serviceCalls: serviceCallsRows.map(sc => ({
       method: sc.method,
       path: sc.normalizedPath,
@@ -328,6 +360,7 @@ export function buildContext(
         confidence: h.confidence,
       })),
     },
+    historyIndex,
     fileChurn,
     risk: {
       risk: risk.risk,
