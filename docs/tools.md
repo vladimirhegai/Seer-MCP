@@ -23,7 +23,7 @@ inline.
 | Large transitive graph | `seer_trace` with `mode: "summary"` or paged preview |
 | Large file shape | `seer_skeleton` before a full file read |
 | Literal strings, comments, docs, config values | `rg` or file reads after Seer |
-| Symbol git history | `seer_history`; if not built, ask before starting a build |
+| Symbol git history | `seer_history` (auto-builds the symbol's file on first call) |
 
 ---
 
@@ -47,13 +47,17 @@ and it maps a git diff to the affected symbols and their blast radius.
 - `seer_symbols` (`query?`, `top?`) BM25 search, or top symbols by PageRank.
 - `seer_definition` (`name`, `file?`) exact definition lookup.
 - `seer_file_symbols` (`file`) symbols in a file, in line order.
-- `seer_callers` (`symbol`, `file?`, `includeNameMatches?`) DIRECT callers. `total`
-  is call SITES (edges); `uniqueCallers` is distinct caller functions. Use `file`
-  or a qualified `Class.method` to disambiguate. For C/C++ member calls the
-  receiver type is unresolved, so the precise count can undercount; when that
-  happens an `ambiguity` block reports the by-name upper bound, and
-  `includeNameMatches: true` returns the by-name caller list. (For TRANSITIVE
-  reach, use `seer_trace_callers` / `seer_trace` `scope: "callers"`.)
+- `seer_callers` (`symbol`, `file?`, `includeNameMatches?`, `groupByFile?`,
+  `filterReceiverType?`, `nameMatchOffset?`) DIRECT callers. `total` is call SITES
+  (edges); `uniqueCallers` is distinct caller functions. Use `file` or a qualified
+  `Class.method` to disambiguate. For C/C++ member calls the receiver type is
+  unresolved, so the precise count can undercount; an `ambiguity` block reports
+  the by-name upper bound. Narrow it: `groupByFile: true` (accurate per-file
+  breakdown of where the by-name sites concentrate), `filterReceiverType` (a class
+  name, or `true` to infer it — best-effort attribution by receiver type, with a
+  `plausibleUpperBound`), and `includeNameMatches: true` + `nameMatchOffset` to
+  page the raw list. SCIP import gives an exact count. (For TRANSITIVE reach, use
+  `seer_trace_callers` / `seer_trace` `scope: "callers"`.)
 - `seer_callees` (`symbol`) direct callees.
 - `seer_search` (`query`, `tokenBudget?`) combined symbol + file-path search.
 - `seer_skeleton` (`file`, `focusSymbol?`) render a file as signatures only, with
@@ -93,9 +97,11 @@ and it maps a git diff to the affected symbols and their blast radius.
 ## History and continuity
 
 - `seer_churn` file-level git stats.
-- `seer_history` (`symbol`) per-symbol commit blame chain from a prebuilt
-  history index. Read-only; it reports `historyIndex.built: false` until an
-  explicit history build has populated the index.
+- `seer_history` (`symbol`, `autoBuild?`) per-symbol commit blame chain. On a cold
+  miss it auto-builds just the queried symbol's file inline (bounded ~1s) and
+  returns the commits — no separate build step. Pass `autoBuild: false` for a
+  strictly read-only lookup (e.g. inside `seer_batch`). The FULL repo history
+  index stays explicit (`seer_symbol_history_build` with no args / CLI).
 - `seer_continuity` (`symbol`) rename/move evidence (advisory, confidence-labeled).
 
 ## Portability and precision
@@ -156,8 +162,10 @@ tools stay untrimmed; trace tools default to compact previews with totals.
 ## Tools you usually do not need
 
 Modules and shape hashes normally build during indexing and may self-heal on
-first use. Symbol history is different: it can be expensive on large repos, so
-`seer_history` never builds it inline. Agents should report missing history and
-ask before starting a build. Run `seer_symbol_history_build` with a small
-`maxSeconds`/`maxFiles` budget, or run `seer symbol-history` from a shell when
-you want the full history pass.
+first use. Symbol history is similar but bounded by file: `seer_history`
+auto-builds just the queried symbol's file inline (~1s) on a cold miss, so a
+single-symbol question needs no separate step. The expensive part is the FULL
+repo history pass — that stays explicit: run `seer_symbol_history_build` (no
+`symbols`/`paths`) with a small `maxSeconds`/`maxFiles` budget, or
+`seer symbol-history` from a shell. Pass `autoBuild: false` to `seer_history` for
+a strictly read-only lookup.

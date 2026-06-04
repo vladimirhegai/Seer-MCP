@@ -12,7 +12,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { runInit, runUpdate, detectAutoClients, ClientId } from '../src/cli/init';
-import { parseSelection, runInitWizard, PromptIO } from '../src/cli/prompt';
+import { parseSelection, parseSingleSelection, runInitWizard, PromptIO } from '../src/cli/prompt';
 
 let passed = 0;
 let failed = 0;
@@ -327,42 +327,59 @@ async function main(): Promise<void> {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
-  // ── 10. Wizard selection parser (the interactive --auto path) ─────────────
+  // ── 10. Wizard selection parsers (single-select primary + multi extensions)─
   {
     const menu = ['a', 'b', 'c', 'd'];
     const join = (xs: string[]) => xs.join('');
-    check(join(parseSelection('1,3', menu)) === 'ac', '10.parses "1,3" to the 1st and 3rd items');
-    check(join(parseSelection('1 3', menu)) === 'ac', '10.tolerates space-separated numbers');
-    check(join(parseSelection('3,1,1', menu)) === 'ac', '10.dedupes and sorts ascending');
-    check(parseSelection('9', menu).length === 0, '10.ignores out-of-range numbers');
-    check(parseSelection('', menu).length === 0, '10.empty input selects nothing');
-    check(join(parseSelection('2,abc,4', menu)) === 'bd', '10.ignores non-numeric tokens');
+    // Multi-select: the Antigravity-extensions follow-up (can run several at once).
+    check(join(parseSelection('1,3', menu)) === 'ac', '10.parseSelection "1,3" → 1st+3rd');
+    check(join(parseSelection('1 3', menu)) === 'ac', '10.parseSelection tolerates spaces');
+    check(join(parseSelection('3,1,1', menu)) === 'ac', '10.parseSelection dedupes+sorts');
+    check(parseSelection('9', menu).length === 0, '10.parseSelection ignores out-of-range');
+    check(parseSelection('', menu).length === 0, '10.parseSelection empty → none');
+    check(join(parseSelection('2,abc,4', menu)) === 'bd', '10.parseSelection ignores non-numeric');
+    // Single-select: the primary "which agent" question (one agent per repo).
+    check(parseSingleSelection('3', menu) === 'c', '10.parseSingleSelection "3" → 3rd');
+    check(parseSingleSelection(' 2 ', menu) === 'b', '10.parseSingleSelection trims whitespace');
+    check(parseSingleSelection('', menu) === null, '10.parseSingleSelection empty → null');
+    check(parseSingleSelection('9', menu) === null, '10.parseSingleSelection out-of-range → null');
+    check(parseSingleSelection('1,2', menu) === null, '10.parseSingleSelection rejects multi "1,2"');
+    check(parseSingleSelection('abc', menu) === null, '10.parseSingleSelection rejects non-numeric');
   }
 
-  // ── 11. Wizard branching with scripted answers (no TTY needed) ────────────
+  // ── 11. Wizard branching with scripted answers (single-select, no TTY) ─────
   {
     // Antigravity detected, accept default (Enter), no extensions, index Y, history N.
-    const a = await runInitWizard(['antigravity'], scriptedIO(['', '', '', '']));
-    check(!!a && a.clients.join(',') === 'antigravity', '11.empty client answer accepts the detected default', a);
+    const a = await runInitWizard('antigravity', scriptedIO(['', '', '', '']));
+    check(!!a && a.clients.join(',') === 'antigravity', '11.Enter accepts the detected agent', a);
     check(!!a && a.index === true, '11.index defaults to yes on Enter', a);
     check(!!a && a.symbolHistory === false, '11.symbol history defaults to no on Enter', a);
 
-    // Pick Antigravity (1) + two extensions (Claude=1, Gemini=3), decline index.
-    const b = await runInitWizard([], scriptedIO(['1', '1,3', 'n']));
+    // No detection; pick Antigravity (1) + two extensions (Claude=1, Gemini=3), decline index.
+    const b = await runInitWizard(null, scriptedIO(['1', '1,3', 'n']));
     check(!!b && b.clients.includes('antigravity') && b.clients.includes('claude') && b.clients.includes('gemini'),
-      '11.antigravity + chosen extensions are all configured', b?.clients);
+      '11.antigravity primary + chosen extensions are all configured', b?.clients);
     check(!!b && b.clients.includes('codex') === false, '11.unpicked extension is not added', b?.clients);
     check(!!b && b.index === false, '11.declining index returns index=false', b);
     check(!!b && b.symbolHistory === false, '11.history is skipped entirely when not indexing', b);
 
-    // Multi-select non-antigravity clients; no extension prompt should consume input.
-    const c = await runInitWizard([], scriptedIO(['2,4', 'y', 'y']));
-    check(!!c && c.clients.join(',') === 'claude,cursor', '11.multi-select maps numbers to the right clients', c?.clients);
-    check(!!c && c.index === true && c.symbolHistory === true, '11.index=yes then history=yes both honored', c);
+    // Single NON-antigravity pick (Claude=2): no extension prompt, so the 2nd
+    // scripted answer must flow to the index question, not be eaten by Q2.
+    const c = await runInitWizard(null, scriptedIO(['2', 'y', 'y']));
+    check(!!c && c.clients.join(',') === 'claude', '11.single non-antigravity pick maps to one client', c?.clients);
+    check(!!c && c.index === true && c.symbolHistory === true, '11.no extension prompt; index then history honored', c);
 
-    // Empty/garbage client selection bails out with null.
-    const d = await runInitWizard([], scriptedIO(['99']));
-    check(d === null, '11.out-of-range-only client selection bails out (null)', d);
+    // The detected default can be overridden by typing a different number.
+    const o = await runInitWizard('antigravity', scriptedIO(['4', 'n']));
+    check(!!o && o.clients.join(',') === 'cursor', '11.typing a number overrides the detected default', o?.clients);
+
+    // No detection + empty input → clean cancel (null), no client chosen.
+    const d = await runInitWizard(null, scriptedIO(['']));
+    check(d === null, '11.no detection + empty input cancels (null)', d);
+
+    // Out-of-range, then the scripted stream runs dry (empty) → clean cancel.
+    const e = await runInitWizard(null, scriptedIO(['99']));
+    check(e === null, '11.out-of-range then empty cancels (null)', e);
   }
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);

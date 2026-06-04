@@ -7,7 +7,7 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
 import { buildContext } from '../indexer/context.js';
-import { runInit, runUpdate, runUninstall, detectAutoClients, detectConfiguredClients, ClientId } from './init.js';
+import { runInit, runUpdate, runUninstall, detectAutoClients, detectActiveClient, detectConfiguredClients, ClientId } from './init.js';
 import { runInitWizard, isInteractive } from './prompt.js';
 
 // Read the version from package.json at runtime so it never drifts from the
@@ -246,7 +246,7 @@ program
     const wizardEligible = !opts.client && !opts.global && !opts.print && !opts.yes
       && !opts.command && isInteractive();
     if (wizardEligible) {
-      const answers = await runInitWizard(detectAutoClients(ws));
+      const answers = await runInitWizard(detectActiveClient(ws));
       if (!answers) return; // user bailed out
       clients = answers.clients;
       runIndexAfter = answers.index;

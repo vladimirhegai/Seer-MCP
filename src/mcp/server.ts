@@ -167,7 +167,8 @@ function mcpInstructions(): string {
     'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
     'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
     'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
-    'seer_history is read-only. If it returns a buildHint (no rows for the symbol), you may run a SCOPED seer_symbol_history_build { symbols: [name] } — it builds just that symbol\'s file in ~1s. A FULL history build (no symbols/paths) can take minutes on large repos: ask the user first, or point them at `seer symbol-history`.',
+    'seer_history auto-builds just the queried symbol\'s file on a cold miss (bounded ~1s) and returns its commits — no separate build step. Pass autoBuild=false for a strictly read-only lookup. The FULL repo history index (seer_symbol_history_build with no args) can take minutes on large repos: ask the user first, or point them at `seer symbol-history`.',
+    'For C/C++ member calls where seer_callers reports an ambiguity (resolved count far below the by-name count), narrow with seer_callers groupByFile=true (where the sites concentrate) and filterReceiverType (best-effort receiver class; true infers it); includeNameMatches pages the raw list. SCIP import gives an exact count.',
     'For huge transitive graphs, prefer seer_trace mode="summary" or the compact preview; page with offset/limit and use mode="full" only when raw rows are needed.',
     'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
   ].join(' ');
@@ -615,6 +616,142 @@ export class SeerMcpServer {
   }
 
   /**
+   * Explain a "no symbol" miss that is really a declaration-vs-definition gap.
+   * The default symbol search excludes declarations (header prototypes, forward
+   * decls), so `seer_context { symbol, file: "node.h" }` returns nothing while
+   * the same name in `node.cpp` works — the Codex "felt inconsistent" report.
+   * When the name resolves ONLY to a declaration, return a hint naming the
+   * declaration site(s) and where the real definition lives. Undefined when no
+   * declaration exists (so a genuine miss stays a genuine miss).
+   */
+  private declarationHint(symbol: string, file: string | undefined): {
+    note: string;
+    declarations: Array<{ qualifiedName: string; file: string; lineStart: number }>;
+    definition?: { qualifiedName: string; file: string; lineStart: number };
+  } | undefined {
+    let withDecls;
+    try { withDecls = this.store.getDefinition(symbol, { filePath: file, includeDeclarations: true }); }
+    catch { return undefined; }
+    const decls = (withDecls ?? []).filter(d => d.symbolRole === 'declaration');
+    if (decls.length === 0) return undefined;
+    // Point at the definition that matches the DECLARATION's own class, not the
+    // globally-highest-PageRank same-named symbol. For `add_child` in node.h the
+    // decl is `Node.add_child`, so resolve THAT — otherwise the hint would send
+    // the agent to an unrelated `ChainItem.add_child` that merely ranks higher.
+    let definition;
+    const declQn = decls[0].qualifiedName;
+    try {
+      definition = (declQn ? this.store.getDefinition(declQn)[0] : undefined)
+        ?? this.store.getDefinition(symbol)[0];
+    } catch { /* */ }
+    const defNote = definition ? ` Its definition is in ${definition.filePath}` : '';
+    return {
+      note: `"${symbol}"${file ? ` in ${file}` : ''} resolved only to a DECLARATION (e.g. a header prototype), which symbol tools skip by default.${defNote}. Re-call with the definition's file, or pass includeDeclarations to inspect the declaration itself.`,
+      declarations: decls.slice(0, 4).map(d => ({ qualifiedName: d.qualifiedName ?? d.name, file: d.filePath, lineStart: d.lineStart })),
+      ...(definition ? { definition: { qualifiedName: definition.qualifiedName ?? definition.name, file: definition.filePath, lineStart: definition.lineStart } } : {}),
+    };
+  }
+
+  /** The class segment of a dotted qualified name (`Node.add_child` → `Node`,
+   *  `A.B.method` → `B`). Undefined for an unqualified name. Used to infer the
+   *  receiver type when `filterReceiverType: true`. */
+  private classOfQualified(qualifiedName: string | null | undefined): string | undefined {
+    if (!qualifiedName) return undefined;
+    const parts = qualifiedName.split('.');
+    return parts.length >= 2 ? parts[parts.length - 2] : undefined;
+  }
+
+  /** Does a bounded same-file window show `recv` locally typed as `type`?
+   *  Matches the common C/C++ shapes: `T* v` / `T v` / `T& v`, `Ref<T> v`, and
+   *  `v = memnew(T...)` / `v = cast_to<T>` / `Object::cast_to<T>`. */
+  private receiverLocallyTyped(recv: string, type: string, hay: string): boolean {
+    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const T = esc(type), v = esc(recv);
+    return new RegExp(
+      `\\b${T}\\b\\s*[*&]?\\s*\\b${v}\\b` +
+      `|Ref\\s*<\\s*${T}\\s*>\\s*\\b${v}\\b` +
+      `|\\b${v}\\b\\s*=\\s*(?:memnew\\s*\\(\\s*${T}\\b|(?:Object::)?cast_to\\s*<\\s*${T}\\s*>)`,
+    ).test(hay);
+  }
+
+  /**
+   * Best-effort attribution of type-unresolved by-name call sites to a receiver
+   * class. C/C++ member calls lose the receiver's static type, so `add_child`
+   * scatters across thousands of sites that could belong to `Node`, `TreeItem`,
+   * etc. For each candidate call line this reads the receiver token and looks
+   * back a bounded same-file window for a local typing, bucketing the site as:
+   *   - confirmedTarget  — receiver locally typed as `type`
+   *   - confirmedSibling — receiver locally typed as another same-named class
+   *                        (this is the "discard TreeItem->add_child" the review
+   *                        agents asked for)
+   *   - unresolved       — no local type evidence (typed elsewhere / implicit
+   *                        `this` / macro). The HONEST majority for C++.
+   * Bounded (caps the scan, reads each file once). It is deliberately not a
+   * precise count: SCIP import is the precise path. The value is a high-precision
+   * lower bound for the target plus a confident exclusion of siblings.
+   */
+  private filterCallersByReceiverType(
+    callers: Array<{ callerName: string; callerQualifiedName: string | null; callerKind: string; callerFile: string; callerLine: number; edgeKind: string }>,
+    methodName: string,
+    type: string,
+    siblingTypes: string[],
+    cap = 6000,
+  ): {
+    type: string;
+    siblingTypes: string[];
+    scannedSites: number;
+    confirmedTargetSites: number;
+    confirmedSiblingSites: number;
+    confirmedSiblingByType: Record<string, number>;
+    unresolvedSites: number;
+    capped: boolean;
+    note: string;
+    items: Array<{ callerName: string; callerQualifiedName: string | null; callerKind: string; file: string; line: number; edgeKind: string }>;
+  } {
+    const scan = callers.slice(0, cap);
+    const fileCache = new Map<string, string[] | null>();
+    const readLines = (f: string): string[] | null => {
+      if (fileCache.has(f)) return fileCache.get(f) ?? null;
+      let lines: string[] | null = null;
+      try { lines = fs.readFileSync(f, 'utf8').split(/\r?\n/); } catch { lines = null; }
+      fileCache.set(f, lines);
+      return lines;
+    };
+    const recvRe = new RegExp(`([A-Za-z_]\\w*)\\s*(?:->|\\.)\\s*${methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+    const confirmedTarget: typeof scan = [];
+    const siblingCounts: Record<string, number> = {};
+    let confirmedSibling = 0;
+    let unresolved = 0;
+    for (const c of scan) {
+      const lines = readLines(c.callerFile);
+      if (!lines) { unresolved++; continue; }
+      const m = recvRe.exec(lines[c.callerLine] ?? '');
+      if (!m) { unresolved++; continue; }
+      const recv = m[1];
+      const hay = lines.slice(Math.max(0, c.callerLine - 200), c.callerLine + 1).join('\n');
+      if (this.receiverLocallyTyped(recv, type, hay)) { confirmedTarget.push(c); continue; }
+      const sib = siblingTypes.find(s => this.receiverLocallyTyped(recv, s, hay));
+      if (sib) { siblingCounts[sib] = (siblingCounts[sib] ?? 0) + 1; confirmedSibling++; continue; }
+      unresolved++;
+    }
+    return {
+      type,
+      siblingTypes,
+      scannedSites: scan.length,
+      confirmedTargetSites: confirmedTarget.length,
+      confirmedSiblingSites: confirmedSibling,
+      confirmedSiblingByType: siblingCounts,
+      unresolvedSites: unresolved,
+      capped: callers.length > cap,
+      note: `Best-effort receiver attribution (C/C++ has no static receiver type without SCIP). Of ${scan.length} scanned by-name site(s): ${confirmedTarget.length} are locally typed as ${type}, ${confirmedSibling} as a same-named sibling (excluded), and ${unresolved} have no local type evidence (receiver typed elsewhere / implicit this / macro). Treat confirmedTargetSites as a lower bound and (total - confirmedSiblingSites) as the upper bound; for a precise count import a SCIP index.`,
+      items: confirmedTarget.map(c => ({
+        callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
+        callerKind: c.callerKind, file: c.callerFile, line: c.callerLine, edgeKind: c.edgeKind,
+      })),
+    };
+  }
+
+  /**
    * Emit a list response under a deterministic token budget. Items are assumed
    * pre-sorted by relevance, so we prefix-trim: keep appending until the
    * serialized payload would exceed `tokenBudget * 4` chars (~4 chars/token).
@@ -1029,7 +1166,9 @@ export class SeerMcpServer {
       // Suggestion-only fuzzy fallback: never substitute, just hint.
       if (rows.length === 0) {
         const didYouMean = this.suggestSymbols(query);
+        const declarationHint = this.declarationHint(query, file);
         return this.text({ total: 0, items: [], source: 'tree-sitter',
+          ...(declarationHint ? { declarationHint } : {}),
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const items = rows.map(r => ({
@@ -1063,17 +1202,23 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound — pass includeNameMatches=true for that list.',
+      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound. To narrow that bound: includeNameMatches=true (raw list, pageable with nameMatchOffset), groupByFile=true (accurate per-file breakdown of where the by-name sites concentrate), and filterReceiverType (best-effort: keep only sites whose receiver is locally typed as a given class; true infers the class from the target).',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
         limit: z.number().int().positive().max(500).optional(),
         includeNameMatches: z.boolean().optional()
           .describe('Also return callers matched by SHORT name (type-unresolved upper bound). Useful for C/C++ member calls where the precise id-resolved set undercounts.'),
+        nameMatchOffset: z.number().int().nonnegative().max(1000000).optional()
+          .describe('Offset into the by-name caller list for paging (use with limit + includeNameMatches). nameMatches.nextOffset reports the next page.'),
+        groupByFile: z.boolean().optional()
+          .describe('Return an accurate per-file breakdown of the by-name call sites (where the thousands of type-unresolved sites concentrate) so you can scope a refactor by file without paging raw rows.'),
+        filterReceiverType: z.union([z.string(), z.boolean()]).optional()
+          .describe('Best-effort (C/C++): narrow by-name callers to those whose receiver is locally typed as this class. Pass a class name, or true to infer it from the target symbol. Receivers typed in another file are reported under uncertainSites, not silently dropped.'),
         tokenBudget: z.number().int().positive().max(50000).optional()
           .describe('Soft cap (~4 chars/token) that prefix-trims the (already limit-bounded) caller list.'),
       },
-    }, async ({ symbol, file, limit, includeNameMatches, tokenBudget }) => {
+    }, async ({ symbol, file, limit, includeNameMatches, nameMatchOffset, groupByFile, filterReceiverType, tokenBudget }) => {
       await this.ensureFresh();
       // Resolve to a specific id when the input is DISAMBIGUATING: a `file` was
       // given, or the symbol is qualified (`Node.add_child` / `Node::add_child`).
@@ -1090,8 +1235,10 @@ export class SeerMcpServer {
         : null;
       if (file && !target) {
         const didYouMean = this.suggestSymbols(symbol);
+        const declarationHint = this.declarationHint(symbol, file);
         return this.text({ symbol, file, found: false, total: 0, returned: 0, items: [], source: 'tree-sitter',
           reason: `no symbol "${symbol}" in ${file}`,
+          ...(declarationHint ? { declarationHint } : {}),
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const total = target ? this.store.countCallersById(target.id) : this.store.countCallers(symbol);
@@ -1109,28 +1256,78 @@ export class SeerMcpServer {
       const ambiguity = target
         ? this.callerAmbiguity({ id: target.id, name: target.name, filePath: target.filePath, total })
         : undefined;
-      // Opt-in by-name caller list (the type-unresolved upper bound). Deduped by
-      // caller function so a hub method's list stays useful, capped to limit.
+      // By-name caller analysis (the type-unresolved upper bound). Built when the
+      // agent asks for the raw list (includeNameMatches), a per-file breakdown
+      // (groupByFile), or a receiver-type filter — each a way to narrow the
+      // thousands of by-name sites a hub method attracts. The raw row fetch is
+      // only paid when items or the receiver filter need it; groupByFile uses its
+      // own accurate GROUP BY.
       let nameMatches: Record<string, unknown> | undefined;
-      if (includeNameMatches && target) {
-        const nm = this.store.findCallers(target.name, 1000);
-        const seen = new Set<string>();
-        const deduped = nm.filter(c => {
-          const key = `${c.callerQualifiedName ?? c.callerName}@${c.callerFile}`;
-          if (seen.has(key)) return false;
-          seen.add(key); return true;
-        }).slice(0, limit ?? 40).map(c => ({
-          callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
-          callerKind: c.callerKind, file: c.callerFile, line: c.callerLine, edgeKind: c.edgeKind,
-        }));
+      // `filterReceiverType` is on only for an explicit `true` or a non-empty
+      // class name. An explicit `false` (allowed by the z.union) means OFF —
+      // `!= null` would have wrongly treated it as "infer the type" (on).
+      const wantReceiverFilter = filterReceiverType === true
+        || (typeof filterReceiverType === 'string' && filterReceiverType.trim().length > 0);
+      const wantNameMatches = (includeNameMatches || groupByFile || wantReceiverFilter) && target != null;
+      if (wantNameMatches && target) {
         nameMatches = {
           shortName: target.name,
           total: this.store.countCallers(target.name),
-          uniqueCallers: deduped.length,
-          returned: deduped.length,
           note: 'Callers matched by SHORT name only (type-unresolved). Includes calls to OTHER same-named symbols — an upper bound, not all this symbol\'s callers.',
-          items: deduped,
         };
+        if (includeNameMatches || wantReceiverFilter) {
+          const SCAN_CAP = 6000;
+          const nm = this.store.findCallers(target.name, SCAN_CAP);
+          const seen = new Set<string>();
+          const dedupedAll = nm.filter(c => {
+            const key = `${c.callerQualifiedName ?? c.callerName}@${c.callerFile}`;
+            if (seen.has(key)) return false;
+            seen.add(key); return true;
+          });
+          if (includeNameMatches) {
+            const nmOffset = Math.min(nameMatchOffset ?? 0, dedupedAll.length);
+            const page = dedupedAll.slice(nmOffset, nmOffset + (limit ?? 40)).map(c => ({
+              callerName: c.callerName, callerQualifiedName: c.callerQualifiedName,
+              callerKind: c.callerKind, file: c.callerFile, line: c.callerLine, edgeKind: c.edgeKind,
+            }));
+            nameMatches.uniqueCallers = dedupedAll.length;
+            if (nm.length >= SCAN_CAP) nameMatches.uniqueCallersCapped = true;
+            nameMatches.offset = nmOffset;
+            nameMatches.returned = page.length;
+            nameMatches.nextOffset = nmOffset + page.length < dedupedAll.length ? nmOffset + page.length : null;
+            nameMatches.items = page;
+          }
+          if (wantReceiverFilter) {
+            const type = typeof filterReceiverType === 'string' && filterReceiverType.trim()
+              ? filterReceiverType.trim()
+              : this.classOfQualified(target.qualifiedName);
+            if (type) {
+              const siblings = this.store.definitionClassesByShortName(target.name).filter(c => c && c !== type);
+              const rf = this.filterCallersByReceiverType(nm, target.name, type, siblings);
+              const totalByName = nameMatches.total as number;
+              // The scan is also capped when the upstream by-name fetch hit
+              // SCAN_CAP (findCallers above) — rf.capped alone can't see that,
+              // so reconcile here. When capped we can't trust a sibling count
+              // taken over a partial scan, so we withhold plausibleUpperBound.
+              const scanCapped = rf.capped || nm.length >= SCAN_CAP;
+              nameMatches.receiverTypeFilter = scanCapped
+                ? { ...rf, capped: true }
+                : { ...rf, plausibleUpperBound: totalByName - rf.confirmedSiblingSites };
+            } else {
+              nameMatches.receiverTypeFilter = { note: 'Could not infer a receiver type from the target symbol; pass filterReceiverType: "ClassName" explicitly.' };
+            }
+          }
+        }
+        if (groupByFile) {
+          const totalFiles = this.store.countCallerFilesByName(target.name);
+          const byFile = this.store.groupCallersByFile(target.name, 40);
+          nameMatches.byFile = {
+            totalFiles,
+            returned: byFile.length,
+            ...(byFile.length < totalFiles ? { note: `Top ${byFile.length} of ${totalFiles} files by call-site count — inspect these first.` } : {}),
+            items: byFile.map(f => ({ file: f.relPath, count: f.count })),
+          };
+        }
       }
       const targetMeta = target ? {
         id: target.id, name: target.name, qualifiedName: target.qualifiedName,
@@ -1623,11 +1820,28 @@ export class SeerMcpServer {
       });
       if (!result) {
         const didYouMean = this.suggestSymbols(symbol);
+        const declarationHint = this.declarationHint(symbol, file);
         return this.text({ symbol, total: 0, direct: 0, indirect: 0, tests: [], reason: `no symbol "${symbol}"`,
+          ...(declarationHint ? { declarationHint } : {}),
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
-      return this.text(nameAmbiguity ? { ...result, nameAmbiguity } : result);
+      const out: Record<string, unknown> = nameAmbiguity ? { ...result, nameAmbiguity } : { ...result };
+      // Honest "tests mention this name" signal for the heuristic-only / no-link
+      // cases: when the call graph can't confirm coverage (C/C++ member calls
+      // lose the receiver type), an agent otherwise has to grep tests/ by hand
+      // (the Claude review's "I had to manually find the 46 files"). Surface the
+      // by-name reference count — labelled as references, NOT verified coverage.
+      if (result.testCoverageState === 'heuristic-only' || result.testCoverageState === 'tests-indexed-no-link') {
+        const refs = this.store.countNameCallsInTests(result.symbol.name);
+        if (refs.callSites > 0) {
+          out.testNameReferences = {
+            ...refs,
+            note: `${refs.callSites} call site(s) across ${refs.files} test file(s) invoke a method named "${result.symbol.name}". These are NAME references (receiver type unresolved), not verified coverage of THIS symbol — open the files to confirm.`,
+          };
+        }
+      }
+      return this.text(out);
     });
 
     this.registerTool('seer_trace_path', {
@@ -1792,61 +2006,113 @@ export class SeerMcpServer {
     // ── Track-D tools ───────────────────────────────────────────────────────
 
     this.registerTool('seer_history', {
-      description: 'Read-only per-symbol git history from the prebuilt history index. Returns commits whose hunks overlap the symbol\'s line range. Does not build history; if historyIndex.built is false, only build explicitly with seer_symbol_history_build or CLI symbol-history when requested.',
+      description: 'Per-symbol git history: commits whose hunks overlap the symbol\'s line range, with author, PR, and churn. If history is not built yet, this auto-builds JUST this symbol\'s file(s) inline (bounded, ~1s) and returns the rows — no separate build step needed. Pass autoBuild=false to force a pure read-only lookup. Pass file to disambiguate a common name.',
       inputSchema: {
         symbol: z.string(),
         limit: z.number().int().positive().max(200).optional(),
         since: z.number().int().optional().describe('Unix-seconds lower bound on committed_at'),
         file: z.string().optional(),
+        autoBuild: z.boolean().optional()
+          .describe('On a cold miss, build just this symbol\'s file(s) inline (bounded) so the first call returns history. Default true; set false for a strictly read-only lookup (e.g. inside seer_batch).'),
       },
-    }, async ({ symbol, limit, since, file }) => {
+    }, async ({ symbol, limit, since, file, autoBuild }) => {
       await this.ensureFresh();
-      const historyIndex = this.historyIndexStatus();
+      let historyIndex = this.historyIndexStatus();
       const candidates = this.store.getDefinition(symbol, { filePath: file });
-      const items: any[] = [];
-      const continuityRows = this.countTableRows('symbol_history_continuity');
-      for (const c of candidates.slice(0, 5)) {
-        const history = this.store.getSymbolHistory(c.id, { limit: limit ?? 50, since });
-        const total = this.store.countSymbolHistory(c.id);
-        const continuity = continuityRows > 0 ? getContinuityForSymbol(this.store, c.id) : [];
-        items.push({
-          symbol: { id: c.id, name: c.name, qualifiedName: c.qualifiedName, kind: c.kind, file: c.filePath },
-          total,
-          returned: history.length,
-          commits: history.map(h => ({
-            sha: h.commitSha,
-            author: h.authorName, email: h.authorEmail,
-            committedAt: h.committedAt,
-            message: h.message,
-            linesAdded: h.linesAdded, linesRemoved: h.linesRemoved,
-            prNumber: h.prNumber, prUrl: h.prUrl,
-            matchStrategy: h.matchStrategy, confidence: h.confidence,
-          })),
-          continuity,
-        });
+
+      // Read the current history rows for the resolved candidates. Called again
+      // after a lazy build so the same shaping serves both passes.
+      const readItems = (): any[] => {
+        const out: any[] = [];
+        const continuityRows = this.countTableRows('symbol_history_continuity');
+        for (const c of candidates.slice(0, 5)) {
+          const history = this.store.getSymbolHistory(c.id, { limit: limit ?? 50, since });
+          const total = this.store.countSymbolHistory(c.id);
+          const continuity = continuityRows > 0 ? getContinuityForSymbol(this.store, c.id) : [];
+          out.push({
+            symbol: { id: c.id, name: c.name, qualifiedName: c.qualifiedName, kind: c.kind, file: c.filePath },
+            total,
+            returned: history.length,
+            commits: history.map(h => ({
+              sha: h.commitSha,
+              author: h.authorName, email: h.authorEmail,
+              committedAt: h.committedAt,
+              message: h.message,
+              linesAdded: h.linesAdded, linesRemoved: h.linesRemoved,
+              prNumber: h.prNumber, prUrl: h.prUrl,
+              matchStrategy: h.matchStrategy, confidence: h.confidence,
+            })),
+            continuity,
+          });
+        }
+        return out;
+      };
+
+      let items = readItems();
+      let anyRows = items.some(it => it.total > 0);
+      // The FULL-index signal is the stamped global HEAD (a scoped build leaves it null).
+      const fullyBuilt = (historyIndex as { lastHistoryHeadSha?: string | null }).lastHistoryHeadSha != null;
+
+      // Lazy on-demand build (the fix for the jarring two-step flow three review
+      // agents hit): when the symbol resolves but has NO rows and the full index
+      // isn't built, build just its file(s) inline — bounded by a short deadline
+      // and per-file git timeout, resume-watermarked so a genuinely-empty file is
+      // only ever walked once. A fully-built index that still has no rows is a
+      // real "no history", not a missing build, so we don't re-walk there.
+      let autoBuildInfo: Record<string, unknown> | undefined;
+      const shouldAutoBuild = autoBuild !== false && candidates.length > 0 && !anyRows && !fullyBuilt;
+      if (shouldAutoBuild) {
+        const filePaths = Array.from(new Set(candidates.slice(0, 5).map(c => c.filePath)));
+        const t0 = Date.now();
+        try {
+          const br = await buildSymbolHistory(this.workspace, this.store, {
+            onlyPaths: filePaths,
+            maxCommitsPerFile: 200,
+            deadlineMs: 15_000,
+            gitCommandTimeoutMs: DEFAULT_HISTORY_GIT_TIMEOUT_MS,
+            skipIfHeadUnchanged: true,
+            // Bypass per-file resume watermarks: we only reach here because the
+            // symbol has NO rows, so a watermark that would skip the file is
+            // stale (rows cleared by a reindex but the watermark kept) and must
+            // not block the build. replaceSymbolHistoryForSymbols is delete-then-
+            // insert, so re-walking the file can't duplicate rows.
+            useResumeWatermarks: false,
+          });
+          items = readItems();
+          anyRows = items.some(it => it.total > 0);
+          historyIndex = this.historyIndexStatus();
+          autoBuildInfo = {
+            ran: true,
+            scopedFiles: filePaths.length,
+            rowsInserted: br.historyRowsInserted,
+            completed: br.completed,
+            elapsedMs: Date.now() - t0,
+          };
+        } catch (err) {
+          autoBuildInfo = { ran: true, failed: true, reason: (err as Error).message, elapsedMs: Date.now() - t0 };
+        }
       }
-      // Read-only contract: seer_history never writes. When the resolved symbol
-      // has no rows (either history was never built, or this file changed since
-      // it was — its rows cascade-cleared on reindex), point the agent at the
-      // CHEAP scoped build for exactly this symbol instead of a whole-repo pass.
-      const anyRows = items.some(it => it.total > 0);
-      // `built` is true once ANY rows exist; the FULL-index signal is the stamped
-      // global HEAD (a scoped build deliberately leaves it null).
-      const fullyBuilt = (historyIndex as any).lastHistoryHeadSha != null;
+
+      // Honest hint when there is still nothing to show.
       const buildHint = !anyRows
-        ? `No history rows for "${symbol}". Build just this symbol's file fast with seer_symbol_history_build { symbols: ["${symbol}"]${file ? `, file: "${file}"` : ''} } (~1s, scoped), or \`seer symbol-history\` for the full index.`
+        ? (autoBuildInfo && (autoBuildInfo.failed || autoBuildInfo.completed === false)
+            ? `Inline history build for "${symbol}" did not finish (large/old file). Run \`seer symbol-history --paths "${file ?? candidates[0]?.filePath ?? ''}"\` outside the agent, or retry with a larger budget.`
+            : autoBuild === false
+              ? `No history rows for "${symbol}" and autoBuild=false. Re-call seer_history (autoBuild defaults on) or run seer_symbol_history_build { symbols: ["${symbol}"]${file ? `, file: "${file}"` : ''} }.`
+              : `No git history overlaps "${symbol}"'s current line range. The symbol may be new, or its file changed since the last build.`)
         : undefined;
-      // Three honest states: (1) full index built; (2) not fully built but this
-      // symbol has rows from a SCOPED build; (3) nothing for this symbol yet.
       const note = fullyBuilt
         ? 'Honest limits: by default file renames cut off history at the rename commit (continuity bridges them); symbol renames also cut off there. Confidence drops with commit age.'
         : anyRows
-          ? 'This symbol\'s history is available from a scoped build; the FULL index is not built, so other symbols may report no history until you run `seer symbol-history` or seer_symbol_history_build for them.'
-          : 'Symbol history is not built for this workspace yet. Build a specific symbol fast with seer_symbol_history_build { symbols: [...] }, or run `seer symbol-history --workspace <repo>` outside the agent for the full index.';
+          ? (autoBuildInfo?.ran
+              ? 'History built on demand for this symbol\'s file. The FULL index is not built, so other symbols may report no history until they are queried (each auto-builds its own file) or you run `seer symbol-history`.'
+              : 'This symbol\'s history is available from a scoped build; the FULL index is not built, so other symbols may report no history until queried or you run `seer symbol-history`.')
+          : 'Symbol history is not built for this workspace yet, and the on-demand build returned nothing for this symbol. Run `seer symbol-history --workspace <repo>` outside the agent for the full index.';
       return this.text({
         symbol,
         file,
         historyIndex,
+        ...(autoBuildInfo ? { autoBuild: autoBuildInfo } : {}),
         returned: items.length,
         results: items,
         ...(buildHint ? { buildHint } : {}),
@@ -2593,7 +2859,9 @@ export class SeerMcpServer {
       });
       if (!packet) {
         const didYouMean = this.suggestSymbols(symbol);
+        const declarationHint = this.declarationHint(symbol, file);
         return this.text({ found: false, reason: `no symbol "${symbol}"`,
+          ...(declarationHint ? { declarationHint } : {}),
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
@@ -2695,6 +2963,12 @@ export class SeerMcpServer {
         // field would otherwise reach the store as `undefined`.
         const v = this.validateToolArgs(toolName, c.args);
         if (!v.ok) { results.push({ tool: toolName, ok: false, error: v.error }); continue; }
+        // Keep seer_batch strictly read-only: seer_history can auto-build its
+        // file on a cold miss, so default that off inside a batch. An explicit
+        // autoBuild:true in the entry still wins for a caller who wants it.
+        if (toolName === 'seer_history' && v.data && (v.data as { autoBuild?: boolean }).autoBuild === undefined) {
+          (v.data as { autoBuild?: boolean }).autoBuild = false;
+        }
         try {
           const r = await h(v.data);
           const raw = r?.content?.[0]?.text;

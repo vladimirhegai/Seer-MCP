@@ -247,8 +247,18 @@ export async function buildSymbolHistory(
   // may be absolute or repo-relative; normalize to the absolute keys the symbol
   // table uses so the IN-filter matches.
   const scoped = Array.isArray(options.onlyPaths) && options.onlyPaths.length > 0;
-  const scopedAbs = scoped
-    ? options.onlyPaths!.map(p => (path.isAbsolute(p) ? p : path.resolve(repoRoot, p)))
+  // Pass BOTH the raw inputs (which may be repo-relative) and their absolute
+  // resolution. The store matches case/separator-insensitively against either
+  // f.path or f.rel_path, so a relative path, an absolute path, or a Windows
+  // drive letter whose case differs from the indexed value all resolve to the
+  // right files. (Resolving to absolute only, then exact-matching f.path, used
+  // to miss on Windows because `path.resolve` upper-cases the drive letter while
+  // the index stored it lower-case — yielding 0 files and 0 history rows.)
+  const scopedPathHints = scoped
+    ? Array.from(new Set([
+        ...options.onlyPaths!,
+        ...options.onlyPaths!.map(p => (path.isAbsolute(p) ? p : path.resolve(repoRoot, p))),
+      ]))
     : [];
 
   // `--force` (skipIfHeadUnchanged===false) disables resume too unless a caller
@@ -259,7 +269,7 @@ export async function buildSymbolHistory(
   if (!useResume && !scoped) store.clearSymbolHistoryWatermarks(repoRoot);
 
   const symbols = scoped
-    ? store.listSymbolsForHistoryIndexForFiles(scopedAbs)
+    ? store.listSymbolsForHistoryIndexForFiles(scopedPathHints)
     : store.listSymbolsForHistoryIndex();
   if (symbols.length === 0) {
     return done(true, 0, 0, 0, 0, 0, false);

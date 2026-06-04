@@ -1568,6 +1568,93 @@ export class Store {
   }
 
   /**
+   * Per-file call-site counts for a callee SHORT name, accurate over EVERY call
+   * site (not a sample). Powers `seer_callers` groupByFile: when a hub method
+   * like `add_child` has thousands of type-unresolved by-name call sites, an
+   * agent can see WHERE they concentrate (e.g. editor/* plugins) and narrow the
+   * refactor scope without paging through raw rows.
+   */
+  groupCallersByFile(symbolName: string, limit = 100): Array<{ file: string; relPath: string; count: number }> {
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT f.path AS file, f.rel_path AS relPath, COUNT(*) AS c
+      FROM edges e
+      JOIN symbols s ON s.id = e.from_id
+      JOIN files   f ON f.id = s.file_id
+      WHERE e.to_name IN (${inPh}) AND e.kind = 'call'
+      GROUP BY f.id
+      ORDER BY c DESC, f.rel_path
+      LIMIT ?
+    `).all(...variants, limit) as Row[];
+    return rows.map(r => ({ file: toStr(r.file), relPath: toStr(r.relPath), count: toNum(r.c) }));
+  }
+
+  /** Distinct (simple) class names that define a given short method name, taken
+   *  from the dotted qualified_name (`Node.add_child` → `Node`,
+   *  `FabrikInverseKinematic.ChainItem.add_child` → `ChainItem`). Lets
+   *  `seer_callers` tell a target class apart from same-named siblings when
+   *  attributing type-unresolved call sites by receiver. */
+  definitionClassesByShortName(shortName: string): string[] {
+    if (!shortName) return [];
+    const rows = this.db.prepare(`
+      SELECT DISTINCT qualified_name AS q FROM symbols
+      WHERE name = ?
+        AND kind IN ('function','method','constructor','class')
+        AND (symbol_role IS NULL OR symbol_role = 'definition')
+        AND qualified_name IS NOT NULL
+    `).all(shortName) as Row[];
+    const classes = new Set<string>();
+    for (const r of rows) {
+      const q = toStr(r.q);
+      const idx = q.lastIndexOf('.');
+      if (idx > 0) {
+        const cls = q.slice(0, idx);
+        classes.add(cls.split('.').pop() || cls);
+      }
+    }
+    return Array.from(classes);
+  }
+
+  /** Count of DISTINCT files containing a by-name call site (the denominator for
+   *  groupByFile's "top N of M files"). */
+  countCallerFilesByName(symbolName: string): number {
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
+    const row = this.db.prepare(`
+      SELECT COUNT(DISTINCT s.file_id) AS c
+      FROM edges e JOIN symbols s ON s.id = e.from_id
+      WHERE e.to_name IN (${inPh}) AND e.kind = 'call'
+    `).get(...variants) as Row;
+    return toNum(row.c);
+  }
+
+  /**
+   * By-name call sites of a method that land in TEST files, with the distinct
+   * test-file count. Honest "tests mention this name" signal for the
+   * heuristic-only coverage case (C/C++ member calls whose receiver type is
+   * unresolved): these are REFERENCES, not proof of coverage. Lets an agent skip
+   * a manual `rg tests/` to size the surface. Returns zeros when the DB predates
+   * file-role classification.
+   */
+  countNameCallsInTests(symbolName: string): { callSites: number; files: number } {
+    const variants = symbolNameVariants(symbolName);
+    const inPh = variants.map(() => '?').join(', ');
+    try {
+      const row = this.db.prepare(`
+        SELECT COUNT(*) AS sites, COUNT(DISTINCT s.file_id) AS files
+        FROM edges e
+        JOIN symbols s ON s.id = e.from_id
+        JOIN files   f ON f.id = s.file_id
+        WHERE e.to_name IN (${inPh}) AND e.kind = 'call' AND f.role = 'test'
+      `).get(...variants) as Row;
+      return { callSites: toNum(row.sites), files: toNum(row.files) };
+    } catch {
+      return { callSites: 0, files: 0 };
+    }
+  }
+
+  /**
    * Callees emitted by a specific caller symbol id — never collapses
    * short-name siblings the way `findCallees(name)` does. Returns one row
    * per call edge.
@@ -3119,10 +3206,22 @@ export class Store {
    * symbols whose files were requested, instead of every symbol in the repo.
    */
   listSymbolsForHistoryIndexForFiles(
-    absPaths: string[],
+    paths: string[],
   ): Array<{ id: number; fileId: number; filePath: string; relPath: string; fileHash: string; lineStart: number; lineEnd: number; symbolKey: string }> {
-    if (absPaths.length === 0) return [];
-    const placeholders = absPaths.map(() => '?').join(',');
+    if (paths.length === 0) return [];
+    // Path inputs may be absolute OR repo-relative and, on Windows, can differ
+    // from the stored f.path only by drive-letter case (`c:` vs `C:`) or path
+    // separator (`\` vs `/`). The old exact `f.path IN (...)` match silently
+    // returned nothing in those cases — which broke EVERY scoped/on-demand
+    // symbol-history build on Windows (the agent-facing "~1s history" path).
+    // Normalize both sides (lower-case + forward slashes, strip `./` and a
+    // trailing slash) and match against BOTH the absolute path and the rel_path,
+    // so an absolute, a relative, or a differently-cased input all resolve.
+    const norm = (p: string): string =>
+      p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase();
+    const keys = Array.from(new Set(paths.map(norm))).filter(Boolean);
+    if (keys.length === 0) return [];
+    const ph = keys.map(() => '?').join(',');
     const rows = this.db.prepare(`
       SELECT s.id, s.file_id AS fileId, f.path AS filePath, f.rel_path AS relPath,
              f.hash AS fileHash,
@@ -3130,8 +3229,11 @@ export class Store {
       FROM symbols s JOIN files f ON f.id = s.file_id
       WHERE s.symbol_key IS NOT NULL
         AND s.kind IN ('function','method','constructor','class')
-        AND f.path IN (${placeholders})
-    `).all(...absPaths) as Row[];
+        AND (
+          lower(replace(f.path, '\\', '/')) IN (${ph})
+          OR lower(replace(f.rel_path, '\\', '/')) IN (${ph})
+        )
+    `).all(...keys, ...keys) as Row[];
     return rows.map(r => ({
       id: toNum(r.id), fileId: toNum(r.fileId),
       filePath: toStr(r.filePath), relPath: toStr(r.relPath),
@@ -4598,7 +4700,12 @@ export function symbolNameVariants(name: string): string[] {
     if (!seen.has(v)) { seen.add(v); out.push(v); }
   };
   add(name);
+  // Seer normalizes C++/Rust qualified names to the dot form at index time, but
+  // match BOTH directions so a lookup is robust to either spelling: a caller
+  // passing `Node::add_child` resolves the stored `Node.add_child`, and a
+  // `::`-form name from a SCIP import resolves a dotted query too.
   if (name.includes('::')) add(name.replace(/::/g, '.'));
+  if (name.includes('.'))  add(name.replace(/\./g, '::'));
   return out;
 }
 

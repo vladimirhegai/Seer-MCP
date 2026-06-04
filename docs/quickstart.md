@@ -18,10 +18,11 @@ npx seer-mcp init
 
 This launches a short wizard:
 
-1. **Which AI agent(s)?** Seer lists every supported client and pre-selects the
-   one it detects. Press Enter to accept, or type the numbers you want (e.g.
-   `1,3`). It only writes config for what you pick — choosing Antigravity will
-   not create `.cursor/` or `.vscode/`.
+1. **Which AI agent?** Seer lists every supported client and pre-selects the one
+   it detects. Press Enter to accept, or type the number you want. A Seer index
+   belongs to one repo, so this is a single choice — it only writes config for
+   that agent, so choosing Antigravity will not create `.cursor/` or `.vscode/`.
+   (Wiring several agents into one repo? Use `--client a,b`.)
 2. **Antigravity extensions** (only if you picked Antigravity). Antigravity can
    host Claude, Codex, and Gemini agent extensions, each reading its own MCP
    config. Pick any you also use, or leave blank to skip.

@@ -104,21 +104,27 @@ undocumented eager flags.
 
 ## History Tools
 
-`seer_history` is read-only and returns quickly. If it reports
-`historyIndex.built: false`, build history explicitly:
+`seer_history` auto-builds just the queried symbol's file inline on a cold miss
+(bounded, ~1s) and returns its commits — so a single-symbol question needs no
+separate step. Pass `autoBuild: false` for a strictly read-only lookup.
+
+The expensive part is the FULL repo history index. That stays explicit — build
+it for the whole repo with:
 
 ```bash
 npx seer-mcp symbol-history --workspace C:/path/to/repo
 ```
 
-Or ask the MCP tool to do a bounded pass:
+Or ask the MCP tool (`seer_symbol_history_build`, no `symbols`/`paths`) for a
+bounded pass:
 
 ```json
 { "maxSeconds": 60, "maxFiles": 200 }
 ```
 
-Agents should ask before starting a history build. For very large repos, prefer
-the shell command so the agent session is not tied up by git history walking.
+Agents should ask before starting a FULL history build. For very large repos,
+prefer the shell command so the agent session is not tied up by git history
+walking.
 
 ## Files By Client
 

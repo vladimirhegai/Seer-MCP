@@ -49,10 +49,11 @@ Requires Node.js 24+ on Windows, macOS, or Linux.
 That starts a short interactive setup that asks you three things and does the
 rest:
 
-1. **Which AI agent(s)** you use (Antigravity, Claude Code, Codex, Cursor,
-   Gemini, VS Code, Windsurf). It pre-selects the one it detects, so usually you
-   just press Enter. If you pick Antigravity, it also offers to wire up any
-   Claude / Codex / Gemini extensions you run inside it.
+1. **Which AI agent** you use (Antigravity, Claude Code, Codex, Cursor, Gemini,
+   VS Code, Windsurf) — one agent per repo, so this is a single choice. It
+   pre-selects the one it detects, so usually you just press Enter. If you pick
+   Antigravity, it also offers to wire up any Claude / Codex / Gemini extensions
+   you run inside it.
 2. **Index now?** — recommended. Builds the local map so the first agent query
    is instant.
 3. **Index git history too?** — optional, off by default (slow on large repos).

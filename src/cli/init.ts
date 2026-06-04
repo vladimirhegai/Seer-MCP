@@ -353,6 +353,49 @@ export function detectAutoClients(_workspace: string): ClientId[] {
   return ALL_CLIENTS.filter((c) => selected.has(c));
 }
 
+/** Join the env values that reveal which editor/CLI launched this shell. */
+function forkHaystack(): string {
+  const keys = [
+    'VSCODE_GIT_ASKPASS_NODE', 'VSCODE_GIT_ASKPASS_MAIN', 'VSCODE_GIT_ASKPASS_EXTRA_ARGS',
+    'VSCODE_IPC_HOOK', 'VSCODE_IPC_HOOK_CLI', '__CFBundleIdentifier', 'TERM_PROGRAM',
+    'ANTIGRAVITY', 'ANTIGRAVITY_IDE', 'GOOGLE_ANTIGRAVITY',
+  ];
+  return keys.map((k) => process.env[k] ?? '').join('\n').toLowerCase();
+}
+
+/**
+ * Best-effort detection of the SINGLE agent whose integrated shell we are
+ * running inside — for the interactive wizard's pre-selection. Unlike
+ * `detectAutoClients` (which returns a whole default set for the `--auto`
+ * non-interactive path), this names at most one client, so the wizard
+ * pre-selects only that instead of marking every client "(detected)" — the
+ * behaviour a user flagged when running it inside Antigravity.
+ *
+ * Env-first: the agent that launched the terminal sets identifying variables.
+ * Conservative: returns null when it cannot tell, and the wizard then asks with
+ * no pre-selection rather than guessing wrong. The user always has the final say.
+ */
+export function detectActiveClient(workspace: string): ClientId | null {
+  const env = process.env;
+  // Claude Code marks its own shell.
+  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_ENTRYPOINT) return 'claude';
+  // The VS Code family (VS Code, Cursor, Windsurf, Antigravity) are all forks
+  // that set VSCODE_*/TERM_PROGRAM. Disambiguate the fork by the app name baked
+  // into the git-askpass helper paths (and a few fork-specific vars).
+  const hay = forkHaystack();
+  if (/antigravity/.test(hay)) return 'antigravity';
+  if (/windsurf|codeium/.test(hay)) return 'windsurf';
+  if (/cursor/.test(hay)) return 'cursor';
+  // CLI agents that run in a plain terminal expose their own markers.
+  if (env.CODEX_SANDBOX || env.CODEX_SANDBOX_NETWORK_DISABLED || env.CODEX_HOME) return 'codex';
+  if (env.GEMINI_CLI || env.GEMINI_SANDBOX) return 'gemini';
+  // Plain VS Code / Copilot, once the forks above are ruled out.
+  if (env.TERM_PROGRAM === 'vscode' || /[\\/](?:microsoft vs code|code)[\\/]/.test(hay)) return 'vscode';
+  // Weak fallback: a project-local Antigravity config already exists here.
+  if (workspaceHasAntigravityConfig(workspace)) return 'antigravity';
+  return null;
+}
+
 function jsonHasSeer(spec: ClientSpec, file: string): boolean | null {
   const parsed = readJsonTolerant(file);
   if (!parsed.ok) return null;
@@ -662,11 +705,11 @@ function agentsBlock(): string {
     '  preview. Page with `offset`/`limit`; use `mode: "full"` only when raw',
     '  rows are needed.',
     '- `seer_behavior`: tests that describe expected behavior.',
-    '- `seer_history`: read-only commits that touched a symbol. If it returns a',
-    '  `buildHint` (no rows yet), you may run a SCOPED',
-    '  `seer_symbol_history_build { symbols: [name] }` — it builds just that',
-    '  symbol\'s file in ~1s. A FULL build (no symbols/paths) can take minutes;',
-    '  ask the user or point them at `seer symbol-history`.',
+    '- `seer_history`: commits that touched a symbol. On a cold miss it auto-builds',
+    '  just that symbol\'s file (~1s) and returns the history — no separate step.',
+    '  Pass `autoBuild: false` for a strictly read-only lookup. The FULL repo index',
+    '  (`seer_symbol_history_build` with no args) can take minutes; ask the user or',
+    '  point them at `seer symbol-history`.',
     '- `seer_skeleton { file }`: cheap file shape before a full read.',
     '- `seer_architecture` / `seer_modules` / `seer_boundaries`: repo orientation.',
     '',
@@ -679,8 +722,11 @@ function agentsBlock(): string {
     '3. C/C++ member calls (`obj->method()`) lose the receiver type, so the precise',
     '   id-resolved count can undercount badly. When `seer_callers`/`seer_context`',
     '   returns an `ambiguity` block, the real caller set is between the resolved',
-    '   count and `nameCallsites`. Pass `includeNameMatches: true` for the by-name',
-    '   upper bound, then `rg` the receiver type to confirm the true sites.',
+    '   count and `nameCallsites`. Narrow it with `seer_callers`: `groupByFile: true`',
+    '   shows where the by-name sites concentrate; `filterReceiverType` (a class',
+    '   name, or true to infer it) attributes sites by receiver type (best-effort);',
+    '   `includeNameMatches: true` pages the raw list (`nameMatchOffset`). Import a',
+    '   SCIP index for an exact count.',
     '4. `seer_behavior` finds tests; treat `lowConfidence: true` /',
     '   `testCoverageState: "heuristic-only"` as a hint, not proof of coverage.',
     '5. `rg` for bindings, fixtures, docs, and string/script references that the',

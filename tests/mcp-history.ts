@@ -1,10 +1,11 @@
 /**
  * Regression coverage for MCP history behavior.
  *
- * seer_history must be a bounded read-only query. It should never build the
- * expensive symbol-history index inline, because large repos can leave the MCP
- * server busy for minutes. The explicit seer_symbol_history_build tool remains
- * available and is bounded by maxSeconds/maxFiles.
+ * seer_history auto-builds JUST the queried symbol's file(s) inline on a cold
+ * miss (bounded ~1s) so "history of one symbol" works on the first call. The
+ * pure read-only path is still available via autoBuild=false, and the FULL
+ * index build stays explicit (seer_symbol_history_build, bounded by
+ * maxSeconds/maxFiles). This suite checks both paths plus the scoped builds.
  *
  * Run: npm run build && npx tsx tests/mcp-history.ts
  */
@@ -47,11 +48,20 @@ async function main(): Promise<void> {
     '}',
     '',
   ].join('\n'));
+  // A second symbol in its own file exercises the read-only (autoBuild=false)
+  // and the inline auto-build paths without colliding with the scoped/full
+  // builds that the first file (historyTarget) drives.
+  fs.writeFileSync(path.join(TMP_WS, 'other.ts'), [
+    'export function otherTarget(): number {',
+    '  return 2;',
+    '}',
+    '',
+  ].join('\n'));
 
   if (!git(['init'])) { bad('git init'); return; }
   git(['config', 'user.email', 'seer@example.test']);
   git(['config', 'user.name', 'Seer Test']);
-  if (!git(['add', 'sample.ts'])) { bad('git add'); return; }
+  if (!git(['add', '.'])) { bad('git add'); return; }
   if (!git(['commit', '-m', 'initial history target'])) { bad('git commit'); return; }
 
   const proc = spawn(process.execPath, [CLI, 'mcp', '--workspace', TMP_WS, '--no-watch', '--no-jit'], {
@@ -98,23 +108,28 @@ async function main(): Promise<void> {
       clientInfo: { name: 'mcp-history', version: '0.1.0' },
     });
 
+    // Read-only path: autoBuild=false must NOT build inline — rows stay 0 and a
+    // buildHint points at the recovery (re-call without the flag, or the scoped
+    // build tool). Uses otherTarget so the global index stays cold for the
+    // scoped/full-build steps below.
     const before = await call('tools/call', {
       name: 'seer_history',
-      arguments: { symbol: 'historyTarget', limit: 5 },
+      arguments: { symbol: 'otherTarget', limit: 5, autoBuild: false },
     }, 5_000);
     const beforeParsed = JSON.parse(before.result?.content?.[0]?.text ?? '{}');
-    if (beforeParsed.historyIndex?.built === false && beforeParsed.historyIndex?.rows === 0) {
-      ok('seer_history does not auto-build symbol history');
+    if (beforeParsed.historyIndex?.built === false && beforeParsed.historyIndex?.rows === 0
+        && beforeParsed.autoBuild === undefined) {
+      ok('seer_history autoBuild=false stays read-only (no inline build)');
     } else {
-      bad('seer_history auto-built or omitted historyIndex', beforeParsed);
+      bad('seer_history autoBuild=false built or omitted historyIndex', beforeParsed);
     }
-    // Cold read must carry an actionable buildHint naming the scoped build path.
+    // The read-only miss must carry an actionable buildHint.
     if (typeof beforeParsed.buildHint === 'string'
         && beforeParsed.buildHint.includes('seer_symbol_history_build')
-        && beforeParsed.buildHint.includes('historyTarget')) {
-      ok('seer_history surfaces a scoped buildHint when nothing is built');
+        && beforeParsed.buildHint.includes('otherTarget')) {
+      ok('seer_history surfaces a buildHint when read-only and nothing is built');
     } else {
-      bad('seer_history missing/!scoped buildHint on cold index', beforeParsed.buildHint);
+      bad('seer_history missing buildHint on cold read-only call', beforeParsed.buildHint);
     }
 
     // A scoped request that resolves no files must NOT silently fall through to
@@ -165,10 +180,25 @@ async function main(): Promise<void> {
       bad('seer_history did not reflect scoped build', midParsed);
     }
 
+    // NEW: inline auto-build. otherTarget has never been built and the global
+    // index is still not fully built, so a DEFAULT seer_history call builds just
+    // its file inline and returns rows in one shot — no separate build step.
+    const auto = await call('tools/call', {
+      name: 'seer_history',
+      arguments: { symbol: 'otherTarget', limit: 5 },
+    }, 20_000);
+    const autoParsed = JSON.parse(auto.result?.content?.[0]?.text ?? '{}');
+    if (autoParsed.autoBuild?.ran === true && autoParsed.results?.[0]?.returned >= 1
+        && autoParsed.buildHint === undefined) {
+      ok('seer_history auto-builds the symbol file inline on a cold miss and returns rows');
+    } else {
+      bad('seer_history did not auto-build on cold miss', autoParsed);
+    }
+
     const build = await call('tools/call', {
       name: 'seer_symbol_history_build',
-      arguments: { maxSeconds: 5, maxFiles: 1, gitCommandTimeoutMs: 5000, force: true },
-    }, 15_000);
+      arguments: { maxSeconds: 10, maxFiles: 2, gitCommandTimeoutMs: 5000, force: true },
+    }, 20_000);
     const buildParsed = JSON.parse(build.result?.content?.[0]?.text ?? '{}');
     if (buildParsed.completed === true && buildParsed.historyRowsInserted >= 1 && buildParsed.scoped === false) {
       ok('seer_symbol_history_build completes bounded explicit FULL build');
