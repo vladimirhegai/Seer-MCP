@@ -187,10 +187,22 @@ interface ClientSpec {
   workspaceServerName?: boolean;
   /** Some clients support cwd and otherwise launch stdio servers from the editor install dir. */
   cwd?: boolean;
+  /** Path segments (under the user home dir) of the base directory where the client caches
+   *  tool schemas per server (one subdir per server name). Present only for clients that
+   *  maintain their own schema cache outside the MCP config files. Resolved against the home
+   *  dir at use-time so the location stays correct under a redirected home. On uninstall Seer
+   *  deletes the matching server-name subdir so no orphan caches remain. */
+  toolSchemaCacheDir?: string[];
+}
+
+function homeDir(): string {
+  // SEER_HOME_OVERRIDE lets tests redirect the user-home tree to a temp dir so
+  // they never read or delete real config/cache files. Unset in normal use.
+  return process.env.SEER_HOME_OVERRIDE || os.homedir();
 }
 
 function home(...p: string[]): string {
-  return path.join(os.homedir(), ...p);
+  return path.join(homeDir(), ...p);
 }
 
 const CLIENTS: Record<ClientId, ClientSpec> = {
@@ -239,6 +251,7 @@ const CLIENTS: Record<ClientId, ClientSpec> = {
     projectWorkspaceArg: true,
     workspaceServerName: true,
     cwd: true,
+    toolSchemaCacheDir: ['.gemini', 'antigravity-ide', 'mcp'],
   },
   windsurf: {
     label: 'Windsurf',
@@ -822,6 +835,7 @@ export interface UninstallOptions {
   agents?: boolean;   // also strip guidance files (default true)
   print?: boolean;    // dry run: report, do not write
   force?: boolean;    // remove global entries even when pinned elsewhere
+  removeDb?: boolean; // also delete the .seer/ index directory
 }
 
 export interface UninstallResult {
@@ -960,6 +974,31 @@ function uninstallClient(client: ClientId, opts: UninstallOptions): UninstallEnt
   if (useGlobal || opts.global) {
     for (const extra of spec.extraGlobalPaths ?? []) results.push(removeTarget(extra, true));
   }
+
+  // Clean up the client's tool-schema cache directory. The server name is
+  // deterministic from the workspace path, so we can derive the exact cache
+  // subdir without any stored state. Also remove the legacy generic 'seer'
+  // cache dir that pre-workspace-scoped installs left behind — it's an orphan
+  // once workspaceServerName is in use and is safe to delete on any uninstall.
+  if (spec.toolSchemaCacheDir) {
+    const cacheBase = home(...spec.toolSchemaCacheDir);
+    const removeCacheDir = (dir: string, label: string): void => {
+      if (!fs.existsSync(dir)) return;
+      if (!opts.print) fs.rmSync(dir, { recursive: true, force: true });
+      results.push({ label, file: dir, action: 'deleted' });
+    };
+    removeCacheDir(
+      path.join(cacheBase, serverNameFor(spec, opts.workspace)),
+      `${spec.label} schema cache`,
+    );
+    if (spec.workspaceServerName) {
+      removeCacheDir(
+        path.join(cacheBase, 'seer'),
+        `${spec.label} schema cache (legacy)`,
+      );
+    }
+  }
+
   return results;
 }
 
@@ -1010,6 +1049,17 @@ export function runUninstall(opts: UninstallOptions): UninstallResult {
     contextFiles.push(removeContextFile('AGENTS.md', 'AGENTS.md (agent guide)', { ...opts, workspace }));
     contextFiles.push(removeContextFile('CLAUDE.md', 'CLAUDE.md (Claude guide)', { ...opts, workspace }));
     contextFiles.push(removeContextFile('GEMINI.md', 'GEMINI.md (Gemini guide)', { ...opts, workspace }));
+  }
+
+  if (opts.removeDb && !opts.global) {
+    const dbDir = path.join(workspace, '.seer');
+    const exists = fs.existsSync(dbDir);
+    if (exists && !opts.print) fs.rmSync(dbDir, { recursive: true, force: true });
+    entries.push({
+      label: 'Seer index (.seer/)',
+      file: dbDir,
+      action: exists ? 'deleted' : 'skipped',
+    });
   }
 
   return { entries, contextFiles };

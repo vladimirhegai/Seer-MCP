@@ -244,13 +244,11 @@ Uninstall changes:
 - Deletes a config file if it only contained Seer.
 - Preserves non-Seer content in the same files.
 
-Uninstall does not delete `<repo>/.seer/graph.db`. Delete `.seer/` yourself if
-you want the cache gone.
-
 Useful uninstall flags:
 
 | Flag | Use |
 |---|---|
+| `--remove-db` | Also delete the `.seer/` index directory (irreversible). |
 | `--client antigravity` | Remove only one client. |
 | `--global` | Only remove user-level config entries. |
 | `--no-agents` | Leave `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md` alone. |
@@ -258,6 +256,9 @@ Useful uninstall flags:
 | `--print` | Dry run. |
 
 `--global` does not touch repo guidance files.
+
+By default uninstall leaves `<repo>/.seer/graph.db` on disk so a reinstall is
+fast. Pass `--remove-db` for a complete clean-up.
 
 ## Common Fixes
 

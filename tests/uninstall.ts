@@ -11,6 +11,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 import { runInit, runUninstall, ClientId } from '../src/cli/init';
 
 let passed = 0;
@@ -32,6 +33,13 @@ const PROJECT_CLIENTS: ClientId[] = ['claude', 'cursor', 'vscode', 'codex', 'gem
 
 function main(): void {
   console.log('\nSeer Uninstall Tests\n====================\n');
+
+  // Redirect the user-home tree to a temp dir for the whole suite so schema-cache
+  // cleanup (which lives under ~/.gemini/...) never reads or deletes a developer's
+  // real Antigravity cache, and the no-op/idempotency tests stay deterministic.
+  const fakeHome = path.join(os.tmpdir(), `seer-uninstall-home-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  fs.mkdirSync(fakeHome, { recursive: true });
+  process.env.SEER_HOME_OVERRIDE = fakeHome;
 
   // ── 1. Basic removal: init then uninstall, all project-local clients ─────
   {
@@ -212,6 +220,71 @@ function main(): void {
 
     fs.rmSync(ws, { recursive: true, force: true });
   }
+
+  // ── 10. --remove-db deletes .seer/ ──────────────────────────────────────
+  {
+    const ws = freshWs('remove-db');
+    runInit({ workspace: ws, clients: ['claude'] });
+    const dbDir = path.join(ws, '.seer');
+    fs.mkdirSync(dbDir, { recursive: true });
+    fs.writeFileSync(path.join(dbDir, 'graph.db'), 'fake');
+
+    const r = runUninstall({ workspace: ws, clients: ['claude'], removeDb: true });
+
+    check(!fs.existsSync(dbDir), '10.--remove-db deletes .seer/ directory');
+    const dbEntry = r.entries.find((e) => e.label === 'Seer index (.seer/)');
+    check(dbEntry?.action === 'deleted', '10.entry reports deleted', dbEntry?.action);
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 11. --remove-db skips gracefully when .seer/ does not exist ──────────
+  {
+    const ws = freshWs('remove-db-absent');
+    runInit({ workspace: ws, clients: ['claude'] });
+
+    const r = runUninstall({ workspace: ws, clients: ['claude'], removeDb: true });
+
+    const dbEntry = r.entries.find((e) => e.label === 'Seer index (.seer/)');
+    check(dbEntry?.action === 'skipped', '11.--remove-db skips cleanly when .seer/ absent', dbEntry?.action);
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  // ── 12. antigravity schema-cache dir (and legacy 'seer' dir) are removed ──
+  {
+    const ws = freshWs('ag-cache');
+    runInit({ workspace: ws, clients: ['antigravity'] });
+
+    // Reproduce the server name the same way init.ts does (workspaceServerName=true).
+    const slug = path.basename(path.resolve(ws)).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 32) || 'workspace';
+    const hash = crypto.createHash('sha1').update(path.resolve(ws).toLowerCase()).digest('hex').slice(0, 8);
+    const serverName = `seer_${slug}_${hash}`;
+
+    // Simulate Antigravity's schema cache directory for this workspace + the legacy 'seer' dir.
+    // Lives under the redirected fake home, so the real ~/.gemini cache is never touched.
+    const cacheBase = path.join(fakeHome, '.gemini', 'antigravity-ide', 'mcp');
+    const wsCache   = path.join(cacheBase, serverName);
+    const legacyCache = path.join(cacheBase, 'seer');
+    fs.mkdirSync(wsCache,    { recursive: true });
+    fs.mkdirSync(legacyCache, { recursive: true });
+    fs.writeFileSync(path.join(wsCache,    'seer_context.json'), '{}');
+    fs.writeFileSync(path.join(legacyCache, 'seer_context.json'), '{}');
+
+    const r = runUninstall({ workspace: ws, clients: ['antigravity'] });
+
+    check(!fs.existsSync(wsCache),    '12.workspace-scoped schema cache dir deleted');
+    check(!fs.existsSync(legacyCache), '12.legacy seer schema cache dir deleted');
+    const wsEntry     = r.entries.find((e) => e.label === 'Google Antigravity schema cache');
+    const legacyEntry = r.entries.find((e) => e.label === 'Google Antigravity schema cache (legacy)');
+    check(wsEntry?.action     === 'deleted', '12.ws cache entry reports deleted',     wsEntry?.action);
+    check(legacyEntry?.action === 'deleted', '12.legacy cache entry reports deleted', legacyEntry?.action);
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  delete process.env.SEER_HOME_OVERRIDE;
+  fs.rmSync(fakeHome, { recursive: true, force: true });
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);

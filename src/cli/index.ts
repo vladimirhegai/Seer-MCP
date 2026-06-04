@@ -378,8 +378,9 @@ program
   .option('--no-agents', 'Do not touch guidance files (AGENTS.md, CLAUDE.md, GEMINI.md)')
   .option('--force', 'Remove global seer entries even if they are pinned to another workspace')
   .option('--print', 'Dry run  show what would change without writing anything')
+  .option('--remove-db', 'Also delete the .seer/ index directory (irreversible)')
   .action((workspace: string | undefined, opts: {
-    client?: string; global?: boolean; agents?: boolean; force?: boolean; print?: boolean;
+    client?: string; global?: boolean; agents?: boolean; force?: boolean; print?: boolean; removeDb?: boolean;
   }) => {
     const ws = path.resolve(workspace ?? process.cwd());
 
@@ -392,6 +393,7 @@ program
       agents: opts.agents,
       force: opts.force,
       print: opts.print,
+      removeDb: opts.removeDb,
     });
 
     console.log(`\nSeer Uninstall  ${opts.print ? '(dry run - nothing written)' : ''}`);
