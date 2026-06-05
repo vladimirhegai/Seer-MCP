@@ -8,7 +8,7 @@ import { computePageRank } from '../graph/pagerank.js';
 import { Store } from '../db/store.js';
 import { classifyFile } from './classify.js';
 import { buildModules } from './modules.js';
-import { buildBoundaries } from './boundaries.js';
+import { boundaryInputFingerprint, buildBoundaries } from './boundaries.js';
 import { buildShapeHashes } from './shapehash.js';
 import { normalizeHttpTarget, resolveServiceLinks } from './serviceLinks.js';
 import { scanProtoFiles } from './protoScanner.js';
@@ -1016,22 +1016,21 @@ export class Indexer {
     }
 
     // ── v10 boundary detection ──────────────────────────────────────────────
-    // Always run when graphChanged (new files / pruned files / new edges)
-    // OR when the boundaries table is empty (first opt-in after migrating
-    // an existing DB to v10).
+    // Rebuild when the source graph changed, or when boundary-defining inputs
+    // (manifest labels / workspace roots / convention dirs) changed. A cached
+    // no-op re-index can otherwise keep the existing boundary tables intact.
     let boundariesRecomputed = false;
     try {
-      if (!graphChanged && this.store.hasBoundariesData()) {
+      const boundaryFingerprint = boundaryInputFingerprint(absRoot);
+      const previousBoundaryFingerprint = this.store.getIndexMeta('boundaries_input_fingerprint');
+      if (graphChanged || previousBoundaryFingerprint !== boundaryFingerprint) {
         if (!quiet) process.stdout.write('  Detecting boundaries...\n');
         const r = buildBoundaries(absRoot, this.store);
         this.store.replaceBoundaries(r.boundaries, r.edges);
+        this.store.setIndexMeta('boundaries_input_fingerprint', boundaryFingerprint);
         boundariesRecomputed = true;
-      }
-      if (graphChanged || !this.store.hasBoundariesData()) {
-        if (!quiet) process.stdout.write('  Detecting boundaries...\n');
-        const r = buildBoundaries(absRoot, this.store);
-        this.store.replaceBoundaries(r.boundaries, r.edges);
-        boundariesRecomputed = true;
+      } else if (!quiet) {
+        process.stdout.write('  Skipping boundary detection (graph and boundary inputs unchanged)\n');
       }
     } catch (err) {
       if (verbose) process.stdout.write(`  ⚠  boundary detection failed: ${err}\n`);

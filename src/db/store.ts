@@ -376,6 +376,25 @@ export class Store {
     ).run(SERVICE_CALLS_BACKFILL_VERSION);
   }
 
+  getIndexMeta(key: string): string | null {
+    try {
+      const row = this.db.prepare(
+        'SELECT value FROM _schema_meta WHERE key = ?',
+      ).get(key) as Row | undefined;
+      return row ? toStr(row.value) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  setIndexMeta(key: string, value: string): void {
+    this.assertWritable();
+    this.db.prepare(
+      'INSERT INTO _schema_meta (key, value) VALUES (?, ?) ' +
+      'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    ).run(key, value);
+  }
+
   private readSchemaInfo(): SchemaInfo {
     let dbVersion = 0;
     try {
@@ -427,6 +446,8 @@ export class Store {
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_symbols_symbol_key ON symbols(symbol_key)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind)');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_from_to_kind ON edges(from_id, to_id, kind)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_to_name_kind ON edges(to_name, kind)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_to_id_kind_from ON edges(to_id, kind, from_id)');
 
     // v4.1: separate history HEAD marker so churn doesn't poison the
     // skip-if-unchanged check used by buildSymbolHistory. Cheap ALTER ADD;

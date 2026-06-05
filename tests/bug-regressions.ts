@@ -418,8 +418,18 @@ function bug7_testEdgeDuplicateIndex(): void {
   `).all() as Array<{ detail: string }>;
 
   const details = plan.map(p => p.detail).join(' | ');
-  assert(details.includes('idx_edges_from_to_kind') && details.includes('from_id=?') && details.includes('to_id=?') && details.includes('kind=?'),
-    `duplicate check probes idx_edges_from_to_kind (plan: ${details})`);
+  const usesFromComposite =
+    details.includes('idx_edges_from_to_kind') &&
+    details.includes('from_id=?') &&
+    details.includes('to_id=?') &&
+    details.includes('kind=?');
+  const usesReverseComposite =
+    details.includes('idx_edges_to_id_kind_from') &&
+    details.includes('to_id=?') &&
+    details.includes('kind=?') &&
+    details.includes('from_id=?');
+  assert(usesFromComposite || usesReverseComposite,
+    `duplicate check probes a composite edge index over from_id/to_id/kind (plan: ${details})`);
 
   store.close();
   fs.unlinkSync(tmp);

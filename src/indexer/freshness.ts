@@ -158,12 +158,12 @@ export async function jitSync(
     // worker spawn cost dominates the wins at this scale; serial is the
     // right default for the snappy "edit + ask" loop. MCP servers that want
     // parallel JIT can override later via an option.
-    const result = await indexer.indexDirectory(absRoot, { quiet: !options.verbose, parallel: false });
+    await indexer.indexDirectory(absRoot, { quiet: !options.verbose, parallel: false });
     return {
       dirtyReindexed: dirty.length,
       removed: removed.length,
       added: added.length,
-      elapsedMs: Date.now() - start + (result.elapsedMs ?? 0),
+      elapsedMs: Date.now() - start,
     };
   }
 

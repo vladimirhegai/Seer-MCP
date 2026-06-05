@@ -231,6 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
 CREATE INDEX IF NOT EXISTS idx_edges_to_id   ON edges(to_id);
 CREATE INDEX IF NOT EXISTS idx_edges_kind    ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_from_to_kind ON edges(from_id, to_id, kind);
+CREATE INDEX IF NOT EXISTS idx_edges_to_name_kind ON edges(to_name, kind);
+CREATE INDEX IF NOT EXISTS idx_edges_to_id_kind_from ON edges(to_id, kind, from_id);
 
 -- File-level imports. resolved_file_id is populated by a post-index pass
 -- when the imported module can be mapped to a file we've also indexed.

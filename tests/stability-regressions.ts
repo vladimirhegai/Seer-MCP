@@ -16,6 +16,7 @@ import { jitSync } from '../src/indexer/freshness';
 import { scanServiceHosts } from '../src/indexer/serviceHostScanner';
 import { buildSkeleton } from '../src/indexer/skeleton';
 import { runInit } from '../src/cli/init';
+import { workflowTemplate } from '../src/bundle/ci';
 
 let passed = 0;
 let failed = 0;
@@ -82,6 +83,17 @@ async function metadataOnlyChangesRefresh(): Promise<void> {
     await indexer.indexDirectory(root, { quiet: true, parallel: false });
     const labels = store.listBoundaries(10).map(b => b.label);
     check(labels.includes('new-name') && !labels.includes('old-name'), 'boundaries update on manifest-only edit', labels);
+    const stampsBefore = store.rawDb().prepare(
+      'SELECT root_rel_path AS rootRelPath, computed_at AS computedAt FROM boundaries ORDER BY root_rel_path',
+    ).all();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const third = await indexer.indexDirectory(root, { quiet: true, parallel: false });
+    const stampsAfter = store.rawDb().prepare(
+      'SELECT root_rel_path AS rootRelPath, computed_at AS computedAt FROM boundaries ORDER BY root_rel_path',
+    ).all();
+    check(third.filesIndexed === 0 && third.filesReusedFromCache === 1, 'boundary no-op reindex reuses source cache', third);
+    check(JSON.stringify(stampsAfter) === JSON.stringify(stampsBefore),
+      'boundary no-op reindex does not rewrite boundary rows', { before: stampsBefore, after: stampsAfter });
   });
 }
 
@@ -141,6 +153,24 @@ async function protoFreshnessAndScanning(): Promise<void> {
   }, async (_root, store) => {
     const ops = store.listRoutes({ framework: 'grpc', limit: 10 }).map(r => r.operation).sort();
     check(ops.includes('UserService/GetUser') && ops.includes('UserService/ListUsers'), 'proto scanner keeps RPCs after option body blocks', ops);
+  });
+}
+
+async function jitElapsedDoesNotDoubleCountIndexerTime(): Promise<void> {
+  console.log('\n-- jit elapsed accounting --');
+  await withIndexedRepo('jit-elapsed', root => {
+    write(path.join(root, 'main.ts'), 'export function main(){ return 1; }\n');
+  }, async (root, store) => {
+    fs.unlinkSync(path.join(root, 'main.ts'));
+    const fakeIndexer = {
+      indexDirectory: async () => {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return { elapsedMs: 100_000 };
+      },
+    } as unknown as Indexer;
+    const report = await jitSync(store, fakeIndexer, root, { maxDirty: 200 });
+    check(report.removed === 1, 'JIT full reindex branch triggered by a removed file', report);
+    check(report.elapsedMs < 100_000, 'JIT elapsedMs reports wall-clock time, not wall-clock plus indexer elapsed', report);
   });
 }
 
@@ -303,17 +333,57 @@ async function callersFileDisambiguation(): Promise<void> {
   });
 }
 
+function ciWorkflowRuntime(): void {
+  console.log('\n-- ci workflow runtime --');
+  const workflow = workflowTemplate();
+  check(workflow.includes("node-version: '24'"), 'generated CI workflow uses the supported Node 24 runtime');
+  check(!workflow.includes("node-version: '22'"), 'generated CI workflow does not pin unsupported Node 22');
+  check(workflow.includes('npx -y seer-mcp ci bundle'), 'generated CI workflow invokes the published Seer package');
+  check(!workflow.includes('node dist/cli/index.js'), 'generated CI workflow does not assume Seer source checkout layout');
+}
+
+function reverseCallLookupIndexes(): void {
+  console.log('\n-- reverse call lookup indexes --');
+  const root = tempRoot('reverse-call-indexes');
+  let store: Store | null = null;
+  try {
+    const dbPath = path.join(root, 'graph.db');
+    store = new Store(dbPath);
+    const db = store.rawDb();
+    const indexes = (db.prepare("PRAGMA index_list('edges')").all() as Array<{ name: string }>).map(r => r.name);
+    check(indexes.includes('idx_edges_to_name_kind'), 'edges has composite to_name+kind index for name-keyed caller counts', indexes);
+    check(indexes.includes('idx_edges_to_id_kind_from'), 'edges has composite to_id+kind+from_id index for id-keyed reverse traversal', indexes);
+
+    const byNamePlan = db.prepare(
+      "EXPLAIN QUERY PLAN SELECT COUNT(*) AS c FROM edges WHERE to_name IN (?) AND kind = 'call'",
+    ).all('Target') as Array<{ detail: string }>;
+    const byIdPlan = db.prepare(
+      "EXPLAIN QUERY PLAN SELECT DISTINCT from_id FROM edges WHERE to_id = ? AND kind = 'call'",
+    ).all(1) as Array<{ detail: string }>;
+    check(byNamePlan.some(p => p.detail.includes('idx_edges_to_name_kind')),
+      'countCallers query plan uses the selective to_name+kind index', byNamePlan);
+    check(byIdPlan.some(p => p.detail.includes('idx_edges_to_id_kind_from')),
+      'reverse traversal query plan uses the selective to_id+kind+from_id index', byIdPlan);
+  } finally {
+    if (store) store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function run(): Promise<void> {
   console.log('\nSeer Stability Regression Tests');
   console.log('================================');
   await metadataOnlyChangesRefresh();
   await generatedFiltering();
   await protoFreshnessAndScanning();
+  await jitElapsedDoesNotDoubleCountIndexerTime();
   await composeHostsDoNotInventNestedKeys();
   await skeletonLineMath();
   await deepCliDbLookup();
   globalNpxLaunchersCarryWorkspace();
   await callersFileDisambiguation();
+  ciWorkflowRuntime();
+  reverseCallLookupIndexes();
 
   console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);

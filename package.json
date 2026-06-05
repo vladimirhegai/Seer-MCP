@@ -49,7 +49,7 @@
     "test:tracke": "tsx tests/tracke.ts && tsx tests/tracke-collisions.ts",
     "test:trackf": "tsx tests/trackf.ts && tsx tests/trackf-bugs.ts",
     "test:trackg": "tsx tests/trackg.ts",
-    "test:tracki": "tsx tests/tracki-external-bundles.ts && tsx tests/tracki-contract-diff.ts && tsx tests/tracki-preflight.ts && tsx tests/tracki-boundaries.ts && tsx tests/tracki-continuity.ts",
+    "test:tracki": "tsx tests/tracki-external-bundles.ts && tsx tests/tracki-contract-diff.ts && tsx tests/tracki-preflight.ts && tsx tests/tracki-boundaries.ts && tsx tests/boundaries-glob-expansion.ts && tsx tests/tracki-continuity.ts",
     "test:git": "tsx tests/git-features.ts",
     "test:symbol-history": "tsx tests/symbol-history-perf.ts",
     "test:regressions": "tsx tests/bug-regressions.ts",
