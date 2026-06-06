@@ -18,11 +18,10 @@
 
 import { Store } from '../db/store.js';
 import { buildContext, ContextPacket } from './context.js';
-import { computeRisk, RiskResult } from './risk.js';
-import { rankedBehavior, BehaviorResult } from './behavior.js';
+import { computeRisk } from './risk.js';
+import { rankedBehavior } from './behavior.js';
 import { detectChanges } from './detectchanges.js';
 import { contractDiff, ContractDiff } from '../bundle/contract.js';
-import type { SymbolRow } from '../types.js';
 
 export interface PreflightTouchedSymbol {
   id: number;

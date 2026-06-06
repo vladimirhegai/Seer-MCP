@@ -1,5 +1,5 @@
 import type Parser from 'web-tree-sitter';
-import type { SymbolDef, SymbolRef, FileExtraction, RouteDef, ConfigKeyRead, ServiceCallDef } from '../types.js';
+import type { SymbolDef, FileExtraction, RouteDef, ConfigKeyRead, ServiceCallDef } from '../types.js';
 
 export interface LanguageExtractor {
   /** tree-sitter language name (used to load the WASM grammar) */

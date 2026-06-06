@@ -1,4 +1,3 @@
-import path from 'path';
 import { Store } from '../db/store.js';
 
 /**

@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { discoverFiles, DiscoveredFile, DiscoveryMode } from './discovery.js';
 import { parseFile, detectLanguage, wasmResetCount } from '../parser/index.js';
-import { WorkerPool, WorkItem as PoolWorkItem, PoolResult } from '../parser/workerpool.js';
+import { WorkerPool, WorkItem as PoolWorkItem } from '../parser/workerpool.js';
 import { computePageRank } from '../graph/pagerank.js';
 import { Store } from '../db/store.js';
 import { classifyFile } from './classify.js';

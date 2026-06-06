@@ -1,5 +1,4 @@
 import path from 'path';
-import { Store } from '../db/store.js';
 import { Indexer } from './index.js';
 
 /**
@@ -53,7 +52,6 @@ export class SeerWatcher {
 
   constructor(
     private repoRoot: string,
-    private store: Store,
     private indexer: Indexer,
     options: WatcherOptions = {},
   ) {
@@ -182,7 +180,6 @@ export class SeerWatcher {
       // Clear the dirty set BEFORE running the index so any events arriving
       // during the index are caught for the next pass instead of being lost.
       this.dirty.clear();
-      const start = Date.now();
       const result = await this.indexer.indexDirectory(this.repoRoot, { quiet: true });
       this.lastSyncMs = Date.now();
       this.lastSyncResult = {

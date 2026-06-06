@@ -29,30 +29,19 @@ import { buildSkeleton } from '../indexer/skeleton.js';
 /**
  * Seer MCP server.
  *
- * Tool surface (Track-B baseline + Track-C/D additions):
- *   - seer_health         freshness + schema state
- *   - seer_stats          counts (files/symbols/edges + role + Track-C totals)
- *   - seer_symbols        symbol search (BM25 / LIKE)
- *   - seer_definition     exact symbol definition lookup
- *   - seer_file_symbols   list symbols in a file
- *   - seer_callers        direct callers, bounded with true total
- *   - seer_callees        direct callees, bounded
- *   - seer_search         combined symbol + file path BM25 search,
- *                           enriched with containing-symbol context
- *   - seer_reindex        explicit reindex
+ * Exposes the read/query surface of the Store (plus a few opt-in maintenance
+ * actions) as MCP tools over stdio. The authoritative, always-current list of
+ * tools — names, schemas, and descriptions — is registerTools() below; this
+ * header deliberately does not enumerate them so it can't drift out of date.
  *
- *   v4 additions:
- *   - seer_routes         list HTTP routes detected in source
- *   - seer_dependencies   list external dependencies from manifests
- *   - seer_config         list config / env reads
- *   - seer_complexity     rank symbols by cyclomatic/cognitive complexity
- *   - seer_behavior       tests that exercise a given symbol
- *   - seer_trace_path     bounded BFS shortest call path A → B
- *   - seer_architecture   one-page codebase snapshot
- *   - seer_detect_changes blast-radius for current diff
- *   - seer_churn          file-level git churn pass (opt-in)
- *   - seer_history        per-symbol git history
- *   - seer_symbol_history (action) build symbol history index
+ * Cross-cutting behavior layered on top of the raw handlers:
+ *   - JIT freshness (ensureFresh) keeps query results current without blocking
+ *     on a full reconcile when a clean watcher already vouches for the index.
+ *   - Per-tool timeouts (runToolWithTimeout) and uniform error payloads.
+ *   - Client hints + did-you-mean suggestions (withClientHints, suggestSymbols).
+ *   - Lazy auto-build of derived indexes (modules / shape hashes / continuity)
+ *     on first query against a cold DB.
+ *   - seer_batch / seer_trace dispatch other tools in-process via `handlers`.
  */
 
 export interface McpServerOptions {
@@ -62,117 +51,14 @@ export interface McpServerOptions {
   jit?: boolean;
 }
 
-type TraceMode = 'summary' | 'preview' | 'full';
-
-interface TraceReach {
-  id: number;
-  depth: number;
-}
-
-interface TraceItem {
-  id: number;
-  name: string;
-  qualifiedName: string | null;
-  kind: string;
-  file: string;
-  lineStart: number;
-  pagerank: number;
-  depth: number;
-}
-
-interface TraceRow {
-  id: unknown;
-  name: unknown;
-  qualifiedName: unknown;
-  kind: unknown;
-  file: unknown;
-  lineStart: unknown;
-  pagerank: unknown;
-}
-
-const CORE_ALWAYS_LOAD_TOOLS = new Set([
-  'seer_health',
-  'seer_search',
-  'seer_definition',
-  'seer_file_symbols',
-  'seer_context',
-  'seer_preflight',
-  'seer_callers',
-  'seer_callees',
-  'seer_trace',
-  'seer_behavior',
-  'seer_history',
-  'seer_skeleton',
-  'seer_batch',
-]);
-
-const MAINTENANCE_TOOLS = new Set([
-  'seer_reindex',
-  'seer_churn',
-  'seer_symbol_history_build',
-  'seer_modules_build',
-  'seer_shape_hash_build',
-  'seer_bundle_export',
-  'seer_bundle_import',
-  'seer_scip_import',
-]);
-
-const SIDE_EFFECTING_TOOLS = new Set([
-  ...MAINTENANCE_TOOLS,
-  // These are query-shaped tools, but they can populate derived indexes on a
-  // cold DB before returning data. Do not advertise them as read-only, and keep
-  // them out of seer_batch's read-only fan-out contract.
-  'seer_modules',
-  'seer_module_members',
-  'seer_symbol_module',
-  'seer_module_dependencies',
-  'seer_trace_module_dependencies',
-  'seer_duplicates',
-  'seer_continuity',
-]);
-
-const TRACE_PREVIEW_LIMIT = 20;
-const TRACE_FULL_LIMIT = 100;
-const TRACE_SUMMARY_SAMPLE_LIMIT = 5000;
-const TRACE_SQL_CHUNK_SIZE = 900;
-const DEFAULT_MCP_TOOL_TIMEOUT_MS = 30_000;
-const DEFAULT_MCP_MAINTENANCE_TIMEOUT_MS = 90_000;
-const DEFAULT_FRESHNESS_WAIT_MS = 3_000;
-const DEFAULT_HISTORY_BUILD_SECONDS = 60;
-const DEFAULT_HISTORY_GIT_TIMEOUT_MS = 10_000;
-
-class SeerToolError extends Error {
-  constructor(
-    message: string,
-    public readonly payload: Record<string, unknown>,
-  ) {
-    super(message);
-  }
-}
-
-class SeerToolTimeoutError extends Error {
-  constructor(public readonly toolName: string, public readonly timeoutMs: number) {
-    super(`${toolName} exceeded ${timeoutMs}ms`);
-  }
-}
-
-function mcpInstructions(): string {
-  return [
-    'Use Seer first for structural code navigation in this workspace.',
-    'Core workflow: seer_health, then seer_search plus seer_definition/seer_file_symbols, then seer_context or seer_preflight, then seer_trace/seer_callers/seer_callees for drill-down.',
-    'Before editing code, call seer_health once and confirm the workspace.',
-    'If seer_health.workspace is not the active repo, report the stale/mispointed MCP session and ask the user to restart/reload after rerunning init; do not use stale Seer results for the task.',
-    'For normal code tasks, call Seer MCP tools directly; do not inspect MCP JSON/config files or run npx seer-mcp unless the task is installation/debugging or MCP tools are unavailable.',
-    'If you know the target symbol, call seer_context or seer_preflight before reading files.',
-    'If you do not know the symbol, call seer_search first, then seer_definition or seer_file_symbols.',
-    'For common method names, pass file to seer_context, seer_callers, or seer_trace callers so Seer uses the exact definition.',
-    'Use seer_callers, seer_callees, seer_trace, seer_behavior, seer_history, and seer_skeleton for focused follow-up context.',
-    'seer_history auto-builds just the queried symbol\'s file on a cold miss (bounded ~1s) and returns its commits — no separate build step. Pass autoBuild=false for a strictly read-only lookup. The FULL repo history index (seer_symbol_history_build with no args) can take minutes on large repos: ask the user first, or point them at `seer symbol-history`.',
-    'For C/C++ member calls where seer_callers reports an ambiguity (resolved count far below the by-name count), narrow with seer_callers groupByFile=true (where the sites concentrate) and filterReceiverType (best-effort receiver class; true infers it); includeNameMatches pages the raw list. SCIP import gives an exact count.',
-    'For huge transitive graphs, prefer seer_trace mode="summary" or the compact preview; page with offset/limit and use mode="full" only when raw rows are needed.',
-    'Use rg or manual file reads after Seer for literal strings, comments, docs, config values, unsupported languages, or when Seer returns no useful hit from the correct workspace.',
-  ].join(' ');
-}
+import {
+  TraceMode, TraceReach, TraceItem, TraceRow,
+  CORE_ALWAYS_LOAD_TOOLS, MAINTENANCE_TOOLS, SIDE_EFFECTING_TOOLS,
+  TRACE_PREVIEW_LIMIT, TRACE_FULL_LIMIT, TRACE_SUMMARY_SAMPLE_LIMIT, TRACE_SQL_CHUNK_SIZE,
+  DEFAULT_MCP_TOOL_TIMEOUT_MS, DEFAULT_MCP_MAINTENANCE_TIMEOUT_MS, DEFAULT_FRESHNESS_WAIT_MS,
+  DEFAULT_HISTORY_BUILD_SECONDS, DEFAULT_HISTORY_GIT_TIMEOUT_MS,
+  SeerToolError, SeerToolTimeoutError, mcpInstructions,
+} from './server-support.js';
 
 export class SeerMcpServer {
   private store!: Store;
@@ -239,7 +125,7 @@ export class SeerMcpServer {
     }
 
     if (this.watchEnabled) {
-      this.watcher = new SeerWatcher(this.workspace, this.store, this.indexer, {
+      this.watcher = new SeerWatcher(this.workspace, this.indexer, {
         log: (m) => process.stderr.write(`[watcher] ${m}\n`),
       });
       this.watcher.start();
@@ -1474,7 +1360,7 @@ export class SeerMcpServer {
         this.indexer = new Indexer(this.store);
         if (this.watcher) {
           await this.watcher.stop();
-          this.watcher = new SeerWatcher(this.workspace, this.store, this.indexer, {
+          this.watcher = new SeerWatcher(this.workspace, this.indexer, {
             log: (m) => process.stderr.write(`[watcher] ${m}\n`),
           });
           this.watcher.start();
@@ -2549,7 +2435,7 @@ export class SeerMcpServer {
         this.store = new Store(this.dbPath);
         this.indexer = new Indexer(this.store);
         if (wasWatchEnabled) {
-          this.watcher = new SeerWatcher(this.workspace, this.store, this.indexer, {
+          this.watcher = new SeerWatcher(this.workspace, this.indexer, {
             log: (m) => process.stderr.write(`[watcher] ${m}\n`),
           });
           this.watcher.start();

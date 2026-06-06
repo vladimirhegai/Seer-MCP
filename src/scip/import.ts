@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { Store } from '../db/store.js';
 import type { SymbolDef, SymbolKind } from '../types.js';
-import { ScipIndex, ScipDocument, ScipSymbol, ScipOccurrence } from './format.js';
+import { ScipIndex, ScipSymbol } from './format.js';
 
 export interface ScipImportOptions {
   /** Workspace root — used to resolve SCIP relativePaths to absolute paths. */

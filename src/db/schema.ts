@@ -106,6 +106,10 @@
 //     resume without re-walking already-finished files, and makes a HEAD-moved
 //     rerun reprocess only the files whose content actually changed. Pure
 //     additive table; absence just means "no resume info yet".
+//   - git_index_state.last_history_follow: records whether the last full
+//     symbol-history build used `git log --follow`, so incremental refreshes
+//     replicate the same matching without re-deriving it. Added via ALTER TABLE
+//     ADD COLUMN; NULL on older DBs is treated as false (the default).
 export const CURRENT_SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
@@ -337,8 +341,9 @@ CREATE INDEX IF NOT EXISTS idx_file_churn_last_commit  ON file_churn(last_commit
 -- walks git log and matches changed line ranges to symbol line spans.
 -- match_strategy describes how we matched the commit to the symbol; the
 -- coarser strategies are honest about being heuristic.
---   'overlap'   = changed hunk overlapped the current symbol's line range
---   'key-match' = symbol_key matched the symbol in the historical file version
+--   'overlap'       = a changed hunk overlapped the current symbol's line range
+--   'file-addition' = the commit introduced the whole file, so every symbol in
+--                     it is attributed to that commit (line numbers don't apply)
 CREATE TABLE IF NOT EXISTS symbol_history (
   id              INTEGER PRIMARY KEY,
   symbol_id       INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,

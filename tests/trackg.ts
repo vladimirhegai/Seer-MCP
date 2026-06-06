@@ -567,6 +567,14 @@ async function main(): Promise<void> {
       assertEq(meta.documentIdent, 'GET_USER', 'gql-doc metadata.documentIdent = GET_USER');
     }
 
+    // Regression: a plain IIFE (`const counter = (() => {...})()`) is a
+    // call_expression with a brace in its body, but must NOT be mistaken for a
+    // gql document. No gql-doc sentinel should reference it.
+    const iifeDoc = gqlCalls.find(c =>
+      c.framework === 'gql-doc' &&
+      (c.operation === 'counter' || c.operation === 'let' || c.operation === 'return'));
+    assert(!iifeDoc, 'IIFE const is not emitted as a gql-doc service_call');
+
     // createUserViaApollo → apolloClient.mutate({ mutation: CREATE_USER })
     const createApolloCall = gqlCalls.find(c =>
       c.caller_qname === 'createUserViaApollo' && c.operation === 'CREATE_USER' && c.method === 'MUTATION');

@@ -304,11 +304,6 @@ function popcount32(x: number): number {
   return Math.imul(x, 0x01010101) >>> 24;
 }
 
-function hammingDistance(a: bigint, b: bigint): number {
-  const x = a ^ b;
-  return popcount32(Number(x & 0xFFFFFFFFn)) + popcount32(Number((x >> 32n) & 0xFFFFFFFFn));
-}
-
 /**
  * Fetch continuity rows for a given symbol id, ordered by confidence desc.
  */

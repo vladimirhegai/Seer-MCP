@@ -1067,8 +1067,10 @@ function parseGqlOperation(src: string): { opKind: string; opName?: string; fiel
 
   let opKind = 'query';
   let opName: string | undefined;
+  let hasHeader = false;
   const opMatch = s.match(/^(query|mutation|subscription)\b(?:\s+([A-Za-z_][A-Za-z0-9_]*))?/);
   if (opMatch) {
+    hasHeader = true;
     opKind = opMatch[1];
     opName = opMatch[2];
     s = s.slice(opMatch[0].length).trim();
@@ -1078,9 +1080,15 @@ function parseGqlOperation(src: string): { opKind: string; opName?: string; fiel
       if (close > 0) s = s.slice(close + 1).trim();
     }
   }
+  // A genuine GraphQL document either opens with an operation header
+  // (query/mutation/subscription) or is a bare shorthand selection set that
+  // starts immediately with `{`. Anything else — an IIFE body, an interpolated
+  // template, arbitrary code that merely *contains* a brace somewhere — is not
+  // GraphQL, so we bail instead of grabbing the first identifier we find.
+  if (!hasHeader && !s.startsWith('{')) return null;
   // first '{' opens the selection set
   const openBrace = s.indexOf('{');
-  if (openBrace < 0) return { opKind, opName };
+  if (openBrace < 0) return hasHeader ? { opKind, opName } : null;
   s = s.slice(openBrace + 1).trim();
   // first identifier in the selection set is the top-level field
   const fieldMatch = s.match(/^([A-Za-z_][A-Za-z0-9_]*)/);
@@ -1185,12 +1193,12 @@ function tryExtractMessagingProducer(
       const topicNode = fields.get('topic');
       const topic = litString(topicNode);
       if (topic) {
-        return mkMsgCall(node, 'kafka', method, 'kafkajs', { topic, line: node.startPosition.row });
+        return mkMsgCall('kafka', 'kafkajs', { topic, line: node.startPosition.row });
       }
     } else if (first.type === 'string' || first.type === 'template_string') {
       // Older kafkajs / node-rdkafka: producer.send('topic', msg)
       if (receiverHintsProtocol(recvName, 'kafka')) {
-        return mkMsgCall(node, 'kafka', method, 'kafka', { topic: stripQuotes(first.text), line: node.startPosition.row });
+        return mkMsgCall('kafka', 'kafka', { topic: stripQuotes(first.text), line: node.startPosition.row });
       }
     }
   }
@@ -1200,7 +1208,7 @@ function tryExtractMessagingProducer(
     const fields = readObjectLiteralFields(first);
     const queueUrl = litString(fields.get('QueueUrl'));
     if (queueUrl !== null) {
-      return mkMsgCall(node, 'sqs', method, 'aws-sdk-sqs', {
+      return mkMsgCall('sqs', 'aws-sdk-sqs', {
         queue: extractQueueName(queueUrl),
         rawTarget: queueUrl,
         line: node.startPosition.row,
@@ -1212,7 +1220,7 @@ function tryExtractMessagingProducer(
   if (method === 'sendToQueue') {
     const queue = litString(first);
     if (queue) {
-      return mkMsgCall(node, 'rabbitmq', method, 'amqplib', { queue, line: node.startPosition.row });
+      return mkMsgCall('rabbitmq', 'amqplib', { queue, line: node.startPosition.row });
     }
   }
 
@@ -1223,7 +1231,7 @@ function tryExtractMessagingProducer(
       const fields = readObjectLiteralFields(first);
       const topicArn = litString(fields.get('TopicArn'));
       if (topicArn !== null) {
-        return mkMsgCall(node, 'sns', method, 'aws-sdk-sns', {
+        return mkMsgCall('sns', 'aws-sdk-sns', {
           topic: extractTopicNameFromArn(topicArn),
           rawTarget: topicArn,
           line: node.startPosition.row,
@@ -1235,7 +1243,7 @@ function tryExtractMessagingProducer(
       const exchange = litString(first);
       const routingKey = litString(named[1]);
       if (exchange !== null) {
-        return mkMsgCall(node, 'rabbitmq', method, 'amqplib', {
+        return mkMsgCall('rabbitmq', 'amqplib', {
           exchange,
           metadataJson: routingKey ? JSON.stringify({ routingKey }) : undefined,
           line: node.startPosition.row,
@@ -1246,10 +1254,10 @@ function tryExtractMessagingProducer(
     const subject = litString(first);
     if (subject !== null) {
       if (receiverHintsProtocol(recvName, 'nats')) {
-        return mkMsgCall(node, 'nats', method, 'nats', { topic: subject, line: node.startPosition.row });
+        return mkMsgCall('nats', 'nats', { topic: subject, line: node.startPosition.row });
       }
       if (receiverHintsProtocol(recvName, 'redis_pubsub')) {
-        return mkMsgCall(node, 'redis_pubsub', method, 'redis', { topic: subject, line: node.startPosition.row });
+        return mkMsgCall('redis_pubsub', 'redis', { topic: subject, line: node.startPosition.row });
       }
     }
   }
@@ -1356,8 +1364,7 @@ interface MsgCallOpts {
   metadataJson?: string;
 }
 function mkMsgCall(
-  node: Parser.SyntaxNode, protocol: MsgProtocol, method: string,
-  framework: string, opts: MsgCallOpts,
+  protocol: MsgProtocol, framework: string, opts: MsgCallOpts,
 ): ServiceCallDef {
   const rawTarget = opts.rawTarget ?? opts.topic ?? opts.queue ?? opts.exchange ?? '';
   return {

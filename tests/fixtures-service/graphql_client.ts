@@ -61,3 +61,13 @@ export function useCreateUserHook(): unknown {
 export function useOnUserCreated(): unknown {
   return useQuery(ON_USER_CREATED);
 }
+
+// Regression guard: a plain IIFE is a call_expression whose body contains a
+// `{`, but it is NOT a gql document. The gql-doc detector must not emit a
+// sentinel service_call for it (see parseGqlOperation header/`{` gate).
+const counter = (() => {
+  let n = 0;
+  return { inc: () => ++n, dec: () => --n };
+})();
+
+export { counter };
