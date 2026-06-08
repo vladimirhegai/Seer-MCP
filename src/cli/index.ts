@@ -198,31 +198,6 @@ async function performIndex(absRepo: string, dbPath: string, opts: PerformIndexO
   }
 }
 
-/** Build per-symbol git history for the wizard's "index history too?" opt-in. */
-async function performSymbolHistory(absRepo: string, dbPath: string): Promise<void> {
-  const store = new Store(dbPath);
-  try {
-    const { buildSymbolHistory, parseHistorySince } = await import('../indexer/symbolhistory.js');
-    const { writeProgress, clearProgress } = await import('../indexer/progress.js');
-    const sinceRaw = process.env.SEER_HISTORY_SINCE;
-    const since = parseHistorySince(sinceRaw);
-    if (since === null) throw new Error(`Invalid SEER_HISTORY_SINCE value: ${sinceRaw}`);
-    console.log(`\n  Building per-symbol git history (this can take a while on large repos)...`);
-    const r = await buildSymbolHistory(absRepo, store, {
-      ...(since !== undefined ? { since } : {}),
-      log: (m) => { clearProgress(); console.log(`  ${m}`); },
-      onProgress: (p) => {
-        if (process.stdout.isTTY) writeProgress(p.filesHandled, p.filesTotal, p.currentFile || p.phase);
-      },
-    });
-    clearProgress();
-    const partial = r.completed ? '' : ` — PARTIAL (${r.reason ?? 'budget reached'}); rerun \`seer symbol-history\` to resume`;
-    console.log(`  Symbol history: ${r.historyRowsInserted} rows across ${r.filesProcessed} files (${r.elapsedMs}ms)${partial}`);
-  } finally {
-    store.close();
-  }
-}
-
 //  seer init
 
 program
@@ -253,15 +228,13 @@ program
     // agents to set up instead of guessing. Guessing is what wrote .cursor/ and
     // .vscode/ into Antigravity-only repos. The wizard also offers to index now.
     let runIndexAfter = false;
-    let runHistoryAfter = false;
     const wizardEligible = !opts.client && !opts.global && !opts.print && !opts.yes
-      && !opts.command && isInteractive();
+      && !opts.auto && !opts.command && isInteractive();
     if (wizardEligible) {
       const answers = await runInitWizard(detectActiveClient(ws));
       if (!answers) return; // user bailed out
       clients = answers.clients;
       runIndexAfter = answers.index;
-      runHistoryAfter = answers.symbolHistory;
     }
 
     const result = runInit({
@@ -309,7 +282,6 @@ program
       const dbPath = resolveDb(ws, opts.db);
       try {
         await performIndex(ws, dbPath, {});
-        if (runHistoryAfter) await performSymbolHistory(ws, dbPath);
       } catch (err) {
         console.log(`\n  (indexing skipped: ${(err as Error).message})`);
       }

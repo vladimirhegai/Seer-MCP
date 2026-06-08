@@ -43,7 +43,6 @@ const ANTIGRAVITY_EXTENSIONS: Array<{ id: ClientId; label: string }> = [
 export interface WizardAnswers {
   clients: ClientId[];
   index: boolean;
-  symbolHistory: boolean;
 }
 
 /**
@@ -172,7 +171,7 @@ export async function runInitWizard(detected: ClientId | null, io?: PromptIO): P
       }
     }
 
-    // 3 ─ Index now? (recommended)
+    // 3 - Index now? (recommended)
     prompt.log('');
     const index = await confirm(
       prompt,
@@ -180,18 +179,7 @@ export async function runInitWizard(detected: ClientId | null, io?: PromptIO): P
       true,
     );
 
-    // 4 ─ Symbol history? Only meaningful if we are indexing. Off by default —
-    // a full history walk is slow on large repos and is fully optional.
-    let symbolHistory = false;
-    if (index) {
-      symbolHistory = await confirm(
-        prompt,
-        'Also index per-symbol git history? Powers seer_history, but is slow on large repos. (not recommended for big repos)',
-        false,
-      );
-    }
-
-    return { clients: picked, index, symbolHistory };
+    return { clients: picked, index };
   } catch (err) {
     if (isAbortError(err)) {
       prompt.log('\nSetup cancelled.\n');

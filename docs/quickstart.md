@@ -18,7 +18,6 @@ It can also build the first index right away.
 |---|---|
 | Agent/client | Choose the editor or CLI agent you want to connect. |
 | Index now | Recommended for the first run. |
-| Symbol history | Useful for `seer_history`, slower on big repos, safe to skip. |
 
 From another directory, pass the repo path:
 
@@ -32,6 +31,7 @@ If the wizard already indexed the repo, you can skip this.
 
 ```bash
 npx seer-mcp index .
+npx seer-mcp index . --reset
 ```
 
 Seer stores the index here:
@@ -46,7 +46,22 @@ Add this to `.gitignore` if your repo does not already ignore it:
 .seer/
 ```
 
-## 3. Reload Your Agent
+## 3. Optional Git History
+
+`seer_history` can build just the queried symbol's file on a cold miss, so most
+users can skip the full history pass at setup time.
+
+Build full symbol history when you want repo-wide co-change signals from
+`seer_changes_with`:
+
+```bash
+npx seer-mcp symbol-history
+npx seer-mcp symbol-history --since 1y
+```
+
+This can take a while on large repos. Re-running it is incremental.
+
+## 4. Reload Your Agent
 
 Restart or reload the agent, then ask it to call:
 

@@ -349,11 +349,10 @@ async function main(): Promise<void> {
 
   // ── 11. Wizard branching with scripted answers (single-select, no TTY) ─────
   {
-    // Antigravity detected, accept default (Enter), no extensions, index Y, history N.
-    const a = await runInitWizard('antigravity', scriptedIO(['', '', '', '']));
+    // Antigravity detected, accept default (Enter), no extensions, index Y.
+    const a = await runInitWizard('antigravity', scriptedIO(['', '', '']));
     check(!!a && a.clients.join(',') === 'antigravity', '11.Enter accepts the detected agent', a);
     check(!!a && a.index === true, '11.index defaults to yes on Enter', a);
-    check(!!a && a.symbolHistory === false, '11.symbol history defaults to no on Enter', a);
 
     // No detection; pick Antigravity (1) + two extensions (Claude=1, Gemini=3), decline index.
     const b = await runInitWizard(null, scriptedIO(['1', '1,3', 'n']));
@@ -361,13 +360,12 @@ async function main(): Promise<void> {
       '11.antigravity primary + chosen extensions are all configured', b?.clients);
     check(!!b && b.clients.includes('codex') === false, '11.unpicked extension is not added', b?.clients);
     check(!!b && b.index === false, '11.declining index returns index=false', b);
-    check(!!b && b.symbolHistory === false, '11.history is skipped entirely when not indexing', b);
 
     // Single NON-antigravity pick (Claude=2): no extension prompt, so the 2nd
     // scripted answer must flow to the index question, not be eaten by Q2.
-    const c = await runInitWizard(null, scriptedIO(['2', 'y', 'y']));
+    const c = await runInitWizard(null, scriptedIO(['2', 'y']));
     check(!!c && c.clients.join(',') === 'claude', '11.single non-antigravity pick maps to one client', c?.clients);
-    check(!!c && c.index === true && c.symbolHistory === true, '11.no extension prompt; index then history honored', c);
+    check(!!c && c.index === true, '11.no extension prompt; index question is honored', c);
 
     // The detected default can be overridden by typing a different number.
     const o = await runInitWizard('antigravity', scriptedIO(['4', 'n']));

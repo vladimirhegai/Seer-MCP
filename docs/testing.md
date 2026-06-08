@@ -20,7 +20,7 @@ production-sized repositories.
 | 19 | release gates chained by `npm test` |
 | 11 | MCP protocol suites inside `npm run test:mcp` |
 | 339 | checks in the latest `npm run test:mcp` run |
-| 87 | checks in the focused C++ / Godot regression suite |
+| 87 | checks in the focused C++ regression suite |
 
 Recount top-level suites:
 
@@ -72,7 +72,7 @@ Latest `npm run test:mcp`:
 | Track G tools | 30 |
 | Track I tools | 16 |
 | Optimization spec | 47 |
-| C++ / Godot regressions | 87 |
+| Focused C++ regressions | 87 |
 | **Total** | **339** |
 
 ## Stress Targets
