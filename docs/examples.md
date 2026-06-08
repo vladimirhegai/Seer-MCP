@@ -1,115 +1,99 @@
 # Examples
 
-Real workflows, the way an agent (or you, from the CLI) would actually use Seer.
-Each one links to a fuller walkthrough.
+These examples show the shape of real Seer workflows. Outputs are trimmed so the
+idea is easy to see.
 
-The outputs below are illustrative and trimmed for readability. Shapes are real;
-exact numbers depend on your repo.
+## Quick Map
 
----
+| Goal | Call | Walkthrough |
+|---|---|---|
+| Check a symbol before editing | `seer_preflight` | [Pre-edit context](examples/pre-edit-context.md) |
+| Find the tests that matter | `seer_behavior` | [Behavior and tests](examples/behavior-tests.md) |
+| Follow service boundaries | `seer_service_links` | [Service links](examples/service-links.md) |
+| Inspect a diff | `seer_preflight` with refs | [Change history](examples/change-history.md) |
+| Read a long file cheaply | `seer_skeleton` | This page |
+| Sample real call sites | `seer_callers` with snippets | This page |
 
-## Before editing unfamiliar code
+## Before Editing Unfamiliar Code
 
-You are about to change `chargeCard`. Instead of five searches, one call:
-
-```
-seer_preflight { "symbol": "chargeCard" }
-```
-
-You get the definition, who calls it, the tests that cover it, recent commits,
-and a risk verdict in a single packet. Full walkthrough:
-[Pre-edit context](examples/pre-edit-context.md).
-
----
-
-## Find the tests that actually exercise a symbol
-
-```
-seer_behavior { "symbol": "chargeCard" }
+```json
+{ "symbol": "chargeCard" }
 ```
 
-Ranked by how directly each test hits the symbol, not just filename matching.
-Full walkthrough: [Behavior and tests](examples/behavior-tests.md).
+Call `seer_preflight`. The response includes definition, callers, tests, recent
+history, route exposure, and risk.
 
----
+## Find Tests For A Symbol
 
-## Follow routes across service boundaries
-
-```
-seer_service_links { "pathSubstr": "/invoices" }
+```json
+{ "symbol": "chargeCard" }
 ```
 
-See which client call in one service resolves to which route handler in another.
-Full walkthrough: [Service links](examples/service-links.md).
+Call `seer_behavior`. Tests are ranked by how directly they exercise the symbol.
 
----
+## Follow Service Boundaries
 
-## Understand recent changes
-
-```
-seer_preflight { "fromRef": "main", "toRef": "HEAD" }
+```json
+{ "pathSubstr": "/invoices" }
 ```
 
-Maps the diff to the affected symbols and their blast radius, then layers on the
-history for each. Full walkthrough: [Change history](examples/change-history.md).
+Call `seer_service_links`. Seer connects outbound calls to route handlers when
+both sides are in the index or in imported bundles.
 
----
+## Inspect A Diff
 
-## Read a giant file cheaply
-
-```
-seer_skeleton { "file": "src/server.ts" }
+```json
+{ "fromRef": "main", "toRef": "HEAD" }
 ```
 
-Returns every signature with bodies collapsed to `{ ... 40 lines ... }`. Add
-`focusSymbol` to expand exactly one body. A 2,000-line file becomes an outline
-you can scan for a few hundred tokens.
+Call `seer_preflight`. Seer maps changed lines to changed symbols, then adds
+impact and risk context.
 
----
+## Read A Long File Cheaply
 
-## Find the real argument patterns before writing a new call
-
-You are about to add a new call to `buildInvoice`. Instead of reading the source
-file, pull a few call sites with their surrounding context:
-
-```
-seer_callers { "symbol": "buildInvoice", "limit": 5, "includeSnippets": true, "snippetContext": 2 }
+```json
+{
+  "file": "src/server.ts",
+  "focusSymbol": "startServer"
+}
 ```
 
-Each result includes the actual source lines around the call — real argument
-patterns, not just where the function is called. `snippetContext` controls how
-many lines above and below to include (default 2, max 6). Use a small `limit`;
-snippets are for sampling patterns, not reading all 80 call sites.
+Call `seer_skeleton`. The file comes back as an outline, with one focused body
+expanded when requested.
 
----
+## Sample Real Argument Patterns
 
-## Find what else tends to change alongside a symbol
-
-You are editing `serializeMessage` and want to know whether there are sibling
-symbols that have historically changed with it — shared format constants,
-parallel implementations, a companion deserializer — coupling that the call graph
-cannot see:
-
-```
-seer_changes_with { "symbol": "serializeMessage" }
+```json
+{
+  "symbol": "buildInvoice",
+  "limit": 5,
+  "includeSnippets": true,
+  "snippetContext": 2
+}
 ```
 
-The response lists partner symbols with `sharedCommits` (how many commits they
-co-changed in) and `confidence` (P(partner changed | target changed) over
-non-noisy commits). Check `historyComplete` first: when `false`, the full
-symbol-history index has not been built and partners may be partial or absent.
-Results are advisory and confidence-labeled — correlation, not causation.
+Call `seer_callers`. The result includes real source around each call site, which
+is useful before writing another call.
 
----
+## Find Historical Coupling
 
-## Batch several lookups into one round-trip
-
-```
-seer_batch { "calls": [
-  { "tool": "seer_definition", "args": { "name": "chargeCard" } },
-  { "tool": "seer_callers",    "args": { "symbol": "chargeCard" } },
-  { "tool": "seer_behavior",   "args": { "symbol": "chargeCard" } }
-] }
+```json
+{ "symbol": "serializeMessage" }
 ```
 
-One request, three results, failure-isolated.
+Call `seer_changes_with`. Partners include `sharedCommits` and `confidence`.
+Check `historyComplete` before trusting an empty result.
+
+## Batch Related Lookups
+
+```json
+{
+  "calls": [
+    { "tool": "seer_definition", "args": { "name": "chargeCard" } },
+    { "tool": "seer_callers", "args": { "symbol": "chargeCard" } },
+    { "tool": "seer_behavior", "args": { "symbol": "chargeCard" } }
+  ]
+}
+```
+
+Call `seer_batch` when an agent needs several small facts together.

@@ -2,6 +2,11 @@ import { Store } from '../db/store.js';
 import { rankedBehavior } from './behavior.js';
 import { computeRisk, RiskResult } from './risk.js';
 import type { SymbolRow, CallerRow, CalleeRow } from '../types.js';
+import {
+  AgentNextBestCall, AgentPrecision, AgentWarning,
+  agentWarning, boundedPrecision, boundedUnquantifiedPrecision,
+  exactPrecision, heuristicPrecision, nextBestCall, unknownPrecision,
+} from './agentMetadata.js';
 
 /**
  * One compact, structured pre-edit packet for a symbol.
@@ -42,16 +47,22 @@ export interface ContextPacket {
   };
   callers: {
     total: number;
+    precision: AgentPrecision;
     preview: Array<{
       name: string; qualifiedName: string | null; kind: string;
       file: string; line: number;
     }>;
   };
   callees: {
+    /** Call sites emitted by this symbol. */
     total: number;
+    /** Distinct callee symbols/names after collapsing repeated branch calls. */
+    unique: number;
     preview: Array<{
       name: string; kind: string | null;
       file: string | null; line: number | null;
+      /** Number of call sites in this symbol body that target this callee. */
+      callSites: number;
     }>;
   };
   blastRadius: {
@@ -62,6 +73,7 @@ export interface ContextPacket {
      * "directCallers" (functions) and seer_callers "total" (sites) reconcile. */
     directCallsites: number;
     transitiveCallers: number;
+    precision: AgentPrecision;
     /** Sample of the highest-PageRank reverse-reachable callers (capped). */
     topAffected: Array<{ id: number; name: string; qualifiedName: string | null; file: string; pagerank: number }>;
     maxDepth: number;
@@ -77,6 +89,13 @@ export interface ContextPacket {
       shortName: string;
       sharedByDefinitions: number;
       nameCallsites: number;
+      resolvedCallsites: number;
+      likelyCallersEstimate: {
+        unit: 'call-sites';
+        lowerBound: number;
+        upperBound: number;
+        confidence: 'bounded';
+      };
       note: string;
     };
   };
@@ -137,6 +156,7 @@ export interface ContextPacket {
     testCoverageState: string;
     /** True when the ONLY test evidence is heuristic (treat as a hint, not proof). */
     lowConfidence: boolean;
+    precision: AgentPrecision;
     preview: Array<{
       name: string; qualifiedName: string | null; file: string; lineStart: number;
       relationship: string; assertionCount: number; specificity: number;
@@ -174,6 +194,8 @@ export interface ContextPacket {
     signals: RiskResult['signals'];
     signalContributions: RiskResult['signalContributions'];
   };
+  warnings?: AgentWarning[];
+  nextBestCall?: AgentNextBestCall;
   source: 'tree-sitter';
 }
 
@@ -218,7 +240,22 @@ export function buildContext(
   const directCallers: CallerRow[] = store.findCallersById(target.id, callerLimit);
 
   const allCallees: CalleeRow[] = store.findCalleesById(target.id);
-  const calleesPreview = allCallees.slice(0, calleeLimit);
+  const uniqueCallees = (() => {
+    const byKey = new Map<string, CalleeRow & { callSites: number }>();
+    for (const c of allCallees) {
+      const key = [
+        c.calleeName,
+        c.calleeKind ?? '',
+        c.calleeFile ?? '',
+        c.calleeLineStart ?? '',
+      ].join('\0');
+      const prev = byKey.get(key);
+      if (prev) prev.callSites++;
+      else byKey.set(key, { ...c, callSites: 1 });
+    }
+    return Array.from(byKey.values());
+  })();
+  const calleesPreview = uniqueCallees.slice(0, calleeLimit);
 
   // Blast radius.
   const reverseHits = store.reverseReachableWithDepth(target.id, callerDepth);
@@ -299,9 +336,22 @@ export function buildContext(
     const cppExts = new Set(['.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.h++', '.inl', '.ino']);
     const reason = cppExts.has(ext) ? 'unresolved-receiver-type' as const : 'shared-short-name' as const;
     const note = reason === 'unresolved-receiver-type'
-      ? `Likely undercount. "${shortName}" is defined by ${sharedDefs} symbols and ${nameCallsites} call sites invoke some "${shortName}". C/C++ member calls (obj->${shortName}()) lose the receiver's static type, so directCallers/directCallsites are a LOWER bound; the true caller set is between ${totalCallers} and ${nameCallsites}. Use seer_callers includeNameMatches=true or grep the receiver type for the full surface.`
-      : `"${shortName}" is defined by ${sharedDefs} symbols and ${nameCallsites} call sites use the bare name; only ${totalCallers} resolved to THIS definition. The remainder bound to other same-named symbols.`;
-    return { reason, shortName, sharedByDefinitions: sharedDefs, nameCallsites, note };
+      ? `Likely undercount: ${totalCallers} resolved call site(s), ${nameCallsites} by-name site(s) across ${sharedDefs} "${shortName}" definitions. Receiver types are unresolved in C/C++; use seer_callers includeNameMatches/groupByFile/filterReceiverType to narrow.`
+      : `Shared short name: ${totalCallers} resolved call site(s), ${nameCallsites} by-name site(s) across ${sharedDefs} "${shortName}" definitions. The by-name count is an upper bound.`;
+    return {
+      reason,
+      shortName,
+      sharedByDefinitions: sharedDefs,
+      nameCallsites,
+      resolvedCallsites: totalCallers,
+      likelyCallersEstimate: {
+        unit: 'call-sites' as const,
+        lowerBound: totalCallers,
+        upperBound: nameCallsites,
+        confidence: 'bounded' as const,
+      },
+      note,
+    };
   })();
 
   // Risk (reuses behavior + history + signals computed above; cheaper to
@@ -310,6 +360,46 @@ export function buildContext(
 
   const moduleRow = store.moduleForFile(target.fileId);
   const boundaryRow = store.boundaryForFile(target.fileId);
+  const callerPrecision = blastAmbiguity
+    ? boundedPrecision(
+        blastAmbiguity.likelyCallersEstimate.lowerBound,
+        blastAmbiguity.likelyCallersEstimate.upperBound,
+        'call-sites',
+        blastAmbiguity.reason === 'unresolved-receiver-type'
+          ? 'C/C++ receiver type is unresolved; resolved callers are a lower bound.'
+          : 'This short name is shared; by-name callers are an upper bound.',
+      )
+    : exactPrecision('Callers are resolved to this symbol id.');
+  const blastPrecision = blastAmbiguity
+    ? boundedUnquantifiedPrecision(
+        'Blast radius is computed from id-resolved callers; unresolved receiver types can hide additional reverse edges.',
+      )
+    : exactPrecision('Blast radius is computed from id-resolved graph edges.');
+  const warnings: AgentWarning[] = [];
+  if (blastAmbiguity) {
+    warnings.push(agentWarning(
+      'caller-undercount',
+      blastAmbiguity.reason === 'unresolved-receiver-type'
+        ? 'Resolved caller counts may undercount this C/C++ member because receiver types are unresolved.'
+        : 'This short name is shared; by-name caller counts include other definitions.',
+    ));
+  }
+  const drilldown = blastAmbiguity
+    ? nextBestCall(
+        'seer_callers',
+        { symbol: target.qualifiedName ?? target.name, file: target.filePath, groupByFile: true },
+        'Resolved callers are bounded; groupByFile shows where same-name call sites concentrate.',
+      )
+    : undefined;
+  const behaviorPrecision = behavior?.lowConfidence
+    ? heuristicPrecision('Only heuristic test evidence was found; verify tests before treating this as coverage.')
+    : behavior?.testCoverageState === 'no-indexed-tests'
+        || behavior?.testCoverageState === 'test-indexing-unavailable'
+        || !behavior
+      ? unknownPrecision('Behavior coverage cannot be established from the current test index.')
+      : behavior.testCoverageState === 'tests-indexed-no-link'
+        ? unknownPrecision('Tests are indexed, but no behavioral link was found; absence of a link is not proof of no coverage.')
+        : exactPrecision('Behavior evidence is graph-linked.');
 
   return {
     symbol: {
@@ -329,6 +419,7 @@ export function buildContext(
     },
     callers: {
       total: totalCallers,
+      precision: callerPrecision,
       preview: directCallers.map(c => ({
         name: c.callerName, qualifiedName: c.callerQualifiedName, kind: c.callerKind,
         file: c.callerFile, line: c.callerLine,
@@ -336,15 +427,18 @@ export function buildContext(
     },
     callees: {
       total: allCallees.length,
+      unique: uniqueCallees.length,
       preview: calleesPreview.map(c => ({
         name: c.calleeName, kind: c.calleeKind,
         file: c.calleeFile, line: c.calleeLineStart,
+        callSites: c.callSites,
       })),
     },
     blastRadius: {
       directCallers: directSet.size,
       directCallsites: totalCallers,
       transitiveCallers: transitive.length,
+      precision: blastPrecision,
       topAffected,
       maxDepth: callerDepth,
       ...(blastAmbiguity ? { ambiguity: blastAmbiguity } : {}),
@@ -389,6 +483,7 @@ export function buildContext(
       heuristicMatches: behavior?.heuristicMatches ?? 0,
       testCoverageState: behavior?.testCoverageState ?? 'no-indexed-tests',
       lowConfidence: behavior?.lowConfidence ?? false,
+      precision: behaviorPrecision,
       preview: (behavior?.tests ?? []).map(t => ({
         name: t.testSymbol.name,
         qualifiedName: t.testSymbol.qualifiedName,
@@ -399,6 +494,8 @@ export function buildContext(
         specificity: t.specificity,
       })),
     },
+    ...(warnings.length > 0 ? { warnings } : {}),
+    ...(drilldown ? { nextBestCall: drilldown } : {}),
     recentHistory: {
       total: totalHistory,
       preview: history.map(h => ({

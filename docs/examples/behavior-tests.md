@@ -1,13 +1,12 @@
-# Behavior and tests
+# Behavior And Tests
 
-A flat "here are the test files that mention this symbol" list is noisy. Seer
-ranks tests by how directly they exercise the symbol, so the agent reads the
-specification that actually matters first.
+`seer_behavior` ranks tests by how directly they exercise a symbol. That gives
+an agent a practical reading list before it changes behavior.
 
-## The call
+## Call
 
-```
-seer_behavior { "symbol": "chargeCard" }
+```json
+{ "symbol": "chargeCard" }
 ```
 
 Trimmed response:
@@ -21,8 +20,7 @@ Trimmed response:
       "file": "test/payment.spec.ts",
       "line": 24,
       "directness": "direct-call",
-      "assertions": 4,
-      "lastCommit": "2026-04-18"
+      "assertions": 4
     },
     {
       "name": "rejects an expired card",
@@ -42,27 +40,22 @@ Trimmed response:
 }
 ```
 
-## How the ranking works
+## Ranking Signals
 
-Tests are scored by, in order:
+| Signal | Meaning |
+|---|---|
+| Direct call | The test invokes the symbol itself. |
+| Naming match | The test file mirrors the target file. |
+| Graph distance | The test reaches the symbol through callers. |
+| Assertion density | Denser specs rank higher. |
+| Recency | Recently touched tests get a small lift. |
 
-1. **Direct call** the test invokes the symbol itself.
-2. **Naming convention** the test file mirrors the symbol's file.
-3. **Graph distance** how many call-graph steps from the test to the symbol.
-4. **Assertion count and recency** denser, more recently touched tests rank up.
+## Why It Helps
 
-So in the example, the two unit tests that call `chargeCard` directly sit above
-the end-to-end test that only reaches it two hops away, even though the e2e test
-has more assertions.
+The agent can read the direct unit tests first, then the end-to-end test if the
+change touches the wider checkout flow.
 
-## Why an agent wants this
-
-Before changing behavior, the agent can read the existing contract: an expired
-card is rejected, a valid card charges. If the change should preserve that, the
-agent knows which tests must stay green. If the change alters it, the agent knows
-exactly which spec to update.
-
-## From the CLI
+## CLI
 
 ```bash
 seer behavior chargeCard

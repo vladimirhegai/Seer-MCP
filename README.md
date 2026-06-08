@@ -2,259 +2,309 @@
 
 # Seer
 
-Give your AI agents a map of your repo before they edit.
+**Give AI coding agents a repo map before they edit.**
 
+[![npm](https://img.shields.io/npm/v/seer-mcp?color=2ea043)](https://www.npmjs.com/package/seer-mcp)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
-[![MCP](https://img.shields.io/badge/MCP-Enabled-brightgreen.svg)](docs/mcp.md)
-[![NodeJS](https://img.shields.io/badge/Node.js-%3E%3D_24-green.svg?logo=nodedotjs)](https://nodejs.org/)
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vladimirhegai/Seer-MCP/actions)
-<br/><br/>
-[![Benchmarks](https://img.shields.io/badge/Benchmarks-View_Report-green?style=for-the-badge)](docs/benchmarks.md)
-[![Testing](https://img.shields.io/badge/Testing-View_Specs-brightgreen?style=for-the-badge)](docs/testing.md)
+[![MCP](https://img.shields.io/badge/MCP-ready-2ea043)](docs/mcp.md)
+[![Node](https://img.shields.io/badge/Node.js-%3E%3D_24-339933?logo=nodedotjs)](https://nodejs.org/)
+[![CI](https://img.shields.io/badge/CI-passing-2ea043)](https://github.com/vladimirhegai/Seer-MCP/actions)
+
+[Quick Start](docs/quickstart.md) |
+[Tool Guide](docs/tools.md) |
+[Benchmarks](docs/benchmarks.md) |
+[Testing](docs/testing.md)
+
+[Insert hero GIF: Codex or Claude asks Seer for pre-edit context on a real function, receives callers, tests, route exposure, history, and risk, then edits with that context visible.]
 
 </div>
 
-AI agents are good at writing code. However, they are much worse at knowing **what** they are about to affect.
+## The Missing Layer For Agentic Coding
 
-Instead of making agents piece together context from repeated searches, Seer compresses callers, tests, routes, service links, boundaries, risk signals, and yes, **even your git history**, into context agents can actually use all whilst **<u>improving</u>** token usage, speed, and accuracy.
+AI coding agents can write a patch fast. The fragile part is knowing what that
+patch is about to touch.
 
-Oh, and Seer can absolutely help agents find their way inside large, messy repositories. Using signals like **call graphs**, **Louvain-style module clustering**, **service links**, and **symbol history**, agents can orient toward the right subsystem before they touch code.
+Seer is a **local MCP server** that indexes your repository into a small SQLite
+graph and gives agents structural tools they can call while coding:
 
+| An agent asks | Seer returns |
+|---|---|
+| "What is this symbol?" | Definition, file, line range, qualified name. |
+| "Who calls it?" | Direct callers, call sites, snippets, transitive traces. |
+| "Which tests matter?" | Tests ranked by how directly they exercise the symbol. |
+| "Is this on a route?" | HTTP, RPC, GraphQL, gRPC, and queue links. |
+| "What else changes with it?" | Symbol history and co-change evidence. |
+| "Can I edit this safely?" | A preflight packet with blast radius and risk signals. |
 
-- **Difference from IDE-style agent tools (e.g. Serena):**  
-  Seer focuses less on editing symbols and refactoring code, and more on helping agents understand the impact of a change before they make it.
+For vibe coding, this is the map your agent should check before it starts
+changing files. For agent-heavy development, it is a reusable context layer
+across Claude Code, Codex, Cursor, VS Code, Gemini, Antigravity, and Windsurf.
 
-- **Difference from graph-first codebase tools (e.g. Codebase-Memory):**  
-  Graph-first tools help agents explore structure. Seer focuses on edit-aware context: tests, risk, history, and change impact.
+## Install
 
-*Tested across real repositories and agent workflows, with measurable gains in context quality, speed, and token efficiency (see [Benchmarks](docs/benchmarks.md)).*
-
-[pimage]
-
-[benchmark summary block]
-
-
----
-
-## Quick Start
-
-From the repo you want Seer to understand, run:
+Run this inside the repo you want Seer to understand:
 
 ```bash
 npx seer-mcp init
 ```
 
-Requires Node.js 24+ on Windows, macOS, or Linux.
+Requires **Node.js 24+** on Windows, macOS, or Linux.
 
-That starts a short interactive setup that asks you three things and does the
-rest:
-
-1. **Which AI agent** you use (Antigravity, Claude Code, Codex, Cursor, Gemini,
-   VS Code, Windsurf) — one agent per repo, so this is a single choice. It
-   pre-selects the one it detects, so usually you just press Enter. If you pick
-   Antigravity, it also offers to wire up any Claude / Codex / Gemini extensions
-   you run inside it.
-2. **Index now?** — recommended. Builds the local map so the first agent query
-   is instant.
-3. **Index git history too?** — optional, off by default (slow on large repos).
-
-It only writes config for the agents you choose — picking Antigravity will
-never scribble `.cursor/` or `.vscode/` into your repo.
-
-When you're done, restart/reload your agent and ask it to call `seer_health` to
-confirm it's connected.
-
-### Non-interactive / scripted
-
-Skip the prompts with `--yes`, or name the client directly:
+The wizard detects your agent, writes the right MCP config, and can build the
+first index immediately.
 
 ```bash
-npx seer-mcp init --yes                   # accept detected defaults, no prompts
-npx seer-mcp init --client antigravity    # Antigravity IDE / CLI
-npx seer-mcp init --client claude         # Claude Code
-npx seer-mcp init --client codex          # Codex
-npx seer-mcp init --client cursor         # Cursor
-npx seer-mcp init --client vscode         # VS Code (Copilot / native MCP)
-npx seer-mcp init --client gemini         # Gemini CLI
-npx seer-mcp init --client windsurf       # Windsurf (user-level, pinned here)
-npx seer-mcp init --client all            # every supported client
+npx seer-mcp init --client claude
+npx seer-mcp init --client codex
+npx seer-mcp init --client cursor
+npx seer-mcp init --client vscode
+npx seer-mcp init --client gemini
+npx seer-mcp init --client antigravity
+npx seer-mcp init --client windsurf
 ```
 
-From another directory, pass the repo path first: `npx seer-mcp init C:\path\to\repo`.
+Reload your agent, then ask it to call:
 
-Useful flags:
+```text
+seer_health
+```
 
-- `--yes`: skip the wizard; accept the detected client and defaults.
-- `--client <name>`: target one client (skips the wizard).
-- `--global`: write user-level config for clients that support it.
-- `--print`: preview every file change without writing.
-- `--force`: replace an existing `seer` / `seer_<workspace>` entry.
+The reported workspace should be the repo you installed from.
 
-### Per-repo by design
+## What It Looks Like In Use
 
-Seer maps one repo at a time, so config is workspace-local. Run setup once in
-each repo; Project A and Project B each keep their own config and index, with no
-re-pointing. Antigravity gets a workspace-specific server id (such as
-`seer_godot_a1b2c3d4`) so two projects never share one cached `seer` process.
+Ask your agent:
 
-The index lives at `<repo>/.seer/graph.db` — add `.seer/` to `.gitignore`. If
-you skip indexing during setup, Seer builds it on the first query. To rebuild
-later, or to install without the wizard, run `npx seer-mcp index .`.
+```text
+Before editing chargeCard, use Seer to inspect the callers, tests, route exposure, and risk.
+```
 
-Already installed? Refresh an existing setup after upgrading Seer:
+The agent can call:
+
+```json
+{
+  "symbol": "chargeCard"
+}
+```
+
+through `seer_preflight` and receive a compact packet:
+
+```json
+{
+  "symbol": {
+    "qualifiedName": "billing.PaymentService.chargeCard",
+    "file": "src/billing/payment.ts",
+    "lineStart": 142
+  },
+  "callers": [
+    { "name": "checkout", "file": "src/api/checkout.ts", "line": 88 },
+    { "name": "retryFailedPayment", "file": "src/jobs/retry.ts", "line": 31 }
+  ],
+  "transitiveDependents": 9,
+  "routeExposure": [
+    { "method": "POST", "path": "/api/checkout" }
+  ],
+  "tests": [
+    { "name": "charges a valid card", "file": "test/payment.spec.ts" }
+  ],
+  "risk": {
+    "verdict": "high",
+    "reasons": [
+      "public route POST /api/checkout",
+      "9 transitive dependents",
+      "cyclomatic 14"
+    ]
+  }
+}
+```
+
+[Insert GIF: the agent opens Seer context first, reads the returned tests and callers, then makes a targeted change.]
+
+## Why Agents Like It
+
+| Agent pain | Seer tool |
+|---|---|
+| Common names like `init`, `update`, and `render` are ambiguous. | `seer_search`, `seer_context` with `file` |
+| Reading a 2,000-line file burns context. | `seer_skeleton` |
+| Callers are spread across the repo. | `seer_callers`, `seer_trace` |
+| Tests are hard to find from filenames alone. | `seer_behavior` |
+| Microservice calls hide the real handler. | `seer_service_links` |
+| A diff touches more than it appears to. | `seer_preflight` with `fromRef` / `toRef` |
+| Recent history matters. | `seer_history`, `seer_changes_with` |
+| Several small facts are needed together. | `seer_batch` |
+
+## Core Workflows
+
+### Pre-Edit Context
+
+```json
+{ "symbol": "chargeCard" }
+```
+
+Use `seer_preflight` before changing behavior. It returns definition, callers,
+tests, route exposure, history, and risk in one packet.
+
+[Insert image: preflight response card with callers, tests, and risk highlighted.]
+
+Read the walkthrough: [Pre-edit context](docs/examples/pre-edit-context.md).
+
+### Behavior Tests
+
+```json
+{ "symbol": "chargeCard" }
+```
+
+Use `seer_behavior` to find the tests that exercise a symbol, ranked by direct
+calls, graph distance, assertion density, and recency.
+
+[Insert image: ranked tests list with direct unit tests above an end-to-end test.]
+
+Read the walkthrough: [Behavior and tests](docs/examples/behavior-tests.md).
+
+### Service Links
+
+```json
+{ "pathSubstr": "/invoices" }
+```
+
+Use `seer_service_links` to connect outbound calls to real route handlers across
+HTTP, RPC, GraphQL, gRPC, and queues.
+
+[Insert image: service A client call connected to service B route handler.]
+
+Read the walkthrough: [Service links](docs/examples/service-links.md).
+
+### Change History
+
+```json
+{ "fromRef": "main", "toRef": "HEAD" }
+```
+
+Use `seer_preflight` on a diff to map changed lines to changed symbols, then see
+blast radius and risk for each one.
+
+[Insert image: diff mapped to changed symbols with risk badges.]
+
+Read the walkthrough: [Change history](docs/examples/change-history.md).
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A[Repo files] --> B[Tree-sitter parsers]
+    B --> C[(.seer/graph.db)]
+    C --> D[MCP tools]
+    D --> E[Claude, Codex, Cursor, VS Code, Gemini]
+```
+
+Seer parses source files with Tree-sitter, stores the graph locally, and serves
+read-only structural queries over MCP. It also watches the workspace and checks
+file hashes before queries, so changed files are refreshed before results return.
+
+Facts worth knowing:
+
+| Fact | Detail |
+|---|---|
+| Local | The index lives at `<repo>/.seer/graph.db`. |
+| Deterministic | Core returns structural facts from the local graph. |
+| No API key | Seer-Core runs without model API calls. |
+| Per repo | Each workspace gets its own config and index. |
+| Portable | Bundles can export and import read-only repo layers. |
+
+## Language Support
+
+| Language | Symbols + calls | Routes | Service calls |
+|---|:---:|:---:|:---:|
+| Python | yes | FastAPI, Flask | requests, httpx |
+| JavaScript | yes | Express, Fastify | fetch, axios |
+| TypeScript / TSX | yes | Express, Fastify, tRPC, GraphQL | fetch, axios |
+| Go | yes | gRPC from `.proto` | gRPC, net/http clients |
+| Java | yes | Spring Boot | gRPC, RestTemplate, HttpClient |
+| Rust | yes | planned | reqwest-style clients |
+| C / C++ | yes | planned | planned |
+| C# | yes | planned | gRPC, HttpClient |
+
+See the full [language support matrix](docs/languages.md).
+
+## Measured Indexing Performance
+
+The current public benchmark focuses on indexing speed.
+
+| Codebase | Files | Fresh index | Cached re-index |
+|---|---:|---:|---:|
+| Godot | 4,228 | 22.9s | 1.5s |
+| TypeScript | 39,331 | 40.1s | 4.1s |
+| Linux kernel | 63,965 | 3m46s | 16.3s |
+| Unreal Engine | 84,331 | 5m43s | 22.7s |
+
+Generated by:
 
 ```bash
-npx seer-mcp update
+npm run scale-test
 ```
 
-More detail: [Full Quick Start](docs/quickstart.md) and [MCP Setup](docs/mcp.md).
+See [Benchmarks](docs/benchmarks.md) and [Raw Results](docs/benchmarks/raw-results.md).
 
----
+## Tested Hard
+
+| Proof | Current number |
+|---|---:|
+| Top-level executable test programs | 45 |
+| Test files and fixtures | 102 |
+| MCP protocol checks | 339 |
+| Focused C++ / Godot regression checks | 87 |
+
+Common gates:
+
+```bash
+npm test
+npm run test:mcp
+npm run test:godot-fixes
+npm run scale-test
+```
+
+See [Testing Proof](docs/testing.md).
 
 ## Docs
 
-- [Quick Start](docs/quickstart.md)
-- [MCP Setup](docs/mcp.md)
-- [Tool Guide](docs/tools.md)
-- [CLI Reference](docs/cli.md)
-- [Examples](docs/examples.md)
-- [Benchmarks](docs/benchmarks.md)
-- [Architecture](docs/architecture.md)
-- [Known Limits](docs/limits.md)
-
----
-
-## Why Seer Exists
-
-[problem framing]
-
-[pimage]
-
----
-
-## What Agents Can Ask Seer
-
-### Before editing unfamiliar code
-
-[pimage]
-
-→ [Example Workflow](docs/examples/pre-edit-context.md)
-
-### Find connected tests
-
-[pimage]
-
-→ [Behavior / Test Examples](docs/examples/behavior-tests.md)
-
-### Follow routes and service boundaries
-
-[pimage]
-
-→ [Service Links Guide](docs/examples/service-links.md)
-
-### Understand recent changes
-
-[pimage]
-
-→ [History / Change Context Examples](docs/examples/change-history.md)
-
----
-
-## Benchmarks
-
-[pimage]
-
-[small summary table]
-
-→ [Benchmark Summary](docs/benchmarks.md)
-
-→ [Raw Results](docs/benchmarks/raw-results.md)
-
----
+| Page | Use it for |
+|---|---|
+| [Quick Start](docs/quickstart.md) | Install and verify Seer. |
+| [MCP Setup](docs/mcp.md) | Client-specific config details. |
+| [Tool Guide](docs/tools.md) | Pick the right MCP tool. |
+| [CLI Reference](docs/cli.md) | Use Seer from a terminal. |
+| [Examples](docs/examples.md) | Real workflows with trimmed outputs. |
+| [Architecture](docs/architecture.md) | How the index and tools fit together. |
+| [Known Limits](docs/limits.md) | Boundaries and caveats. |
+| [Testing Proof](docs/testing.md) | Test coverage and validation. |
 
 ## FAQ
 
-### Is Seer another codebase graph MCP?
+### Does Seer send code anywhere?
 
-### How is Seer different from codebase-memory?
+No. Seer-Core is local. It reads files, writes `.seer/graph.db`, and serves MCP
+queries.
 
-### How is Seer different from Serena?
+### Does Seer use an LLM?
 
-### Does Seer replace Claude / Cursor / Codex?
+No. Core returns deterministic structural facts. Your coding agent decides how
+to use them.
 
-### How is Seer different from grep?
+### Does Seer edit code?
 
-→ [Expanded FAQ / Positioning Notes](docs/faq.md)
+The main tools are read-only. Setup and indexing commands write config and the
+local index.
 
----
+### Can I use multiple agents?
 
-## CLI + MCP Reference
+Yes. Run setup for the clients you use:
 
-### Core CLI commands
+```bash
+npx seer-mcp init --client all
+```
 
-### MCP tools overview
-
-### Common workflows
-
-→ [CLI Reference](docs/cli.md)
-
-→ [Tool Reference](docs/tools.md)
-
----
-
-## Internals
-
-[pimage]
-
-### Indexing
-
-### Symbol layers
-
-### Service links
-
-### Change context
-
-### Storage / bundles
-
-→ [Architecture](docs/architecture.md)
-
-→ [Implementation Notes](docs/internals.md)
-
----
-
-## Testing + Validation
-
-### Unit / integration / scale testing
-
-### MCP parity testing
-
-### Benchmark validation
-
-→ [Testing Guide](docs/testing.md)
-
-→ [Benchmarks](docs/benchmarks.md)
-
----
-
-## Supported Languages
-
-→ [Language Support Matrix](docs/languages.md)
-
----
-
-## Known Limits
-
-→ [Known Limits](docs/limits.md)
-
----
-
-## Contributing
-
-→ [CONTRIBUTING.md]
-
----
+Each repo keeps its own Seer config and index.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full license text.
-
+MIT. See [LICENSE](LICENSE).

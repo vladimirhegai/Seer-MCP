@@ -1,23 +1,25 @@
-# Service links
+# Service Links
 
-In a microservice repo (or a set of repos), the interesting bugs live in the
-gaps between services. Seer resolves an outbound network call in one service to
-the concrete route handler that serves it in another, so an agent can follow a
-request across a boundary.
+Seer can connect an outbound call in one service to the handler that serves it
+in another service. This is useful when a bug crosses a network boundary.
 
-## What gets connected
+## What Gets Connected
 
-Seer scans for client call signatures (fetch, axios, requests, httpx,
-HttpClient, RestTemplate, gRPC, tRPC, GraphQL, and message-queue producers) and
-records them in `service_calls`. After indexing, a resolver normalizes those URLs
-and patterns and matches them against the `routes` it extracted from server
-frameworks, producing `service_links`.
+| Source | Examples |
+|---|---|
+| HTTP clients | `fetch`, `axios`, `requests`, `httpx`, `HttpClient`, `RestTemplate` |
+| RPC | gRPC, tRPC |
+| GraphQL | queries and resolver names |
+| Queues | Kafka, SQS-style producers and consumers |
+| Routes | Express, Fastify, FastAPI, Flask, Spring, GraphQL, tRPC, `.proto` |
 
-## The call
+## Call
 
+```json
+{ "pathSubstr": "/invoices" }
 ```
-seer_service_links { "pathSubstr": "/invoices" }
-```
+
+Call `seer_service_links`.
 
 Trimmed response:
 
@@ -45,41 +47,45 @@ Trimmed response:
 }
 ```
 
-The `shop` service calls `GET /api/invoices/<id>`; Seer resolves that to the
-`billing` service's `/api/invoices/:id` handler, even though the client wrote the
-URL with a template literal.
+## Trace A Chain
 
-## Tracing a chain
-
-To follow a request across several hops:
-
-```
-seer_trace_service_path { "from": "shop.getInvoice", "to": "billing.getInvoice" }
+```json
+{
+  "from": "shop.getInvoice",
+  "to": "billing.getInvoice"
+}
 ```
 
-or fan out from one entry point:
+Call `seer_trace_service_path`.
 
+For fan-out:
+
+```json
+{
+  "from": "shop.checkout",
+  "maxDepth": 3
+}
 ```
-seer_trace_service_dependencies { "from": "shop.checkout", "maxDepth": 3 }
-```
 
-## Crossing repos with external bundles
+Call `seer_trace_service_dependencies`.
 
-If the services live in separate repos, export a bundle from one and import it
-additively into the other as a read-only layer:
+## Across Repos
+
+Export one repo as a bundle:
 
 ```bash
-# in the billing repo
 seer bundle export --out billing.seerbundle
+```
 
-# in the shop repo
+Import it as a read-only layer:
+
+```bash
 seer bundle import billing.seerbundle --external --alias billing
 ```
 
-Now `shop`'s outbound calls resolve against `billing`'s real routes without
-copying any source in. See [bundles in the CLI reference](../cli.md).
+Now the current repo can resolve calls against the imported service routes.
 
-## From the CLI
+## CLI
 
 ```bash
 seer service-calls --protocol http --path /invoices

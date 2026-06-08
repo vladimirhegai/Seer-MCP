@@ -72,6 +72,7 @@ function writeCppFixture(dir: string, opts: { withTests: boolean }): void {
     'static void attach_internal(Node *child) { (void)child; }',
     'void Node::add_child(Node *child) {',
     '  validate_child(child);',
+    '  validate_child(child);',
     '  attach_internal(child);',
     '}',
     '// Same-file caller: the bare `add_child(child)` resolves to Node::add_child',
@@ -258,6 +259,22 @@ async function storeLevelTests(): Promise<string> {
     && ctxAmb.blastRadius.ambiguity.nameCallsites === nameCallsites,
     'context.blastRadius.ambiguity reports the unresolved-receiver undercount with the name-level upper bound',
     ctxAmb.blastRadius.ambiguity);
+  assert(ctxAmb.blastRadius.ambiguity?.likelyCallersEstimate?.lowerBound === store.countCallersById(nodeAddId)
+    && ctxAmb.blastRadius.ambiguity?.likelyCallersEstimate?.upperBound === nameCallsites,
+    'context.blastRadius.ambiguity includes a glanceable bounded caller estimate',
+    ctxAmb.blastRadius.ambiguity?.likelyCallersEstimate);
+  assert(ctxAmb.callers.precision.level === 'bounded'
+    && ctxAmb.blastRadius.precision.level === 'bounded'
+    && ctxAmb.nextBestCall?.tool === 'seer_callers'
+    && (ctxAmb.warnings ?? []).some(w => w.kind === 'caller-undercount'),
+    'context includes bounded precision, warning, and nextBestCall for unresolved member callers',
+    { callers: ctxAmb.callers.precision, blast: ctxAmb.blastRadius.precision, next: ctxAmb.nextBestCall, warnings: ctxAmb.warnings });
+  const validatePreview = ctxAmb.callees.preview.find(c => c.name === 'validate_child');
+  assert(ctxAmb.callees.total > ctxAmb.callees.unique
+    && validatePreview?.callSites === 2
+    && ctxAmb.callees.preview.filter(c => c.name === 'validate_child').length === 1,
+    'context.callees preview deduplicates repeated callees and reports callSites',
+    ctxAmb.callees);
   // A free function with a unique name must NOT get an ambiguity block.
   const orphanCtx = buildContext(store, 'orphan_method')!;
   assert(orphanCtx.blastRadius.ambiguity === undefined,
@@ -266,6 +283,9 @@ async function storeLevelTests(): Promise<string> {
   const behLow = rankedBehavior(store, 'Node.add_child', { includeNamingConvention: false, includeSameFile: false })!;
   assert(behLow.testCoverageState === 'heuristic-only' && behLow.lowConfidence === true,
     'behavior.lowConfidence is true exactly when evidence is heuristic-only', { state: behLow.testCoverageState, low: behLow.lowConfidence });
+  const ctxLow = buildContext(store, 'Node.add_child', { testLimit: 10 })!;
+  assert(ctxLow.behavior.precision.level === 'exact',
+    'context behavior precision stays exact when graph-linked evidence is present', ctxLow.behavior.precision);
   const behHigh = rankedBehavior(store, 'Node.add_child')!;
   assert(behHigh.testCoverageState === 'graph-linked' && behHigh.lowConfidence === false,
     'behavior.lowConfidence is false when a precise link exists', { state: behHigh.testCoverageState, low: behHigh.lowConfidence });
@@ -464,10 +484,24 @@ async function mcpLevelTests(ws: string): Promise<void> {
     assert(cr.ambiguity != null && cr.ambiguity.reason === 'unresolved-receiver-type'
       && cr.ambiguity.nameCallsites > (cr.total ?? 0),
       'seer_callers flags the C/C++ receiver-type undercount with a name-level upper bound', cr.ambiguity);
+    assert(cr.ambiguity?.likelyCallersEstimate?.lowerBound === cr.total
+      && cr.ambiguity?.likelyCallersEstimate?.upperBound === cr.ambiguity.nameCallsites,
+      'seer_callers ambiguity includes a bounded likelyCallersEstimate for quick scanning',
+      cr.ambiguity?.likelyCallersEstimate);
+    assert(cr.precision?.level === 'bounded'
+      && cr.nextBestCall?.tool === 'seer_callers'
+      && (cr.warnings ?? []).some((w: any) => w.kind === 'caller-undercount'),
+      'seer_callers returns bounded precision, warning, and nextBestCall for unresolved member callers',
+      { precision: cr.precision, next: cr.nextBestCall, warnings: cr.warnings });
     const crNames = await callTool('seer_callers', { symbol: 'Node.add_child', includeNameMatches: true });
     assert(crNames.nameMatches != null && (crNames.nameMatches.items?.length ?? 0) >= 1
       && crNames.nameMatches.total >= (cr.total ?? 0),
       'seer_callers includeNameMatches returns the by-name caller upper bound', crNames.nameMatches?.total);
+    const bareCallees = await callTool('seer_callees', { symbol: 'add_child' });
+    assert(bareCallees.precision?.level === 'name-aggregate'
+      && bareCallees.nextBestCall?.tool === 'seer_definition',
+      'seer_callees marks bare shared names as name aggregates with a narrowing nextBestCall',
+      { precision: bareCallees.precision, next: bareCallees.nextBestCall });
 
     // Audit2: trace summary mode no longer emits a bare `returned: 0` that reads
     // like "0 results" — it nests an explicit rows.omittedByMode marker instead.
@@ -480,15 +514,25 @@ async function mcpLevelTests(ws: string): Promise<void> {
     // passing `file` resolves it and the hint disappears (no token waste).
     const ctxBare = await callTool('seer_context', { symbol: 'add_child' });
     assert(ctxBare.nameAmbiguity != null
-      && /defined by \d+ symbols/.test(ctxBare.nameAmbiguity.note ?? '')
+      && /^Top match:/.test(ctxBare.nameAmbiguity.note ?? '')
+      && typeof ctxBare.nameAmbiguity.totalDefinitions === 'number'
+      && typeof ctxBare.nameAmbiguity.otherDefinitionsCount === 'number'
       && Array.isArray(ctxBare.nameAmbiguity.otherDefinitions),
-      'seer_context on a bare ambiguous name surfaces a nameAmbiguity hint', ctxBare.nameAmbiguity);
+      'seer_context on a bare ambiguous name surfaces a compact nameAmbiguity hint', ctxBare.nameAmbiguity);
+    assert(ctxBare.nextBestCall?.tool === 'seer_definition'
+      && (ctxBare.warnings ?? []).some((w: any) => w.kind === 'ambiguous-target'),
+      'seer_context on a bare ambiguous name gives deterministic narrowing guidance',
+      { next: ctxBare.nextBestCall, warnings: ctxBare.warnings });
     const ctxPinned = await callTool('seer_context', { symbol: 'add_child', file: 'node.cpp' });
     assert(ctxPinned.nameAmbiguity === undefined && ctxPinned.symbol?.qualifiedName === 'Node.add_child',
       'seer_context with file resolves the symbol and drops the nameAmbiguity hint', ctxPinned.symbol?.qualifiedName);
     const trcAmb = await callTool('seer_trace_callers', { symbol: 'add_child', mode: 'summary' });
     assert(trcAmb.nameAmbiguity != null,
       'seer_trace_callers on a bare ambiguous name also carries the nameAmbiguity hint', trcAmb.nameAmbiguity?.note);
+    assert(trcAmb.nextBestCall?.tool === 'seer_definition'
+      && (trcAmb.warnings ?? []).some((w: any) => w.kind === 'ambiguous-target'),
+      'seer_trace_callers on a bare ambiguous name gives definition narrowing guidance',
+      { next: trcAmb.nextBestCall, warnings: trcAmb.warnings });
 
     // Fix 3: seer_definition `symbol` alias.
     const defAlias = await callTool('seer_definition', { symbol: 'Node.add_child' });
@@ -515,6 +559,15 @@ async function mcpLevelTests(ws: string): Promise<void> {
     const batchOk = await callTool('seer_batch', { calls: [{ tool: 'seer_definition', args: { symbol: 'Node.add_child' } }] });
     assert(batchOk.results?.[0]?.ok === true && (batchOk.results[0].result.items ?? []).length >= 1,
       'seer_batch runs a delegated seer_definition using the `symbol` alias', batchOk.results?.[0]);
+    const batchNamespaced = await callTool('seer_batch', {
+      calls: [{ tool: 'mcp__seer__seer_skeleton', args: { file: 'node.cpp', focusSymbol: 'add_child' } }],
+    });
+    assert(batchNamespaced.results?.[0]?.ok === true
+      && batchNamespaced.results[0].tool === 'seer_skeleton'
+      && batchNamespaced.results[0].requestedTool === 'mcp__seer__seer_skeleton'
+      && /Node::add_child/.test(batchNamespaced.results[0].result?.skeleton ?? ''),
+      'seer_batch accepts MCP-client namespaced tool names and dispatches to the short Seer handler',
+      batchNamespaced.results?.[0]);
 
     // Fix 3: seer_trace validates delegated args.
     const traceBad = await callTool('seer_trace', { scope: 'callers', args: {} });
@@ -528,6 +581,17 @@ async function mcpLevelTests(ws: string): Promise<void> {
     const beh = await callTool('seer_behavior', { symbol: 'Node.add_child' });
     assert(beh.testCoverageState === 'graph-linked' && (beh.heuristicMatches ?? 0) >= 1,
       'seer_behavior surfaces coverage state + heuristicMatches (graph-linked + heuristic)', { state: beh.testCoverageState, heur: beh.heuristicMatches });
+    const behHeuristic = await callTool('seer_behavior', {
+      symbol: 'Node.add_child',
+      includeNamingConvention: false,
+      includeSameFile: false,
+    });
+    assert(behHeuristic.testCoverageState === 'heuristic-only'
+      && behHeuristic.precision?.level === 'heuristic'
+      && behHeuristic.nextBestCall?.tool === 'seer_callers'
+      && (behHeuristic.warnings ?? []).some((w: any) => w.kind === 'heuristic-coverage'),
+      'seer_behavior heuristic-only output is explicitly low-precision and self-routing',
+      { state: behHeuristic.testCoverageState, precision: behHeuristic.precision, next: behHeuristic.nextBestCall, warnings: behHeuristic.warnings });
 
     // Fix 5: context + preflight expose historyIndex.built.
     const ctx = await callTool('seer_context', { symbol: 'Node.add_child' });

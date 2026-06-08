@@ -1,190 +1,182 @@
 # Tool Guide
 
-These are the MCP tools an agent sees once Seer is connected. Everything is
-read-only structural fact: no prose, no summaries, no guessing. If a lookup
-finds nothing, list tools return a `didYouMean` array of close matches rather
-than a dead end.
+These are the MCP tools an agent sees after Seer is connected. The tools return
+local structural facts from the index: definitions, calls, routes, tests,
+history, risk, and related context.
 
-This page is about what each tool is *for*. For exact parameters, every tool
-also self-describes its input schema over MCP, so your agent sees the arguments
-inline.
+For exact parameters, each tool exposes its input schema over MCP. This page is
+about choosing the right tool.
 
----
+## Start Here
 
-## Agent Decision Table
-
-| Situation | Start with |
+| Situation | First tool |
 |---|---|
-| Confirm Seer is attached to this repo | `seer_health` |
-| Unknown symbol, file, or subsystem | `seer_search` |
-| Known symbol before reading or editing | `seer_context` or `seer_preflight` |
-| Common method name like `init`, `update`, `add_child` | `seer_context` / `seer_callers` with `file` |
-| Direct call graph | `seer_callers` or `seer_callees` |
-| About to write a NEW call to a function | `seer_callers` with `includeSnippets: true` |
-| What else tends to change with this symbol | `seer_changes_with` (needs full history) |
-| Large transitive graph | `seer_trace` with `mode: "summary"` or paged preview |
-| Large file shape | `seer_skeleton` before a full file read |
-| Literal strings, comments, docs, config values | `rg` or file reads after Seer |
-| Symbol git history | `seer_history` (auto-builds the symbol's file on first call) |
+| Confirm Seer is attached to the right repo | `seer_health` |
+| Search for a symbol, file, or subsystem | `seer_search` |
+| Inspect one symbol before editing | `seer_context` |
+| Check impact before editing | `seer_preflight` |
+| Find direct callers or callees | `seer_callers`, `seer_callees` |
+| Trace a bigger dependency graph | `seer_trace` |
+| Scan a long file cheaply | `seer_skeleton` |
+| Find tests for a symbol | `seer_behavior` |
+| Find route and service boundaries | `seer_service_links` |
+| Inspect symbol history | `seer_history` |
 
----
+Many drill-down responses include compact metadata:
 
-## Start here
-
-| Tool | Use it when |
+| Field | Meaning |
 |---|---|
-| `seer_health` | You want to confirm the index is live and fresh. Cheap. |
-| `seer_architecture` | You just landed in an unfamiliar repo and need the lay of the land. |
-| `seer_preflight` | You are about to edit something, or want a diff's blast radius. |
+| `precision` | Exact, bounded, heuristic, or name aggregate. |
+| `warnings` | Caveats the agent should keep in mind. |
+| `nextBestCall` | One useful follow-up when narrowing or paging is obvious. |
 
-`seer_preflight` is the workhorse. Give it a symbol and it returns the
-definition, who calls it, transitive dependents, the tests that cover it, recent
-commit history, and a risk verdict, all in one call. Give it `fromRef`/`toRef`
-and it maps a git diff to the affected symbols and their blast radius.
+## Search And Navigation
 
----
+| Tool | Use |
+|---|---|
+| `seer_search` | Search symbols and file paths together. |
+| `seer_symbols` | Search symbol names or list top-ranked symbols. |
+| `seer_definition` | Find a definition by name, optionally scoped by file. |
+| `seer_file_symbols` | List symbols in a file in source order. |
+| `seer_skeleton` | Show file structure with bodies collapsed. |
 
-## Navigation and search
+Example:
 
-- `seer_symbols` (`query?`, `top?`) BM25 search, or top symbols by PageRank.
-- `seer_definition` (`name`, `file?`) exact definition lookup.
-- `seer_file_symbols` (`file`) symbols in a file, in line order.
-- `seer_callers` (`symbol`, `file?`, `includeNameMatches?`, `groupByFile?`,
-  `filterReceiverType?`, `nameMatchOffset?`, `includeSnippets?`, `snippetContext?`)
-  DIRECT callers. `total` is call SITES
-  (edges); `uniqueCallers` is distinct caller functions. Use `file` or a qualified
-  `Class.method` to disambiguate. Pass `includeSnippets: true` to get the real
-  source at each call site (`snippet` + `snippetRange`) — the fastest way to see
-  *how* a function is actually called (argument patterns) before you write a new
-  call. Best with a small `limit`; `snippetContext` sets the lines of context
-  (default 2, max 6). For C/C++ member calls the receiver type is
-  unresolved, so the precise count can undercount; an `ambiguity` block reports
-  the by-name upper bound. Narrow it: `groupByFile: true` (accurate per-file
-  breakdown of where the by-name sites concentrate), `filterReceiverType` (a class
-  name, or `true` to infer it — best-effort attribution by receiver type, with a
-  `plausibleUpperBound`), and `includeNameMatches: true` + `nameMatchOffset` to
-  page the raw list. SCIP import gives an exact count. (For TRANSITIVE reach, use
-  `seer_trace_callers` / `seer_trace` `scope: "callers"`.)
-- `seer_callees` (`symbol`) direct callees.
-- `seer_search` (`query`, `tokenBudget?`) combined symbol + file-path search.
-- `seer_skeleton` (`file`, `focusSymbol?`) render a file as signatures only, with
-  bodies collapsed to `{ ... N lines ... }`. Read a 2,000-line file for the cost
-  of its outline. `focusSymbol` expands one body verbatim.
+```json
+{ "query": "chargeCard" }
+```
 
-## Routes, deps, config
+For common names, add a file:
 
-- `seer_routes` (`method?`, `framework?`, `pathSubstr?`)
-- `seer_dependencies` (`ecosystem?`, `nameSubstr?`)
-- `seer_config` (`key?`, `source?`)
+```json
+{ "symbol": "init", "file": "src/server.ts" }
+```
 
-## Complexity and blast radius
+## Call Graph
 
-- `seer_complexity` (`by?`, `minValue?`) cyclomatic / cognitive / LOC rankings.
-- `seer_behavior` (`symbol`, `file?`) tests that exercise the symbol, ranked by
-  how directly they hit it. Pass `file` to pin a common method name.
-- `seer_trace_path` (`from`, `to`) shortest call path between two symbols.
-- `seer_trace_callers`
-  (`symbol`, `file?`, `maxDepth?`, `limit?`, `offset?`, `mode?`) transitive
-  callers. Default `mode: "preview"` returns exact totals, depth/file
-  summaries, and a small page of rows.
-- `seer_trace_callees`
-  (`symbol`, `file?`, `maxDepth?`, `limit?`, `offset?`, `mode?`) transitive
-  callees. Use `mode: "summary"` for counts/top files only, or `mode: "full"`
-  when raw rows are needed.
-- `seer_detect_changes` (`fromRef?`, `toRef?`) blast radius for a diff.
+| Tool | Use |
+|---|---|
+| `seer_callers` | Direct callers. |
+| `seer_callees` | Direct callees. |
+| `seer_trace` | Transitive callers, callees, paths, file graphs, modules, and service paths. |
+| `seer_trace_path` | Shortest call path between two symbols. |
+| `seer_trace_callers` | Transitive callers. |
+| `seer_trace_callees` | Transitive callees. |
 
-## Modules and boundaries
+`seer_callers` returns call sites and distinct caller functions. Add
+`includeSnippets: true` to see the real source around each call site:
 
-- `seer_modules`, `seer_module_members`, `seer_symbol_module`,
-  `seer_module_dependencies` Louvain clusters and their edges.
-- `seer_boundaries`, `seer_boundary_for_file`, `seer_boundary_dependencies`
-  monorepo package partitions and crossings.
-- `seer_trace_file_dependencies`, `seer_trace_module_dependencies` import BFS.
+```json
+{
+  "symbol": "buildInvoice",
+  "limit": 5,
+  "includeSnippets": true,
+  "snippetContext": 2
+}
+```
 
-## History and continuity
+For C and C++ member calls, receiver types may be unresolved. Seer reports this
+with an ambiguity block and a likely caller estimate.
 
-- `seer_churn` file-level git stats.
-- `seer_history` (`symbol`, `autoBuild?`) per-symbol commit blame chain. On a cold
-  miss it auto-builds just the queried symbol's file inline (bounded ~1s) and
-  returns the commits — no separate build step. Pass `autoBuild: false` for a
-  strictly read-only lookup (e.g. inside `seer_batch`). The FULL repo history
-  index stays explicit (`seer_symbol_history_build` with no args / CLI).
-- `seer_continuity` (`symbol`) rename/move evidence (advisory, confidence-labeled).
-- `seer_changes_with` (`symbol`, `file?`, `minSupport?`, `maxCommitSymbols?`,
-  `includeSameFile?`, `since?`) temporal/logical coupling: the symbols that have
-  historically changed in the *same commits* as this one. Catches edit-impact the
-  call graph cannot see — shared serialization formats, protocol constants,
-  parallel implementations, config. Each partner carries `sharedCommits` and a
-  `confidence` (P(partner changes | this changes) over non-noisy commits); huge
-  sweeping commits are dropped as noise (`noisyCommitsIgnored`). Advisory and
-  confidence-labeled, never causal. Read-only: check `historyComplete`; when it
-  is false, `partners` may be partial or falsely empty. Build the FULL
-  symbol-history index (`seer symbol-history` / `seer_symbol_history_build`) for
-  authoritative coupling — a single-file auto-build is not enough, because a
-  partner's file must also be in the history index.
+## Pre-Edit Context
 
-## Portability and precision
+| Tool | Use |
+|---|---|
+| `seer_preflight` | One packet before editing a symbol or reviewing a diff. |
+| `seer_context` | Definition, callers, tests, history, and risk for one symbol. |
+| `seer_risk` | Edit-risk score with its ingredients. |
+| `seer_behavior` | Tests ranked by how directly they exercise a symbol. |
+| `seer_detect_changes` | Map a git diff to changed symbols. |
 
-- `seer_bundle_export`, `seer_bundle_info`, `seer_bundle_import` portable
-  `.seerbundle` archives.
-- `seer_external_bundles` list imported peer-repo layers.
-- `seer_contract_diff` (`oldBundle`, `newBundle`) advisory API diff across protocols.
-- `seer_scip_import`, `seer_scip_imports`, `seer_provenance` SCIP precision overlays.
-- `seer_duplicates` near-duplicate code clusters via SimHash.
+`seer_preflight` accepts either a symbol:
 
-## Service links (cross-service)
+```json
+{ "symbol": "chargeCard", "file": "src/billing/payment.ts" }
+```
 
-- `seer_service_calls`, `seer_service_links` outbound calls resolved to handlers.
-- `seer_trace_service_path`, `seer_trace_service_dependencies`,
-  `seer_trace_module_service_dependencies` cross-service BFS.
+or a diff range:
 
-## Unified context
+```json
+{ "fromRef": "main", "toRef": "HEAD" }
+```
 
-- `seer_preflight` consolidated pre-edit packet (symbol or diff-range mode).
-- `seer_context` (`symbol`, `file?`) consolidated symbol context.
-- `seer_risk` (`symbol`, `file?`) decomposed edit-risk analysis.
+## Routes, Config, Dependencies
 
-> Disambiguation: the single-definition tools (`seer_context`, `seer_behavior`,
-> `seer_risk`, `seer_trace_callers`, `seer_trace_callees`) resolve a bare name to
-> the highest-PageRank definition. When the name is ambiguous and no `file` is
-> given, the response carries a `nameAmbiguity` hint listing the chosen
-> definition and the alternatives — pass `file` or a qualified `Class::method` to
-> target a specific one. `seer_callers`/`seer_callees` instead aggregate every
-> same-named definition on a bare name (the count is an upper bound across all of
-> them); pass `file` or `Class.method` there to scope to one.
+| Tool | Use |
+|---|---|
+| `seer_routes` | Server routes discovered from supported frameworks. |
+| `seer_dependencies` | Package dependencies from manifests. |
+| `seer_config` | Env and config reads. |
+| `seer_service_calls` | Outbound HTTP, RPC, GraphQL, queue, and service calls. |
+| `seer_service_links` | Outbound calls resolved to handlers. |
+| `seer_trace_service_path` | Path between two service symbols. |
 
----
+## Modules And Boundaries
 
-## Tools that save round-trips
+| Tool | Use |
+|---|---|
+| `seer_modules` | Inferred code clusters. |
+| `seer_module_members` | Files and symbols in a cluster. |
+| `seer_symbol_module` | Cluster for one symbol. |
+| `seer_module_dependencies` | Edges between clusters. |
+| `seer_boundaries` | Monorepo package or service boundaries. |
+| `seer_boundary_dependencies` | Cross-boundary calls. |
+| `seer_trace_file_dependencies` | File dependency BFS. |
+| `seer_trace_module_dependencies` | Module dependency BFS. |
 
-- `seer_batch` (`calls`) run up to 25 read-only tools in a single request.
-  One failing call does not abort the rest. It cannot nest inside itself.
-- `seer_trace` (`scope`, `args?`) a single entry point that dispatches to the
-  whole `seer_trace_*` family (`callers`, `callees`, `path`, `file`, `module`,
-  `service`, `service_path`, `module_service`). `seer_trace` is the always-loaded
-  entry point; the individual `seer_trace_*` tools behave identically when called
-  directly, but some MCP clients lazy-load them — prefer `seer_trace` if a
-  `seer_trace_*` tool is not listed. `args` is the delegate's own argument object
-  (e.g. `{ scope: "callers", args: { symbol, file?, maxDepth?, mode? } }`).
+## Git History
 
-## Keeping output small
+| Tool | Use |
+|---|---|
+| `seer_churn` | File-level git stats. |
+| `seer_history` | Per-symbol commit chain. |
+| `seer_continuity` | Rename or move evidence in the current tree. |
+| `seer_changes_with` | Symbols that historically changed with this one. |
+| `seer_symbol_history_build` | Build the full symbol-history index. |
 
-The high-volume list tools (`seer_symbols`, `seer_definition`, `seer_callers`,
-`seer_callees`, `seer_search`, `seer_trace_callers`, `seer_trace_callees`,
-`seer_complexity`, `seer_service_calls`, `seer_service_links`) accept an optional
-`tokenBudget`.
-Seer packs the highest-ranked rows until the serialized payload would exceed
-roughly `tokenBudget * 4` characters, then flags `truncated: true` with an
-`omitted` count and a note on how to get the rest. With no budget, direct list
-tools stay untrimmed; trace tools default to compact previews with totals.
+`seer_history` can build the queried symbol's file on first use. For
+`seer_changes_with`, build the full history index for the strongest result.
 
-## Tools you usually do not need
+## Portability And Precision
 
-Modules and shape hashes normally build during indexing and may self-heal on
-first use. Symbol history is similar but bounded by file: `seer_history`
-auto-builds just the queried symbol's file inline (~1s) on a cold miss, so a
-single-symbol question needs no separate step. The expensive part is the FULL
-repo history pass — that stays explicit: run `seer_symbol_history_build` (no
-`symbols`/`paths`) with a small `maxSeconds`/`maxFiles` budget, or
-`seer symbol-history` from a shell. Pass `autoBuild: false` to `seer_history` for
-a strictly read-only lookup.
+| Tool | Use |
+|---|---|
+| `seer_bundle_export` | Export a portable `.seerbundle`. |
+| `seer_bundle_import` | Import another repo as a read-only layer. |
+| `seer_bundle_info` | Inspect a bundle. |
+| `seer_external_bundles` | List imported layers. |
+| `seer_contract_diff` | Compare API surfaces across bundles. |
+| `seer_scip_import` | Add a SCIP precision overlay. |
+| `seer_provenance` | See where an edge came from. |
+| `seer_duplicates` | Find near-duplicate code clusters. |
+
+## Fewer Round Trips
+
+| Tool | Use |
+|---|---|
+| `seer_batch` | Run up to 25 read-only Seer calls in one request. |
+| `seer_trace` | Single entry point for the trace family. |
+
+`seer_batch` accepts short names and MCP-client namespaced names:
+
+```json
+{
+  "calls": [
+    { "tool": "seer_definition", "args": { "name": "chargeCard" } },
+    { "tool": "mcp__seer__seer_callers", "args": { "symbol": "chargeCard" } }
+  ]
+}
+```
+
+A failed call leaves the rest of the batch running.
+
+## Keeping Output Small
+
+High-volume list tools accept `tokenBudget`. Seer packs the highest-ranked rows
+first, then returns `truncated: true` and an `omitted` count when it stops.
+
+```json
+{ "query": "payment", "tokenBudget": 800 }
+```
+
+Trace tools also support preview and summary modes for big graphs.

@@ -1,82 +1,76 @@
 # CLI Reference
 
-Every Seer capability is available from a plain shell, not just over MCP. This
-is useful for scripting, CI, and just looking around a repo yourself. All query
-commands auto-detect `.seer/graph.db` by walking up from the current directory;
-pass `--db <path>` to point at a saved index.
+Every Seer feature is available from a shell. This is handy for CI, scripts, and
+quick repo checks without an agent.
 
-Run `seer --help`, or `seer <command> --help`, for the full flag list of any
-command.
+Most query commands auto-detect `.seer/graph.db` by walking up from the current
+directory. Use `--db <path>` when you want a specific index.
 
----
+```bash
+seer --help
+seer <command> --help
+```
 
 ## Setup
 
-```bash
-seer init [workspace]          # wire Seer into your agents (see docs/mcp.md)
-seer index <repo-path>         # build or refresh the index
-seer mcp --workspace <path>    # run the MCP server over the index
-```
+| Command | Use |
+|---|---|
+| `seer init [workspace]` | Wire Seer into an MCP client. |
+| `seer index <repo-path>` | Build or refresh the index. |
+| `seer mcp --workspace <path>` | Run the MCP server. |
+| `seer update` | Refresh existing Seer config. |
+| `seer uninstall` | Remove Seer config. |
 
-### `seer index` options
+### `seer index`
 
 | Flag | Meaning |
 |---|---|
-| `--reset` | Delete the existing index first. |
-| `--mode full\|standard\|fast` | Discovery breadth. `standard` is the default. |
-| `--include-vendor` / `--include-generated` | Pull in normally-excluded files. |
-| `--max-file-kb <n>` | Skip files larger than `n` KiB (0 = no cap, the default). |
-| `--parallel` / `--no-parallel` | Force or disable worker-thread parsing. |
-| `--jobs <n>` | Worker thread count (default: cores minus one, capped at 8). |
-| `-v, --verbose` | Per-file progress. |
-
-`standard` excludes big dependency and generated trees. `fast` also drops docs,
-fixtures, and static assets. `full` indexes everything.
-
----
+| `--reset` | Rebuild from scratch. |
+| `--mode full\|standard\|fast` | Discovery breadth. Default is `standard`. |
+| `--include-vendor` | Include dependency folders. |
+| `--include-generated` | Include generated files. |
+| `--max-file-kb <n>` | Skip files larger than `n` KiB. |
+| `--parallel` / `--no-parallel` | Force or disable worker parsing. |
+| `--jobs <n>` | Worker count. |
+| `-v, --verbose` | Show per-file progress. |
 
 ## Orientation
 
-```bash
-seer health           # schema version, role counts, watcher state (cheap)
-seer stats            # file / symbol / edge / route / config counts
-seer architecture     # one-page snapshot: top symbols, modules, frameworks
-seer boundaries       # detected monorepo package boundaries
-seer modules          # Louvain module clusters
-seer module <label>   # files and top symbols inside a module
-```
+| Command | Answers |
+|---|---|
+| `seer health` | Is the index live and fresh? |
+| `seer stats` | How many files, symbols, edges, routes, and configs are indexed? |
+| `seer architecture` | What are the top symbols, modules, and frameworks? |
+| `seer boundaries` | What package or service boundaries exist? |
+| `seer modules` | What clusters did Seer infer? |
+| `seer module <label>` | Which files and symbols are in one cluster? |
 
----
-
-## Search and symbols
+## Symbols And Calls
 
 ```bash
-seer symbols [query]            # search by name, or list top symbols by PageRank
-seer symbols <q> --top 20
-seer symbols <q> --include-tests --include-declarations --include-type-refs
+seer symbols [query]
+seer symbols <query> --top 20
+seer callers <symbol> --file path/to/file.ts
+seer callees <symbol>
 ```
 
-By default, vendor, generated, test-file symbols, forward declarations, and type
-references are hidden. Opt in with the `--include-*` flags.
-
----
-
-## Call graph
+By default, search hides vendor files, generated files, tests, forward
+declarations, and type references. Opt in with:
 
 ```bash
-seer callers <symbol> [--file path] [--limit n]  # who calls this
-seer callers <symbol> --include-snippets [--snippet-context n]  # + real source at each call site
-seer callees <symbol> [--limit n]    # what this calls
+seer symbols <query> --include-tests --include-declarations --include-type-refs
 ```
 
-Without `--file`, callers is intentionally broad for shared short names. Use
-`--file` for exact, id-scoped callers of a common or qualified method name.
-`--include-snippets` adds the real source at each call site (HOW the symbol is
-invoked — argument patterns); pair it with a small `--limit`.
+For common names like `init`, `update`, or `render`, pass `--file` to target one
+definition.
 
----
+To sample real call-site source:
 
-## Routes, dependencies, config
+```bash
+seer callers buildInvoice --limit 5 --include-snippets --snippet-context 2
+```
+
+## Routes, Dependencies, Config
 
 ```bash
 seer routes [--method POST] [--framework express] [--path checkout]
@@ -84,61 +78,37 @@ seer deps   [--ecosystem npm] [--name react]
 seer config [--key DATABASE_URL]
 ```
 
----
+## Pre-Edit Checks
 
-## Pre-edit intelligence
+| Command | Use |
+|---|---|
+| `seer preflight --symbol <name>` | Full packet before editing a symbol. |
+| `seer preflight --from main --to HEAD` | Blast radius of a diff. |
+| `seer context <symbol>` | Definition, callers, tests, history, risk. |
+| `seer risk <symbol>` | Decomposed edit-risk score. |
+| `seer behavior <symbol>` | Tests that exercise a symbol. |
+| `seer detect-changes --from main --to HEAD` | Diff mapped to symbols. |
 
-```bash
-seer preflight --symbol <name> [--file <path>]      # full pre-edit packet
-seer preflight --from main --to HEAD                # blast radius of a diff
-seer preflight --from main --to HEAD --old-bundle a.seerbundle --new-bundle b.seerbundle
+`preflight` is the usual first call before an edit.
 
-seer context  <symbol>      # definition + callers + tests + history + risk
-seer risk     <symbol>      # decomposed edit-risk score
-seer behavior <symbol>      # ranked tests that exercise the symbol
-seer detect-changes --from main --to HEAD   # standalone diff blast radius
-```
-
-`preflight` is the one to reach for first. It folds definition, callers,
-transitive dependents, tests, recent history, and risk into a single packet.
-
----
-
-## Git history and continuity
+## Git History
 
 ```bash
-seer churn                       # file-level git stats
-seer symbol-history [--force]    # build the per-symbol history index (opt-in)
-seer history <symbol>            # commit blame chain for one symbol
-seer continuity <symbol>         # rename/move continuity evidence (advisory)
-seer changes-with <symbol>       # symbols that historically co-change (advisory coupling)
+seer churn
+seer symbol-history
+seer history <symbol>
+seer continuity <symbol>
+seer changes-with <symbol>
 ```
 
-`changes-with` mines the per-symbol history for temporal coupling — the symbols
-that changed in the same commits as the target. It needs the FULL history index
-(`seer symbol-history`); on a scoped/partial index it prints a warning and may be
-incomplete. Flags: `--file`, `--min-support n`, `--max-commit-symbols n`,
-`--cross-file-only`, `--since <unix|ISO>`, `--json`.
-
----
-
-## Portability and diffing
+`seer changes-with` finds symbols that historically changed in the same commits
+as the target. Build the full symbol-history index first for the best signal:
 
 ```bash
-seer bundle export [--out file.seerbundle]
-seer bundle import <bundle> [--external --alias <name>]
-seer bundle info <bundle>
-seer bundle external                       # list imported external layers
-seer contract diff <old> <new> [--include-callers]
-seer ci bundle                             # fresh-index + emit a bundle (for CI)
-seer ci workflow                           # print a GitHub Actions YAML
-seer scip-import <scip.json>               # add a SCIP precision overlay
-seer duplicates [--max-distance 4] [--min-loc 5]
+seer symbol-history
 ```
 
----
-
-## Service links
+## Service Links
 
 ```bash
 seer service-calls  [--protocol http] [--path /users]
@@ -146,13 +116,24 @@ seer service-links  [--match-kind exact]
 seer trace-service <from> <to> [--depth n]
 ```
 
-These resolve outbound network calls (fetch, axios, gRPC, tRPC, GraphQL, message
-queues) to the concrete route handlers that serve them.
+These resolve outbound calls such as fetch, axios, gRPC, tRPC, GraphQL, and
+queue producers to route handlers.
 
----
+## Bundles And Overlays
 
-## Common flags
+```bash
+seer bundle export [--out file.seerbundle]
+seer bundle import <bundle> [--external --alias <name>]
+seer bundle info <bundle>
+seer contract diff <old> <new> [--include-callers]
+seer scip-import <scip.json>
+seer duplicates [--max-distance 4] [--min-loc 5]
+```
 
-- `--db <path>` on any query command points at a specific index.
-- `--limit <n>` caps list output on most list commands.
-- `--json` is available on `preflight` and `contract diff` for machine output.
+## Common Flags
+
+| Flag | Use |
+|---|---|
+| `--db <path>` | Query a specific SQLite index. |
+| `--limit <n>` | Cap list output. |
+| `--json` | Machine-readable output where supported. |

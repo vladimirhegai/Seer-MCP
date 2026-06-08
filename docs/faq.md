@@ -1,73 +1,94 @@
-# FAQ and positioning
+# FAQ
 
-## Is Seer just another codebase-graph MCP?
+## What is Seer?
 
-There is overlap, but the focus is different. Most graph tools help an agent
-*explore* structure. Seer is built around the moment *before an edit*: it folds
-callers, tests, risk, boundaries, and per-symbol history into one packet so the
-agent understands the impact of a change, not just the shape of the code. The
-headline differentiator is symbol-level git history, not file-level churn.
+Seer is a local MCP server that gives agents a structural map of a repo:
+symbols, callers, tests, routes, service links, boundaries, history, and edit
+risk.
 
-## How is Seer different from codebase-memory?
+## Does Anything Leave My Machine?
 
-Codebase-memory and similar graph-first tools are great at structural
-exploration. Seer leans into edit-awareness: tests that cover a symbol, the risk
-of touching it, what a diff will break, and how a function changed over time.
-Think of structural exploration as the floor, and edit-impact context as the
-thing Seer adds on top. A concrete example is `seer_changes_with`: it mines git
-history for the symbols that *historically change together* with the one you are
-about to edit — coupling through shared formats, protocol constants, or config
-that the static call graph (what graph-first tools expose) simply cannot see.
+No. Seer-Core runs locally, writes a local SQLite index, and makes no network
+calls for indexing or querying.
 
-## How is Seer different from Serena?
+```text
+<repo>/.seer/graph.db
+```
 
-Serena-style tools focus on editing and refactoring symbols directly. Seer does
-not edit your code. It tells the agent doing the editing what the change is going
-to affect, so the edit is safer. They are complementary.
+## Does Seer Use An LLM?
 
-## Does Seer replace Claude, Cursor, or Codex?
+Seer-Core returns deterministic structural facts. Agents can use those facts,
+while Core itself makes no LLM calls.
 
-No. Seer is an MCP server those tools call. It gives the agent better context;
-the agent still does the reasoning and the editing. Seer works with all of them
-at once (see [MCP Setup](mcp.md)).
+## What Problems Is It Good At?
 
-## How is Seer different from grep?
+| Question | Seer tool |
+|---|---|
+| Who calls this method? | `seer_callers` |
+| What does this function call? | `seer_callees` |
+| What should I know before editing this symbol? | `seer_preflight` |
+| Which tests exercise this code? | `seer_behavior` |
+| What changed in this diff? | `seer_preflight` with `fromRef` / `toRef` |
+| Which service handler receives this call? | `seer_service_links` |
+| How has this symbol changed over time? | `seer_history` |
 
-Grep matches text. Seer understands structure. "Who calls this method", "which
-tests cover it", "what does this diff break", and "how did this function change"
-are not text queries. They also cost far fewer tokens than the multi-search,
-multi-file-read dance an agent does with grep alone. Use grep for comments,
-string literals, and config values; use Seer for everything structural.
+## How Is It Different From Text Search?
 
-## Does anything leave my machine?
+Text search finds matching strings. Seer finds code structure. Use search for
+comments, literals, and config text. Use Seer for callers, callees, route maps,
+test reachability, and edit impact.
 
-No. Seer-Core is local and deterministic. No API keys, no network calls, no
-telemetry. The index is a single SQLite file under `.seer/`.
+## Does It Edit Code?
 
-## Does it use an LLM?
+Seer gives context to the agent doing the editing. It keeps its own tools
+read-only except for maintenance tasks such as indexing and setup.
 
-Seer-Core does not. It returns deterministic structural facts. The accuracy and
-token-efficiency benchmarks use LLMs only to *measure* how much Seer helps an
-agent, not inside Seer itself. (A separate Seer-Onboarding layer is the
-LLM-enabled, human-facing product; this repo is Core.)
+## Which Agents Can Use It?
 
-## Which languages are supported?
+Seer connects through MCP. The setup wizard supports:
+
+| Client | Setup |
+|---|---|
+| Claude Code | `npx seer-mcp init --client claude` |
+| Cursor | `npx seer-mcp init --client cursor` |
+| VS Code MCP / Copilot | `npx seer-mcp init --client vscode` |
+| Codex | `npx seer-mcp init --client codex` |
+| Gemini | `npx seer-mcp init --client gemini` |
+| Antigravity | `npx seer-mcp init --client antigravity` |
+| Windsurf | `npx seer-mcp init --client windsurf` |
+
+## Which Languages Are Supported?
 
 Python, JavaScript, TypeScript/TSX, Go, Java, Rust, C, C++, and C#. See
-[Language Support](languages.md) for the capability matrix.
+[Language Support](languages.md) for details.
 
-## How big a repo can it handle?
+## How Big A Repo Can It Handle?
 
-It has been run on the Linux kernel and Unreal Engine (millions of symbols, tens
-of millions of edges). See [Benchmarks](benchmarks.md) for measured numbers.
+Seer has been tested on repos such as Godot, TypeScript, React, the Linux
+kernel, and Unreal Engine. See [Benchmarks](benchmarks.md) for indexing numbers.
 
-## Do I have to commit the `.seer/` folder?
+## Do I Commit `.seer/`?
 
-No. It rebuilds on demand. Add `.seer/` to `.gitignore` if you prefer. For
-sharing a prebuilt index (for example in CI), use `seer bundle export`.
+No. The index rebuilds on demand. Add this to `.gitignore`:
 
-## How do I keep results fresh?
+```gitignore
+.seer/
+```
 
-You do not have to do anything. A background watcher keeps the index warm, and a
-hash-based freshness check re-parses anything that changed before a query
-returns. If you ever suspect drift, `seer index . --reset` rebuilds clean.
+For sharing an index across machines or repos, use bundles:
+
+```bash
+seer bundle export --out repo.seerbundle
+seer bundle import repo.seerbundle --external --alias upstream
+```
+
+## How Does Freshness Work?
+
+Seer watches the workspace and also checks file hashes before queries. Changed
+files are re-indexed before results return.
+
+If you ever want a clean rebuild:
+
+```bash
+seer index . --reset
+```

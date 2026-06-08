@@ -1,27 +1,31 @@
-# Pre-edit context
+# Pre-Edit Context
 
-The single most useful thing Seer does: tell an agent what a change will touch
-*before* it makes it.
+The best time to understand a change is before touching the code.
 
-## The problem
+## Scenario
 
-An agent asked to "add idempotency to `chargeCard`" usually starts by grepping
-for `chargeCard`, opening the file, grepping for callers, opening those, hunting
-for tests, and maybe checking git blame. That is six to ten tool calls and a lot
-of tokens, and it still misses the transitive dependents and the risk.
+An agent needs to add idempotency to `chargeCard`. It should know:
 
-## One call instead
+| Question | Why it matters |
+|---|---|
+| Who calls it? | The change may affect more than the local file. |
+| Which tests cover it? | Existing behavior should stay protected. |
+| Is it on a route? | A regression may be user-facing. |
+| Has it changed recently? | Recent fixes often hide important context. |
 
+## One Call
+
+```json
+{ "symbol": "chargeCard" }
 ```
-seer_preflight { "symbol": "chargeCard" }
-```
+
+Call `seer_preflight`.
 
 Trimmed response:
 
 ```json
 {
   "symbol": {
-    "name": "chargeCard",
     "qualifiedName": "billing.PaymentService.chargeCard",
     "file": "src/billing/payment.ts",
     "lineStart": 142,
@@ -31,51 +35,47 @@ Trimmed response:
     { "name": "checkout", "file": "src/api/checkout.ts", "line": 88 },
     { "name": "retryFailedPayment", "file": "src/jobs/retry.ts", "line": 31 }
   ],
-  "callerCount": 2,
   "transitiveDependents": 9,
   "routeExposure": [
-    { "method": "POST", "path": "/api/checkout", "framework": "express" }
+    { "method": "POST", "path": "/api/checkout" }
   ],
   "tests": [
     { "name": "charges a valid card", "file": "test/payment.spec.ts", "directness": "direct" }
   ],
-  "history": [
-    { "sha": "a1b2c3d", "date": "2026-04-18", "summary": "handle declined cards" }
-  ],
   "risk": {
     "verdict": "high",
-    "reasons": ["sits on public route POST /api/checkout", "9 transitive dependents", "cyclomatic 14"]
+    "reasons": [
+      "public route POST /api/checkout",
+      "9 transitive dependents",
+      "cyclomatic 14"
+    ]
   }
 }
 ```
 
-## Why this matters
+## What The Agent Learns
 
-The agent now knows, in one shot, that `chargeCard`:
+| Signal | Read as |
+|---|---|
+| Public route | Treat this as user-facing behavior. |
+| 9 transitive dependents | Check downstream callers before changing the contract. |
+| One direct test | Add coverage for the new idempotency behavior. |
+| Recent history | Read nearby commits if the change touches old bug-fix paths. |
 
-- is reached from a public checkout endpoint, so a regression is user-facing,
-- has 9 downstream dependents, so the blast radius is wide,
-- has exactly one direct test, so coverage is thin,
-- was last touched to handle declined cards, so that path is load-bearing.
+## Diff Mode
 
-That is enough to write the change carefully and add the right test, without a
-scavenger hunt.
+For work already underway:
 
-## Diff mode
-
-If you want the blast radius of work already in progress:
-
-```
-seer_preflight { "fromRef": "main", "toRef": "HEAD" }
+```json
+{ "fromRef": "main", "toRef": "HEAD" }
 ```
 
-Seer maps the changed line ranges to the affected symbols and returns the same
-kind of packet for each. See [Change history](change-history.md).
+Seer maps the diff to changed symbols and returns a preflight packet for each.
 
-## From the CLI
+## CLI
 
 ```bash
 seer preflight --symbol chargeCard
-seer preflight --symbol chargeCard --file src/billing/payment.ts   # disambiguate
+seer preflight --symbol chargeCard --file src/billing/payment.ts
 seer preflight --from main --to HEAD --json
 ```

@@ -1,61 +1,75 @@
 # Known Limits
 
-Seer is honest about what it does not do. Knowing these keeps an agent from
-trusting a signal further than it should.
+Seer is useful because it is fast, local, and deterministic. Those choices come
+with boundaries. This page names them plainly.
 
-## HTTP route extraction is framework-limited
+## Summary
 
-Server-side routes are extracted for Java (Spring), Python (FastAPI, Flask), and
-TypeScript/JavaScript (Express, Fastify, tRPC, GraphQL). Go `net/http`/gin/chi,
-Rust axum/actix, C# ASP.NET, and C++ have no HTTP route extraction. Those
-backends can still be a *client* in a service link, and they can be a *target*
-over gRPC (routes come from `.proto` files), but not an HTTP target. See
-[Language Support](languages.md).
+| Area | Limit | Practical move |
+|---|---|---|
+| HTTP routes | Framework support is explicit. | Check [Language Support](languages.md). |
+| Edge resolution | Tree-sitter gives structural edges without full type checking. | Use SCIP overlays for compiler-grade edges. |
+| Generated code | Seer indexes files on disk. | Include generated files when you need them. |
+| Runtime behavior | Reflection and dynamic DI are invisible until represented in source. | Treat dynamic systems as manual review areas. |
+| Co-change history | Needs the full history index. | Run `seer symbol-history`. |
 
-## Continuity is a snapshot matcher, not a time machine
+## Route Extraction
 
-`seer_continuity` links a rename or move only when both identities exist in the
-current working tree (for example a kept alias). A true cross-commit rename,
-where the old symbol is gone, yields no continuity candidate, on purpose, because
-inventing one would be a false positive. Cross-commit lineage is delivered by
-`seer_history` instead, which follows the file through git. So the "trace
-refactoring across renames" promise is real; it is just fulfilled by history,
-with continuity as advisory snapshot evidence.
+Routes are extracted for:
 
-## Edge resolution is heuristic, not a compiler
+| Ecosystem | Frameworks |
+|---|---|
+| TypeScript / JavaScript | Express, Fastify, tRPC, GraphQL |
+| Python | FastAPI, Flask |
+| Java | Spring Boot |
+| gRPC | `.proto` files |
 
-The three-pass resolver (same-file, imported-file, global fallback) is fast and
-language-agnostic, but it is not type-aware. On heavily overloaded or
-dynamically dispatched code, the global fallback can bind to a plausible
-same-name target rather than the exact one. For compiler-grade precision on a
-specific language, layer in a SCIP index with `seer scip-import`; those edges are
-labeled by provenance and sit on top of the tree-sitter baseline.
+Other languages can still be clients in service links.
 
-## It indexes what is on disk
+## Edge Resolution
 
-Seer parses source files. Code generated at build time, behavior injected by
-reflection or runtime DI, and routes registered dynamically at startup are
-invisible until they exist as files. `--include-generated` pulls in generated
-files if you want them.
+Seer links calls to definitions with a fast scope-aware resolver:
 
-## Resolution percentage is not coverage
+1. Same file.
+2. Imported files.
+3. Global same-name fallback.
 
-The "resolved edges" percentage in `seer stats` reflects how many call edges
-were bound to a definition, which is naturally lower in repos that lean on
-external libraries (those targets are not in the index). It is a health signal,
-not a quality grade.
+This works well for structural navigation. Heavily overloaded or dynamically
+dispatched code may need a compiler index. Import one with:
 
-## Temporal coupling requires a full history index
+```bash
+seer scip-import scip.json
+```
 
-`seer_changes_with` mines `symbol_history` for co-change partners. It needs the
-repo-wide history index — a partner's file must also be indexed, otherwise its
-coupling signal is invisible. Check `historyComplete` in the response: when
-`false`, the full index has not been built and `partners` may be partial or
-falsely empty. Build it with `npx seer-mcp symbol-history` (can take minutes on
-large repos). The tool never silently auto-builds a partial answer.
+## Generated And Runtime Code
 
-## Deterministic, not semantic
+Seer reads files. Build-time generated code, runtime route registration,
+reflection, and dependency injection only appear when they are visible in files.
 
-Seer returns facts, not understanding. It will tell you a function has 9
-dependents and sits on a public route; it will not tell you whether your change
-is correct. That judgment stays with the agent and with you.
+To include generated files:
+
+```bash
+seer index . --include-generated
+```
+
+## Resolution Percentage
+
+`seer stats` reports resolved call edges. That percentage is a health signal.
+Projects with many external-library calls naturally resolve fewer edges because
+those definitions live outside the repo.
+
+## Temporal Coupling
+
+`seer_changes_with` looks for symbols that changed in the same commits. It needs
+the full history index because partner symbols may live in other files.
+
+```bash
+seer symbol-history
+```
+
+Check `historyComplete` in the response before relying on an empty partner list.
+
+## Deterministic Facts
+
+Seer tells an agent what the repo structure says. The agent still decides what
+the change means and whether the final code is correct.

@@ -27,6 +27,12 @@ import { findDuplicates, buildShapeHashes } from '../indexer/shapehash.js';
 import { buildSkeleton } from '../indexer/skeleton.js';
 import { computeCoupling } from '../indexer/coupling.js';
 import { attachCallSiteSnippets } from '../indexer/snippets.js';
+import {
+  AgentNextBestCall, AgentPrecision, AgentWarning,
+  agentWarning, boundedPrecision, boundedUnquantifiedPrecision,
+  exactPrecision, heuristicPrecision,
+  nameAggregatePrecision, nextBestCall, unknownPrecision,
+} from '../indexer/agentMetadata.js';
 
 /**
  * Seer MCP server.
@@ -335,6 +341,94 @@ export class SeerMcpServer {
     return SIDE_EFFECTING_TOOLS.has(name);
   }
 
+  /**
+   * MCP clients often expose server tools as `mcp__<server>__seer_tool` even
+   * though Seer's in-process handler registry is keyed by the short
+   * `seer_tool` name. `seer_batch` accepts either spelling so agents can paste
+   * the visible tool name without knowing about this internal registry.
+   */
+  private normalizeDelegatedToolName(rawName: string): { toolName: string; requestedTool?: string } {
+    if (!rawName.startsWith('mcp__')) return { toolName: rawName };
+    const last = rawName.split('__').pop() ?? rawName;
+    if (!last.startsWith('seer_')) return { toolName: rawName };
+    return { toolName: last, requestedTool: rawName };
+  }
+
+  private countShortNameDefinitions(name: string): number {
+    try { return this.store.countDefinitionsByShortName(name); }
+    catch { return 0; }
+  }
+
+  private ambiguityPrecision(ambiguity: { reason: string; likelyCallersEstimate: { lowerBound: number; upperBound: number } }): AgentPrecision {
+    return boundedPrecision(
+      ambiguity.likelyCallersEstimate.lowerBound,
+      ambiguity.likelyCallersEstimate.upperBound,
+      'call-sites',
+      ambiguity.reason === 'unresolved-receiver-type'
+        ? 'C/C++ receiver type is unresolved; resolved callers are a lower bound.'
+        : 'This short name is shared; by-name callers are an upper bound.',
+    );
+  }
+
+  private ambiguityGraphPrecision(): AgentPrecision {
+    return boundedUnquantifiedPrecision(
+      'Graph traversal starts from id-resolved edges; unresolved receiver types can hide additional graph edges.',
+    );
+  }
+
+  private ambiguityWarning(ambiguity: { reason: string }): AgentWarning {
+    return agentWarning(
+      'caller-undercount',
+      ambiguity.reason === 'unresolved-receiver-type'
+        ? 'Resolved caller counts may undercount this C/C++ member because receiver types are unresolved.'
+        : 'This short name is shared; by-name caller counts include other definitions.',
+    );
+  }
+
+  private ambiguityNextCall(
+    target: { name: string; qualifiedName: string | null; filePath: string },
+    state: { groupByFile?: boolean; includeNameMatches?: boolean; receiverFilter?: boolean } = {},
+  ): AgentNextBestCall | undefined {
+    const base = { symbol: target.qualifiedName ?? target.name, file: target.filePath };
+    if (!state.groupByFile) {
+      return nextBestCall(
+        'seer_callers',
+        { ...base, groupByFile: true },
+        'Resolved callers are bounded; groupByFile shows where same-name call sites concentrate.',
+      );
+    }
+    if (!state.includeNameMatches) {
+      return nextBestCall(
+        'seer_callers',
+        { ...base, includeNameMatches: true, limit: 40 },
+        'You already have the by-file breakdown; includeNameMatches pages the same-name call sites.',
+      );
+    }
+    if (!state.receiverFilter) {
+      return nextBestCall(
+        'seer_callers',
+        { ...base, filterReceiverType: true, limit: 40 },
+        'You already have same-name sites; filterReceiverType tries to attribute them to the target class.',
+      );
+    }
+    return undefined;
+  }
+
+  private nameAggregateNextCall(symbol: string): AgentNextBestCall {
+    return nextBestCall(
+      'seer_definition',
+      { name: symbol, tokenBudget: 4000 },
+      'This bare name matches multiple definitions; inspect definitions, then re-call with file or a qualified name.',
+    );
+  }
+
+  private nameAmbiguityWarning(symbol: string, count: number): AgentWarning {
+    return agentWarning(
+      'ambiguous-target',
+      `Bare name "${symbol}" resolved to the highest-ranked definition, but ${count} other definition(s) exist.`,
+    );
+  }
+
   private async runToolWithTimeout(
     name: string,
     handler: (args: any) => Promise<any>,
@@ -449,6 +543,12 @@ export class SeerMcpServer {
     sharedByDefinitions: number;
     nameCallsites: number;
     resolvedCallsites: number;
+    likelyCallersEstimate: {
+      unit: 'call-sites';
+      lowerBound: number;
+      upperBound: number;
+      confidence: 'bounded';
+    };
     note: string;
   } | undefined {
     const shortName = target.name;
@@ -468,9 +568,22 @@ export class SeerMcpServer {
     const cppExts = new Set(['.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.h++', '.inl', '.ino']);
     const reason = cppExts.has(ext) ? 'unresolved-receiver-type' as const : 'shared-short-name' as const;
     const note = reason === 'unresolved-receiver-type'
-      ? `Likely undercount. ${shortName} is defined by ${sharedDefs} symbols, and ${nameCallsites} call sites invoke some "${shortName}". C/C++ member calls (obj->${shortName}()) lose the receiver's static type, so Seer cannot bind them to THIS definition — the ${target.total} resolved call site(s) are a LOWER bound; the true caller set for this symbol is between ${target.total} and ${nameCallsites}. Pass includeNameMatches=true for the by-name caller list, or grep for the exact receiver type.`
-      : `${shortName} is defined by ${sharedDefs} symbols and ${nameCallsites} call sites use the bare name; only ${target.total} resolved to THIS definition. The remainder bound to other same-named symbols. Pass includeNameMatches=true to see every by-name caller (the upper bound).`;
-    return { reason, shortName, sharedByDefinitions: sharedDefs, nameCallsites, resolvedCallsites: target.total, note };
+      ? `Likely undercount: ${target.total} resolved call site(s), ${nameCallsites} by-name site(s) across ${sharedDefs} "${shortName}" definitions. Receiver types are unresolved in C/C++; use includeNameMatches/groupByFile/filterReceiverType to narrow.`
+      : `Shared short name: ${target.total} resolved call site(s), ${nameCallsites} by-name site(s) across ${sharedDefs} "${shortName}" definitions. The by-name count is an upper bound.`;
+    return {
+      reason,
+      shortName,
+      sharedByDefinitions: sharedDefs,
+      nameCallsites,
+      resolvedCallsites: target.total,
+      likelyCallersEstimate: {
+        unit: 'call-sites' as const,
+        lowerBound: target.total,
+        upperBound: nameCallsites,
+        confidence: 'bounded' as const,
+      },
+      note,
+    };
   }
 
   /**
@@ -485,6 +598,8 @@ export class SeerMcpServer {
    */
   private nameAmbiguityHint(symbol: string, file: string | undefined): {
     note: string;
+    totalDefinitions: number;
+    otherDefinitionsCount: number;
     resolvedTo: { qualifiedName: string; file: string; lineStart: number };
     otherDefinitions: Array<{ qualifiedName: string; file: string; lineStart: number }>;
   } | undefined {
@@ -495,11 +610,13 @@ export class SeerMcpServer {
     if (defs.length <= 1) return undefined;
     const [chosen, ...rest] = defs;
     return {
+      totalDefinitions: defs.length,
+      otherDefinitionsCount: rest.length,
       resolvedTo: { qualifiedName: chosen.qualifiedName ?? chosen.name, file: chosen.filePath, lineStart: chosen.lineStart },
       otherDefinitions: rest.slice(0, 4).map(d => ({
         qualifiedName: d.qualifiedName ?? d.name, file: d.filePath, lineStart: d.lineStart,
       })),
-      note: `"${symbol}" is defined by ${defs.length} symbols; used the highest-PageRank one (${chosen.qualifiedName ?? chosen.name}). Pass file= or a qualified Class::method to target a different definition.`,
+      note: `Top match: ${chosen.qualifiedName ?? chosen.name}; ${rest.length} other definition(s). Pass file= or a qualified Class::method to narrow.`,
     };
   }
 
@@ -1090,7 +1207,7 @@ export class SeerMcpServer {
     });
 
     this.registerTool('seer_callers', {
-      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. Pass includeSnippets=true to get the real source at each call site (HOW the symbol is invoked — argument patterns — before you write a new call). For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with the by-name upper bound. To narrow that bound: includeNameMatches=true (raw list, pageable with nameMatchOffset), groupByFile=true (accurate per-file breakdown of where the by-name sites concentrate), and filterReceiverType (best-effort: keep only sites whose receiver is locally typed as a given class; true infers the class from the target).',
+      description: 'CORE drill-down tool. Direct callers of a symbol. `total` counts CALL SITES (edges); `uniqueCallers` counts distinct caller functions (a function calling the target twice = 1 unique / 2 sites). Pass file to disambiguate common names or qualified names such as Class.method. Pass includeSnippets=true to get the real source at each call site (HOW the symbol is invoked — argument patterns — before you write a new call). For C/C++ member calls the receiver type is unresolved, so a resolved count far below reality is reported under `ambiguity` with resolved call sites plus a bounded `likelyCallersEstimate`. To narrow that bound: includeNameMatches=true (raw list, pageable with nameMatchOffset), groupByFile=true (accurate per-file breakdown of where the by-name sites concentrate), and filterReceiverType (best-effort: keep only sites whose receiver is locally typed as a given class; true infers the class from the target).',
       inputSchema: {
         symbol: z.string(),
         file: z.string().optional(),
@@ -1234,18 +1351,46 @@ export class SeerMcpServer {
         id: target.id, name: target.name, qualifiedName: target.qualifiedName,
         kind: target.kind, file: target.filePath, lineStart: target.lineStart,
       } : undefined;
+      const sharedDefinitions = target ? 1 : this.countShortNameDefinitions(symbol);
+      const precision = ambiguity
+        ? this.ambiguityPrecision(ambiguity)
+        : target
+          ? exactPrecision('Callers are resolved to this symbol id.')
+          : sharedDefinitions > 1
+            ? nameAggregatePrecision('call-sites', total, `Bare name "${symbol}" is shared by ${sharedDefinitions} definitions; callers are aggregated by name.`)
+            : sharedDefinitions === 0
+              ? unknownPrecision(`No indexed definition matched "${symbol}"; any rows are name-only call sites.`)
+              : exactPrecision('This short name maps to one indexed definition.');
+      const warnings: AgentWarning[] = [];
+      let suggestedCall: AgentNextBestCall | undefined;
+      if (ambiguity && target) {
+        warnings.push(this.ambiguityWarning(ambiguity));
+        suggestedCall = this.ambiguityNextCall(target, {
+          groupByFile,
+          includeNameMatches,
+          receiverFilter: wantReceiverFilter,
+        });
+      } else if (!target && sharedDefinitions > 1) {
+        warnings.push(agentWarning('name-aggregate', `Bare name "${symbol}" is shared by ${sharedDefinitions} definitions; pass file or a qualified name to scope the result.`));
+        suggestedCall = this.nameAggregateNextCall(symbol);
+      }
       if (total === 0) {
         const didYouMean = this.suggestSymbols(symbol);
         return this.text({ symbol, file, target: targetMeta,
-          total: 0, uniqueCallers, returned: 0, items: [], source: 'tree-sitter',
+          total: 0, uniqueCallers, returned: 0, items: [], precision,
           ...(ambiguity ? { ambiguity } : {}),
           ...(nameMatches ? { nameMatches } : {}),
+          ...(warnings.length > 0 ? { warnings } : {}),
+          ...(suggestedCall ? { nextBestCall: suggestedCall } : {}),
+          source: 'tree-sitter',
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       return this.budgetedText({ symbol, file, target: targetMeta,
-        total, uniqueCallers,
+        total, uniqueCallers, precision,
         ...(ambiguity ? { ambiguity } : {}),
         ...(nameMatches ? { nameMatches } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(suggestedCall ? { nextBestCall: suggestedCall } : {}),
         source: 'tree-sitter' }, items, tokenBudget);
     });
 
@@ -1284,10 +1429,25 @@ export class SeerMcpServer {
         edgeKind: c.edgeKind,
         source: c.calleeFile ? 'tree-sitter' : 'unresolved',
       }));
+      const sharedDefinitions = target ? 1 : this.countShortNameDefinitions(symbol);
+      const precision = target
+        ? exactPrecision('Callees are resolved from this symbol id.')
+        : sharedDefinitions > 1
+          ? nameAggregatePrecision('call-sites', all.length, `Bare name "${symbol}" is shared by ${sharedDefinitions} definitions; callees are aggregated by name.`)
+          : sharedDefinitions === 0
+            ? unknownPrecision(`No indexed definition matched "${symbol}"; any rows are name-only callee edges.`)
+            : exactPrecision('This short name maps to one indexed definition.');
+      const warnings = !target && sharedDefinitions > 1
+        ? [agentWarning('name-aggregate', `Bare name "${symbol}" is shared by ${sharedDefinitions} definitions; pass file or a qualified name to scope the result.`)]
+        : [];
+      const suggestedCall = !target && sharedDefinitions > 1 ? this.nameAggregateNextCall(symbol) : undefined;
       return this.budgetedText({ symbol, file, target: target ? {
         id: target.id, name: target.name, qualifiedName: target.qualifiedName,
         kind: target.kind, file: target.filePath, lineStart: target.lineStart,
-      } : undefined, total: all.length, source: 'tree-sitter' }, items, tokenBudget);
+      } : undefined, total: all.length, precision,
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(suggestedCall ? { nextBestCall: suggestedCall } : {}),
+        source: 'tree-sitter' }, items, tokenBudget);
     });
 
     // Search: BM25 across symbols + files. Each symbol hit also gets enriched
@@ -1728,6 +1888,32 @@ export class SeerMcpServer {
       }
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
       const out: Record<string, unknown> = nameAmbiguity ? { ...result, nameAmbiguity } : { ...result };
+      const warnings: AgentWarning[] = [];
+      let suggestedCall: AgentNextBestCall | undefined;
+      if (nameAmbiguity) {
+        warnings.push(this.nameAmbiguityWarning(symbol, nameAmbiguity.otherDefinitionsCount));
+        suggestedCall = this.nameAggregateNextCall(symbol);
+      }
+      if (result.lowConfidence) {
+        warnings.push(agentWarning(
+          'heuristic-coverage',
+          'Only heuristic test evidence was found; verify tests before treating this as coverage.',
+        ));
+        suggestedCall ??= nextBestCall(
+          'seer_callers',
+          { symbol: result.symbol.qualifiedName ?? result.symbol.name, file: result.symbol.file, includeNameMatches: true, limit: 40 },
+          'Heuristic behavior evidence is name-based; includeNameMatches shows same-name call sites to verify manually.',
+        );
+      }
+      out.precision = result.lowConfidence
+        ? heuristicPrecision('Only heuristic test evidence was found; verify tests before treating this as coverage.')
+        : result.testCoverageState === 'no-indexed-tests' || result.testCoverageState === 'test-indexing-unavailable'
+          ? unknownPrecision('Behavior coverage cannot be established from the current test index.')
+          : result.testCoverageState === 'tests-indexed-no-link'
+            ? unknownPrecision('Tests are indexed, but no behavioral link was found; absence of a link is not proof of no coverage.')
+            : exactPrecision(`Behavior coverage state is ${result.testCoverageState}.`);
+      if (warnings.length > 0) out.warnings = warnings;
+      if (suggestedCall) out.nextBestCall = suggestedCall;
       // Honest "tests mention this name" signal for the heuristic-only / no-link
       // cases: when the call graph can't confirm coverage (C/C++ member calls
       // lose the receiver type), an agent otherwise has to grep tests/ by hand
@@ -1800,9 +1986,40 @@ export class SeerMcpServer {
       const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
       const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      const resolvedCallsites = this.store.countCallersById(target.id);
+      const callerAmbiguity = this.callerAmbiguity({
+        id: target.id, name: target.name, filePath: target.filePath, total: resolvedCallsites,
+      });
+      const warnings: AgentWarning[] = [];
+      if (nameAmbiguity) warnings.push(this.nameAmbiguityWarning(symbol, nameAmbiguity.otherDefinitionsCount));
+      if (callerAmbiguity) warnings.push(this.ambiguityWarning(callerAmbiguity));
+      const precision = callerAmbiguity
+        ? this.ambiguityGraphPrecision()
+        : exactPrecision('Trace is resolved from the selected symbol id.');
+      const suggestedCall = nameAmbiguity
+        ? this.nameAggregateNextCall(symbol)
+        : callerAmbiguity
+          ? this.ambiguityNextCall(target)
+          : hasNextPage
+            ? nextBestCall(
+                'seer_trace_callers',
+                { symbol, ...(file ? { file } : {}), maxDepth: maxD, maxNodes: maxN, mode: selectedMode, limit: pageLimit, offset: pageOffset + pageItems.length },
+                'More trace rows are available; use nextOffset to fetch the next page.',
+              )
+            : selectedMode === 'summary'
+              ? nextBestCall(
+                  'seer_trace_callers',
+                  { symbol, ...(file ? { file } : {}), maxDepth: maxD, maxNodes: maxN, mode: 'preview', limit: TRACE_PREVIEW_LIMIT },
+                  'Summary mode omits raw rows; preview mode returns a compact first page.',
+                )
+              : undefined;
       const base = {
         symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
         ...(nameAmbiguity ? { nameAmbiguity } : {}),
+        ...(callerAmbiguity ? { ambiguity: callerAmbiguity } : {}),
+        precision,
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(suggestedCall ? { nextBestCall: suggestedCall } : {}),
         maxDepth: maxD,
         maxNodes: maxN,
         total: hits.length,
@@ -1853,9 +2070,30 @@ export class SeerMcpServer {
       const { items, pageItems, sampled } = this.loadTraceItems(hits, pageOffset, pageLimit);
       const hasNextPage = selectedMode !== 'summary' && pageOffset + pageItems.length < hits.length;
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
+      const warnings = nameAmbiguity
+        ? [this.nameAmbiguityWarning(symbol, nameAmbiguity.otherDefinitionsCount)]
+        : [];
+      const suggestedCall = nameAmbiguity
+        ? this.nameAggregateNextCall(symbol)
+        : hasNextPage
+          ? nextBestCall(
+              'seer_trace_callees',
+              { symbol, ...(file ? { file } : {}), maxDepth: maxD, maxNodes: maxN, mode: selectedMode, limit: pageLimit, offset: pageOffset + pageItems.length },
+              'More trace rows are available; use nextOffset to fetch the next page.',
+            )
+          : selectedMode === 'summary'
+            ? nextBestCall(
+                'seer_trace_callees',
+                { symbol, ...(file ? { file } : {}), maxDepth: maxD, maxNodes: maxN, mode: 'preview', limit: TRACE_PREVIEW_LIMIT },
+                'Summary mode omits raw rows; preview mode returns a compact first page.',
+              )
+            : undefined;
       const base = {
         symbol: { id: target.id, name: target.name, qualifiedName: target.qualifiedName, file: target.filePath },
         ...(nameAmbiguity ? { nameAmbiguity } : {}),
+        precision: exactPrecision('Trace is resolved from the selected symbol id.'),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(suggestedCall ? { nextBestCall: suggestedCall } : {}),
         maxDepth: maxD,
         maxNodes: maxN,
         total: hits.length,
@@ -2835,7 +3073,17 @@ export class SeerMcpServer {
           ...(didYouMean.length > 0 ? { didYouMean } : {}) });
       }
       const nameAmbiguity = this.nameAmbiguityHint(symbol, file);
-      return this.text(nameAmbiguity ? { ...packet, nameAmbiguity } : packet);
+      if (!nameAmbiguity) return this.text(packet);
+      const warnings = [
+        ...(packet.warnings ?? []),
+        this.nameAmbiguityWarning(symbol, nameAmbiguity.otherDefinitionsCount),
+      ];
+      return this.text({
+        ...packet,
+        nameAmbiguity,
+        warnings,
+        nextBestCall: this.nameAggregateNextCall(symbol),
+      });
     });
 
     // ── AI-agent optimization tools ─────────────────────────────────────────
@@ -2903,6 +3151,7 @@ export class SeerMcpServer {
         'CORE efficiency tool. Run several read-only Seer tools in one call and get all results back together. ' +
         'Saves turns when the fan-out is known up front (e.g. definition + callers + behavior + risk for one symbol). ' +
         'Each entry is {tool, args}. Calls run sequentially in one process; one failure never aborts the rest. ' +
+        'Tool names may be short Seer names (seer_skeleton) or MCP-client namespaced names (mcp__seer__seer_skeleton). ' +
         'seer_batch cannot nest, and it is intended for read-only tools.',
       inputSchema: {
         calls: z.array(z.object({
@@ -2911,28 +3160,53 @@ export class SeerMcpServer {
         })).min(1).max(25),
       },
     }, async ({ calls }) => {
-      const results: Array<{ tool: string | null; ok: boolean; result?: unknown; error?: string }> = [];
+      const results: Array<{ tool: string | null; requestedTool?: string; ok: boolean; result?: unknown; error?: string }> = [];
       for (const c of calls) {
-        const toolName = c && typeof c.tool === 'string' ? c.tool : null;
+        const rawToolName = c && typeof c.tool === 'string' ? c.tool : null;
+        const normalized = rawToolName ? this.normalizeDelegatedToolName(rawToolName) : null;
+        const toolName = normalized?.toolName ?? null;
+        const requestedTool = normalized?.requestedTool;
         if (!toolName || toolName === 'seer_batch') {
-          results.push({ tool: toolName, ok: false, error: 'missing tool name or nested seer_batch (disallowed)' });
+          results.push({
+            tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
+            ok: false,
+            error: 'missing tool name or nested seer_batch (disallowed)',
+          });
           continue;
         }
         if (this.isSideEffectingTool(toolName)) {
           results.push({
             tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
             ok: false,
             error: 'seer_batch only dispatches read-only tools; run side-effecting or derived-index tools directly after user approval.',
           });
           continue;
         }
         const h = this.handlers.get(toolName);
-        if (!h) { results.push({ tool: toolName, ok: false, error: `unknown tool "${toolName}"` }); continue; }
+        if (!h) {
+          results.push({
+            tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
+            ok: false,
+            error: `unknown tool "${rawToolName ?? toolName}". Use a Seer tool name such as "seer_skeleton"; MCP namespaced names like "mcp__seer__seer_skeleton" are also accepted.`,
+          });
+          continue;
+        }
         // Re-validate against the tool's schema — in-process dispatch bypasses
         // the SDK's protocol-level validation, so an entry missing a required
         // field would otherwise reach the store as `undefined`.
         const v = this.validateToolArgs(toolName, c.args);
-        if (!v.ok) { results.push({ tool: toolName, ok: false, error: v.error }); continue; }
+        if (!v.ok) {
+          results.push({
+            tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
+            ok: false,
+            error: v.error,
+          });
+          continue;
+        }
         // Keep seer_batch strictly read-only: seer_history can auto-build its
         // file on a cold miss, so default that off inside a batch. An explicit
         // autoBuild:true in the entry still wins for a caller who wants it.
@@ -2947,12 +3221,18 @@ export class SeerMcpServer {
           const parsedOk = !(parsed && typeof parsed === 'object' && (parsed as any).ok === false);
           results.push({
             tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
             ok: parsedOk,
             result: parsed,
             ...(!parsedOk ? { error: (parsed as any).error ?? (parsed as any).reason ?? 'tool returned ok:false' } : {}),
           });
         } catch (err) {
-          results.push({ tool: toolName, ok: false, error: (err as Error).message });
+          results.push({
+            tool: toolName,
+            ...(requestedTool ? { requestedTool } : {}),
+            ok: false,
+            error: (err as Error).message,
+          });
         }
       }
       return this.text({ batch: true, count: results.length, results });

@@ -545,6 +545,9 @@ function pickLikelyTestsFromContext(ctx: ContextPacket, maxN: number): Preflight
 
 function collectWarnings(ctx: ContextPacket): string[] {
   const out: string[] = [];
+  for (const w of ctx.warnings ?? []) {
+    out.push(w.message);
+  }
   if (ctx.behavior.direct === 0 && ctx.behavior.indirect === 0) {
     out.push('no direct or indirect test coverage detected');
   }
