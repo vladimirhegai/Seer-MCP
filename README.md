@@ -19,6 +19,11 @@
 
 </div>
 
+> [!IMPORTANT]
+> Seer is for the moment **before** an agent edits. It gives the agent local,
+> structural context so it can see callers, tests, routes, history, and risk
+> without wandering through files by hand.
+
 ## The Missing Layer For Agentic Coding
 
 AI coding agents can write a patch fast. The fragile part is knowing what that
@@ -36,7 +41,7 @@ graph and gives agents structural tools they can call while coding:
 | "What else changes with it?" | Symbol history and co-change evidence. |
 | "Can I edit this safely?" | A preflight packet with blast radius and risk signals. |
 
-For vibe coding, this is the map your agent should check before it starts
+For vibe coding, this is the quick reality check before the agent starts
 changing files. For agent-heavy development, it is a reusable context layer
 across Claude Code, Codex, Cursor, VS Code, Gemini, Antigravity, and Windsurf.
 
@@ -52,6 +57,10 @@ npx seer-mcp init
 ```
 
 Requires **Node.js 24+** on Windows, macOS, or Linux.
+
+> [!TIP]
+> New repo, new Seer index. Run setup from the repo you want the agent to
+> understand, then confirm `seer_health.workspace` points at that repo.
 
 Optionally, if you already know which client you want, skip the wizard and name
 it directly:
@@ -108,9 +117,10 @@ npx seer-mcp symbol-history
 npx seer-mcp symbol-history --since 1y
 ```
 
-This can take a while on large repos. Re-running it is incremental, and after a
-full history index exists, `npx seer-mcp index .` refreshes changed history rows
-as part of normal indexing.
+> [!WARNING]
+> Full symbol history can take a while on big repos. Re-running it is
+> incremental, and after a full history index exists, `npx seer-mcp index .`
+> refreshes changed history rows as part of normal indexing.
 
 ## What It Looks Like In Use
 
@@ -119,6 +129,10 @@ Imagine asking your agent:
 ```text
 Before editing chargeCard, use Seer to inspect the callers, tests, route exposure, and risk.
 ```
+
+> [!TIP]
+> Good Seer prompts start with **"Before editing..."**. That nudges the agent to
+> gather impact context first, then read or patch files.
 
 The agent can call:
 
@@ -241,6 +255,58 @@ Facts worth knowing:
 | No API key | Seer-Core runs without model API calls. |
 | Per repo | Each workspace gets its own config and index. |
 | Portable | Bundles can export and import read-only repo layers. |
+
+## Advanced: Precision And Multi-Repo Context
+
+Most users can ignore this section at first. These are the power moves for
+teams, monorepos, and agent workflows that need more than one checkout.
+
+| Need | Use | What it gives the agent |
+|---|---|---|
+| Related services live in separate repos. | External `.seerbundle` layers. | Read-only routes, service links, and contract context from another repo. |
+| Tree-sitter is too fuzzy for a language or call pattern. | SCIP precision import. | Source-labelled compiler-grade symbols and edges on top of Seer's baseline. |
+
+### Connect Another Repo
+
+Export a bundle from the dependency or service repo:
+
+```bash
+npx seer-mcp index .
+npx seer-mcp bundle export --out billing.seerbundle
+```
+
+Import it into the app or gateway repo as a read-only layer:
+
+```bash
+npx seer-mcp index .
+npx seer-mcp bundle import billing.seerbundle --external --alias billing
+npx seer-mcp bundle external
+```
+
+Useful follow-up tools:
+
+```text
+seer_service_links
+seer_external_bundles
+seer_contract_diff
+seer_preflight
+```
+
+### Add SCIP Precision
+
+Seer can import SCIP JSON indexes produced by compiler or LSP-style tooling:
+
+```bash
+npx seer-mcp scip-import path/to/index.scip.json
+```
+
+Then ask the agent to call `seer_provenance` to see which facts came from
+Tree-sitter, SCIP, or a merged row.
+
+> [!NOTE]
+> SCIP support works as a one-time precision import. Generate the SCIP index
+> with your language tooling, then import it into Seer. Seer keeps Tree-sitter
+> rows and labels precision contributions as `scip` or `scip-merge`.
 
 ## Language Support
 
