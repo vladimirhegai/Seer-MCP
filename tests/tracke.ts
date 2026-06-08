@@ -26,6 +26,7 @@ import { buildContext } from '../src/indexer/context';
 
 const FIXTURES = path.join(__dirname, 'fixtures-tracke');
 const TMP_DB = path.join(os.tmpdir(), `seer-tracke-${Date.now()}.db`);
+const TMP_WS = path.join(os.tmpdir(), `seer-tracke-ws-${Date.now()}`);
 
 let passed = 0;
 let failed = 0;
@@ -38,6 +39,27 @@ function assertEq<T>(actual: T, expected: T, msg: string): void {
   assert(actual === expected, `${msg} (got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)})`);
 }
 
+function copyRecursive(src: string, dst: string): void {
+  fs.mkdirSync(dst, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name);
+    const d = path.join(dst, entry.name);
+    if (entry.isDirectory()) copyRecursive(s, d);
+    else fs.copyFileSync(s, d);
+  }
+}
+
+function writeRiskFanInFixture(root: string): void {
+  const lines = ['export function fanInOnly(): number { return 1; }'];
+  for (let i = 0; i < 80; i++) {
+    lines.push(`export function fanInDirect${i}(): number { return fanInOnly(); }`);
+  }
+  for (let i = 0; i < 220; i++) {
+    lines.push(`export function fanInParent${i}(): number { return fanInDirect${i % 80}(); }`);
+  }
+  fs.writeFileSync(path.join(root, 'fan-in.ts'), lines.join('\n') + '\n', 'utf8');
+}
+
 async function run(): Promise<void> {
   console.log('\nSeer Track E Feature Tests');
   console.log('============================\n');
@@ -46,11 +68,13 @@ async function run(): Promise<void> {
     console.error(`Missing fixtures dir: ${FIXTURES}`);
     process.exit(1);
   }
+  copyRecursive(FIXTURES, TMP_WS);
+  writeRiskFanInFixture(TMP_WS);
 
   const store = new Store(TMP_DB);
   const indexer = new Indexer(store);
-  console.log(`Indexing ${FIXTURES}...`);
-  const r = await indexer.indexDirectory(FIXTURES, { quiet: true });
+  console.log(`Indexing ${TMP_WS}...`);
+  const r = await indexer.indexDirectory(TMP_WS, { quiet: true });
   console.log(`  files=${r.filesIndexed} symbols=${r.symbols} edges=${r.edges} modules=${r.modules}\n`);
 
   // ── Schema version ────────────────────────────────────────────────────────
@@ -236,6 +260,22 @@ async function run(): Promise<void> {
   }
 
   // ── seer_context ────────────────────────────────────────────────────────
+  console.log('\n── Risk fan-in calibration ──');
+  // A symbol can have many direct and transitive callers without any other
+  // risk signal. That should be loud enough to inspect, but not high by itself.
+  const fanInRisk = computeRisk(store, 'fanInOnly');
+  assert(fanInRisk !== null, 'computeRisk returns a result for fanInOnly');
+  if (fanInRisk) {
+    const directContribution = fanInRisk.signalContributions.find(s => s.signal === 'directCallers')?.contribution ?? 0;
+    const transitiveContribution = fanInRisk.signalContributions.find(s => s.signal === 'transitiveCallers')?.contribution ?? 0;
+    console.log(`  fanInOnly risk=${fanInRisk.risk} score=${fanInRisk.score.toFixed(2)} direct=${directContribution.toFixed(2)} transitive=${transitiveContribution.toFixed(2)}`);
+    assert(fanInRisk.signals.directCallers >= 80, 'fanInOnly has many direct callers');
+    assert(fanInRisk.signals.transitiveCallers >= 200, 'fanInOnly has many transitive callers');
+    assert(directContribution <= 24, 'direct caller contribution is capped');
+    assert(transitiveContribution <= 18, 'transitive caller contribution is capped');
+    assert(fanInRisk.risk === 'medium', 'fan-in alone stays medium, not high');
+  }
+
   console.log('\n── Context packet ──');
   const ctx = buildContext(store, 'validateCredentials');
   assert(ctx !== null, 'buildContext returns a packet for validateCredentials');

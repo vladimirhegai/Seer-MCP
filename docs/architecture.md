@@ -67,6 +67,9 @@ density, and recency.
 | Boundaries | The change crosses packages or services. |
 | Complexity and churn | The code is hard or has moved recently. |
 
+Fan-in is capped below the `high` threshold by itself. A busy helper should show
+as important, while `high` usually means Seer found another signal too.
+
 ## Freshness
 
 ```mermaid

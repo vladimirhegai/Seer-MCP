@@ -12,8 +12,9 @@ import type { SymbolRow } from '../types.js';
  * vibes."
  *
  * Signals (with deterministic weights):
- *   directCallers           +1 per caller up to 30
- *   transitiveCallers       +ln(1 + transitive) * 4   (bounded BFS, depth 3)
+ *   directCallers           +1 per caller up to 24
+ *   transitiveCallers       +ln(1 + transitive) * 3, capped at 18
+ *                            (bounded BFS, depth 3)
  *   routeExposed            +20 if symbol is a route handler
  *   directTests             -10 per direct test, capped at -30 (good coverage
  *                                                                 reduces risk)
@@ -27,8 +28,9 @@ import type { SymbolRow } from '../types.js';
  *   moduleBoundaryCrossings +2 per distinct neighboring module, capped at +20
  *
  * The score is bucketed into `low` (<20), `medium` (<50), or `high` (>=50).
- * The thresholds are conservative — easy to bias toward "high" — so the
- * agent gets shown evidence even when the verdict is in doubt.
+ * Fan-in alone is capped below "high"; another signal such as complexity,
+ * exposure, churn, config, or boundary/service impact should be present before
+ * the label gets that loud.
  */
 
 export interface RiskSignals {
@@ -264,9 +266,9 @@ function sumAssertions(b: BehaviorResult | null): number {
 function scoreContributions(s: RiskSignals): Array<{ signal: string; value: number; contribution: number }> {
   const out: Array<{ signal: string; value: number; contribution: number }> = [];
   out.push({ signal: 'directCallers', value: s.directCallers,
-    contribution: Math.min(30, s.directCallers) });
+    contribution: Math.min(24, s.directCallers) });
   out.push({ signal: 'transitiveCallers', value: s.transitiveCallers,
-    contribution: Math.log1p(s.transitiveCallers) * 4 });
+    contribution: Math.min(18, Math.log1p(s.transitiveCallers) * 3) });
   out.push({ signal: 'routeExposed', value: s.routeExposed ? 1 : 0,
     contribution: s.routeExposed ? 20 : 0 });
   // Coverage reduces risk (negative contribution).

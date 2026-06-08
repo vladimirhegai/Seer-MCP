@@ -2,7 +2,7 @@
 
 ## What is Seer?
 
-Seer is a local MCP server that gives agents a structural map of a repo:
+Seer is a local MCP server that shows AI coding agents what an edit will touch:
 symbols, callers, tests, routes, service links, boundaries, history, and edit
 risk.
 

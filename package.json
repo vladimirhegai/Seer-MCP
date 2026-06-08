@@ -1,7 +1,7 @@
 {
   "name": "seer-mcp",
   "version": "0.1.24",
-  "description": "Give your AI agents a map of your repo before they edit.",
+  "description": "Show AI coding agents what their edit will touch before they make it.",
   "license": "MIT",
   "private": false,
   "type": "commonjs",

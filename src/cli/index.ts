@@ -67,7 +67,7 @@ const program = new Command();
 
 program
   .name('seer')
-  .description('Local-first AI codebase explainer')
+  .description('Pre-edit impact context for AI coding agents')
   .version(VERSION);
 
 //  seer index

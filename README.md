@@ -2,7 +2,7 @@
 
 # Seer
 
-**Give AI coding agents a repo map before they edit.**
+**Show AI coding agents what their edit will touch before they make it.**
 
 [![npm](https://img.shields.io/npm/v/seer-mcp?color=2ea043)](https://www.npmjs.com/package/seer-mcp)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
