@@ -14,6 +14,7 @@ import { normalizeHttpTarget, resolveServiceLinks } from './serviceLinks.js';
 import { scanProtoFiles } from './protoScanner.js';
 import { scanServiceHosts } from './serviceHostScanner.js';
 import { writeProgress } from './progress.js';
+import { profileStart, profileReport, profileEnabled } from './profile.js';
 import type { Language, FileExtraction } from '../types.js';
 
 export interface IndexOptions {
@@ -275,11 +276,13 @@ export class Indexer {
       process.stdout.write(`\nDiscovering files in ${absRoot}...\n`);
     }
 
+    const endDiscovery = profileStart('discoverFiles');
     const files = await discoverFiles(absRoot, {
       includeVendor: options.includeVendor,
       includeGenerated: options.includeGenerated,
       mode: options.mode,
     });
+    endDiscovery();
     const includeGenerated = options.includeGenerated ?? (options.mode === 'full');
     const total = files.length;
     const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
@@ -390,6 +393,17 @@ export class Indexer {
     const parallelEnabled =
       parallelRequested && (parallelForced || work.length >= PARALLEL_AUTO_MIN_FILES);
 
+    // ── Deferred reverse-traversal index (bulk fresh index only) ───────────────
+    // On a fresh/large parse, the per-insert + per-resolve maintenance of
+    // idx_edges_to_id_kind_from is pure overhead: `to_id` is NULL at insert time
+    // and only set later by resolveEdges. Drop it now and rebuild it once, in
+    // bulk, after resolveEdges (see finishIndex). Gated on an EMPTY edges table
+    // so a cached/incremental re-index — where few edges are written but the
+    // index already covers the whole graph — never pays a needless rebuild.
+    const deferReverseIndex =
+      work.length >= PARALLEL_AUTO_MIN_FILES && !this.store.hasAnyEdges();
+    if (deferReverseIndex) this.store.dropReverseTraversalIndex();
+
     if (parallelEnabled && work.length > 0) {
       // Snapshot known DB hashes so workers can skip parsing on cache hits.
       const cacheMap = new Map<string, string>();
@@ -403,6 +417,7 @@ export class Indexer {
       }));
 
       const pool = new WorkerPool({ jobs: options.jobs });
+      const endDispatch = profileStart('parse+write (parallel dispatch)');
       try {
         await pool.ready();
         let processed = 0;
@@ -469,18 +484,23 @@ export class Indexer {
 
           // parsed: insert all symbols, edges, imports, routes, configKeys.
           const extraction: FileExtraction = result.extraction;
+          const endWrite = profileStart('  db-write (symbols/edges/etc)');
+          const endSymWrite = profileStart('    db-write symbols (+fts)');
           const symbolIdMap = new Map<string, number>();
           for (const def of extraction.definitions) {
             const symId = this.store.insertSymbol(fileId, def);
             const qname = def.qualifiedName ?? def.name;
             if (!symbolIdMap.has(qname)) symbolIdMap.set(qname, symId);
           }
+          endSymWrite();
+          const endEdgeWrite = profileStart('    db-write edges');
           for (const ref of extraction.references) {
             const fromId = ref.callerName ? symbolIdMap.get(ref.callerName) : undefined;
             if (fromId !== undefined) {
               this.store.insertEdge(fromId, ref.calleeName, ref.kind, ref.line);
             }
           }
+          endEdgeWrite();
           for (const mod of extraction.importedModules) {
             this.store.insertFileImport(fileId, mod);
           }
@@ -537,6 +557,7 @@ export class Indexer {
               });
             }
           }
+          endWrite();
 
           if (processed % BATCH_SIZE === 0) closeBatch();
           indexed++;
@@ -549,9 +570,13 @@ export class Indexer {
         });
         workerWasmResets = pool.wasmResetCount();
         closeBatch();
+        endDispatch();
       } catch (err) {
         rollbackBatch();
         await pool.terminate().catch(() => { /* */ });
+        // Restore the reverse index on a failed parse so reverse-traversal
+        // queries stay fast even though finishIndex never ran. Idempotent.
+        if (deferReverseIndex) { try { this.store.ensureReverseTraversalIndex(); } catch { /* */ } }
         throw err;
       }
       await pool.shutdown();
@@ -561,7 +586,7 @@ export class Indexer {
       return await this.finishIndex(
         absRoot, start, total, indexed, reusedFromCache, skipped,
         skippedTooLarge, parseErrors, touchedFileIds,
-        { verbose: options.verbose, quiet: !!quiet, workerWasmResets },
+        { verbose: options.verbose, quiet: !!quiet, workerWasmResets, deferReverseIndex },
       );
     }
 
@@ -652,6 +677,7 @@ export class Indexer {
 
     let processed = 0;
 
+    const endSerialDispatch = profileStart('parse+write (serial prefetch)');
     try {
       while (slots.length > 0) {
         const prefetched = await slots.shift()!;
@@ -743,18 +769,23 @@ export class Indexer {
             continue;
           }
 
+          const endWrite = profileStart('  db-write (symbols/edges/etc)');
+          const endSymWrite = profileStart('    db-write symbols (+fts)');
           const symbolIdMap = new Map<string, number>(); // qualifiedName → id
           for (const def of extraction.definitions) {
             const symId = this.store.insertSymbol(fileId, def);
             const qname = def.qualifiedName ?? def.name;
             if (!symbolIdMap.has(qname)) symbolIdMap.set(qname, symId);
           }
+          endSymWrite();
+          const endEdgeWrite = profileStart('    db-write edges');
           for (const ref of extraction.references) {
             const fromId = ref.callerName ? symbolIdMap.get(ref.callerName) : undefined;
             if (fromId !== undefined) {
               this.store.insertEdge(fromId, ref.calleeName, ref.kind, ref.line);
             }
           }
+          endEdgeWrite();
           for (const mod of extraction.importedModules) {
             this.store.insertFileImport(fileId, mod);
           }
@@ -811,6 +842,7 @@ export class Indexer {
               });
             }
           }
+          endWrite();
 
           if (processed % BATCH_SIZE === 0) closeBatch();
 
@@ -838,6 +870,7 @@ export class Indexer {
       // (resolveImports / resolveEdges / pruneFilesNotIn all start their own
       // transactions and would crash if one is already open).
       closeBatch();
+      endSerialDispatch();
     } catch (err) {
       // Don't leave a transaction dangling — post-processing's BEGIN would
       // throw and mask the original error.
@@ -850,6 +883,7 @@ export class Indexer {
           if (p.kind === 'ok') byteSem.release(Math.max(p.size, 1));
         } catch { /* swallow */ }
       }
+      if (deferReverseIndex) { try { this.store.ensureReverseTraversalIndex(); } catch { /* */ } }
       throw err;
     }
 
@@ -858,7 +892,7 @@ export class Indexer {
     return await this.finishIndex(
       absRoot, start, total, indexed, reusedFromCache, skipped,
       skippedTooLarge, parseErrors, touchedFileIds,
-      { verbose: options.verbose, quiet: !!quiet },
+      { verbose: options.verbose, quiet: !!quiet, deferReverseIndex },
     );
   }
 
@@ -878,42 +912,63 @@ export class Indexer {
     skippedTooLarge: number,
     parseErrors: number,
     touchedFileIds: Set<number>,
-    opts: { verbose?: boolean; quiet: boolean; workerWasmResets?: number },
+    opts: { verbose?: boolean; quiet: boolean; workerWasmResets?: number; deferReverseIndex?: boolean },
   ): Promise<IndexResult> {
     const { verbose, quiet } = opts;
+    try {
 
     // v9 Track-H: scan .proto files for gRPC service definitions BEFORE the
     // stale-file prune and service-link resolver run. .proto files are not
     // part of normal tree-sitter discovery, so they must be added to
     // touchedFileIds here; otherwise cached re-indexes would prune and
     // recreate proto rows every time.
+    const endProto = profileStart('scanProtoFiles');
     try {
       const protoScan = await scanProtoFiles(absRoot, this.store);
       for (const fileId of protoScan.fileIds) touchedFileIds.add(fileId);
     } catch (err) {
       if (verbose) process.stdout.write(`  ⚠  proto scanner failed: ${err}\n`);
     }
+    endProto();
 
     // Drop files that existed in a prior run but didn't show up this time
     // (e.g. user added a new ignore rule, or files were removed from disk).
     // FK cascades remove their symbols, edges, and file_imports too.
+    const endPrune = profileStart('pruneFilesNotIn');
     const prunedFiles = this.store.pruneFilesNotIn(touchedFileIds);
+    endPrune();
     if (prunedFiles > 0 && !quiet) {
       process.stdout.write(`  Pruned ${prunedFiles.toLocaleString()} stale file(s) from prior run\n`);
     }
 
     // Post-processing passes
     if (!quiet) process.stdout.write('  Resolving imports...\n');
+    const endResolveImports = profileStart('resolveImports');
     const resolvedImports = this.store.resolveImports();
+    endResolveImports();
 
     if (!quiet) process.stdout.write('  Resolving call edges...\n');
+    const endResolveEdges = profileStart('resolveEdges');
     const resolution = this.store.resolveEdges();
+    endResolveEdges();
+
+    // Reverse-traversal index was dropped for the bulk insert + resolve (see
+    // indexDirectoryImpl). Now that `to_id` is fully populated, rebuild it ONCE
+    // — far cheaper than 542k incremental b-tree updates — before any
+    // reader-facing reverse traversal (synthesizeTestEdges, callers/impact).
+    if (opts.deferReverseIndex) {
+      const endRev = profileStart('rebuild reverse edge index');
+      this.store.ensureReverseTraversalIndex();
+      endRev();
+    }
 
     // Track-C: link routes to handlers, config_keys to enclosing symbol,
     // synthesize tests edges from test-file → non-test-file calls.
+    const endTrackC = profileStart('resolveRoutes/config/testEdges');
     const routesResolved = this.store.resolveRouteHandlers();
     const configKeysResolved = this.store.resolveConfigKeySymbols();
     const testEdgesAdded = this.store.synthesizeTestEdges();
+    endTrackC();
 
     // ── Graph-changed predicate ─────────────────────────────────────────────
     // All the inputs it needs are now available. Hoisted here so the external-
@@ -929,11 +984,13 @@ export class Indexer {
     // Passed to the resolver as evidence — host_hint hits get a confidence
     // boost and may be classified as `service_host` link matches.
     let hostMap: import('./serviceHostScanner.js').ServiceHostMap | undefined;
+    const endHosts = profileStart('scanServiceHosts');
     try {
       hostMap = await scanServiceHosts(absRoot);
     } catch (err) {
       if (verbose) process.stdout.write(`  ⚠  service-host scanner failed: ${err}\n`);
     }
+    endHosts();
 
     // Track-G: deterministic service-link resolution. Runs every time, since
     // any change in service_calls OR routes can shift link membership. The
@@ -941,6 +998,7 @@ export class Indexer {
     // idempotent.
     let serviceLinks = 0;
     let serviceLinksByKind: Record<string, number> = {};
+    const endServiceLinks = profileStart('resolveServiceLinks');
     try {
       const sr = resolveServiceLinks(this.store, { hostMap });
       serviceLinks = sr.linksInserted;
@@ -949,12 +1007,14 @@ export class Indexer {
     } catch (err) {
       if (verbose) process.stdout.write(`  ⚠  service-link resolution failed: ${err}\n`);
     }
+    endServiceLinks();
 
     // Metadata-only edits (package.json/Cargo.toml/etc.) do not change the
     // source graph, but they do change dependency facts. Keep cached re-indexes
     // truthful by refreshing the manifest-derived table even when graphChanged
     // is false; the existing graphChanged branch below handles changed graphs.
     if (!graphChanged) {
+      const endExtDeps = profileStart('extractExternalDependencies');
       try {
         const { extractExternalDependencies } = await import('./externaldeps.js');
         await extractExternalDependencies(absRoot, this.store);
@@ -963,11 +1023,13 @@ export class Indexer {
           process.stdout.write(`  !  external dep extraction failed: ${err}\n`);
         }
       }
+      endExtDeps();
     }
 
     // Changed source graphs take this branch; cached source graphs refresh
     // dependency facts through the metadata-only branch above.
     if (graphChanged) {
+      const endExtDeps = profileStart('extractExternalDependencies');
       try {
         const { extractExternalDependencies } = await import('./externaldeps.js');
         await extractExternalDependencies(absRoot, this.store);
@@ -976,6 +1038,7 @@ export class Indexer {
           process.stdout.write(`  ⚠  external dep extraction failed: ${err}\n`);
         }
       }
+      endExtDeps();
     }
 
     // ── Lazy PageRank ───────────────────────────────────────────────────────────
@@ -988,10 +1051,16 @@ export class Indexer {
     let pagerankRecomputed = false;
     if (graphChanged) {
       if (!quiet) process.stdout.write('  Computing PageRank...\n');
+      const endPrLoad = profileStart('pagerank: load graph');
       const symbolIds = this.store.getAllSymbolIds();
       const edges = this.store.getAllEdges();
+      endPrLoad();
+      const endPrCompute = profileStart('pagerank: compute');
       const ranks = computePageRank(symbolIds, edges);
+      endPrCompute();
+      const endPrWrite = profileStart('pagerank: write');
       this.store.updatePageRanks(ranks);
+      endPrWrite();
       pagerankRecomputed = true;
     } else if (!quiet) {
       process.stdout.write('  Skipping PageRank (graph unchanged)\n');
@@ -1005,12 +1074,14 @@ export class Indexer {
     let modulesRecomputed = false;
     if (graphChanged || !this.store.hasModulesData()) {
       if (!quiet) process.stdout.write('  Clustering modules...\n');
+      const endModules = profileStart('buildModules');
       try {
         buildModules(this.store);
         modulesRecomputed = true;
       } catch (err) {
         if (verbose) process.stdout.write(`  ⚠  module clustering failed: ${err}\n`);
       }
+      endModules();
     } else if (!quiet) {
       process.stdout.write('  Skipping module clustering (graph unchanged)\n');
     }
@@ -1025,10 +1096,12 @@ export class Indexer {
       const previousBoundaryFingerprint = this.store.getIndexMeta('boundaries_input_fingerprint');
       if (graphChanged || previousBoundaryFingerprint !== boundaryFingerprint) {
         if (!quiet) process.stdout.write('  Detecting boundaries...\n');
+        const endBoundaries = profileStart('buildBoundaries');
         const r = buildBoundaries(absRoot, this.store);
         this.store.replaceBoundaries(r.boundaries, r.edges);
         this.store.setIndexMeta('boundaries_input_fingerprint', boundaryFingerprint);
         boundariesRecomputed = true;
+        endBoundaries();
       } else if (!quiet) {
         process.stdout.write('  Skipping boundary detection (graph and boundary inputs unchanged)\n');
       }
@@ -1053,12 +1126,14 @@ export class Indexer {
           ? '  Computing shape hashes...\n'
           : '  Backfilling shape hashes...\n');
       }
+      const endShape = profileStart('buildShapeHashes');
       try {
         const r = buildShapeHashes(this.store);
         shapeHashesAdded = r.symbolsHashed;
       } catch (err) {
         if (verbose) process.stdout.write(`  ⚠  shape-hash pass failed: ${err}\n`);
       }
+      endShape();
     } else if (!quiet) {
       process.stdout.write('  Skipping shape hashes (graph unchanged, no backfill needed)\n');
     }
@@ -1071,8 +1146,12 @@ export class Indexer {
     // Continuity now builds lazily on first `seer continuity` / preflight query,
     // alongside the other heavy derived passes (modules, shape hashes, history).
 
+    const endStats = profileStart('getStats');
     const stats = this.store.getStats();
+    endStats();
     const elapsedMs = Date.now() - start;
+
+    if (profileEnabled()) profileReport('index');
 
     return {
       filesDiscovered: total,
@@ -1107,6 +1186,16 @@ export class Indexer {
       serviceLinksByKind,
       elapsedMs,
     };
+    } finally {
+      // Safety net: ensure the reverse index exists on every exit path. If a
+      // pass between the drop and the explicit rebuild threw, this restores it;
+      // on the normal path the rebuild already ran so this is a cheap no-op
+      // (CREATE INDEX IF NOT EXISTS). The migration's matching create is the
+      // last-resort net for a hard process crash mid-index.
+      if (opts.deferReverseIndex) {
+        try { this.store.ensureReverseTraversalIndex(); } catch { /* */ }
+      }
+    }
   }
 }
 

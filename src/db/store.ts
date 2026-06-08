@@ -664,6 +664,33 @@ export class Store {
 
   // ── Edge resolution (scope-aware) ───────────────────────────────────────────
 
+  /** True iff the edges table currently holds at least one row. O(1) — used to
+   *  detect a fresh (post-reset) index where deferring the reverse-traversal
+   *  index until after the bulk insert + resolve pays off. */
+  hasAnyEdges(): boolean {
+    return toNum((this.db.prepare('SELECT EXISTS(SELECT 1 FROM edges) AS e').get() as Row).e) === 1;
+  }
+
+  /**
+   * Drop the reverse-traversal index `idx_edges_to_id_kind_from(to_id, kind,
+   * from_id)` so a bulk parse doesn't maintain it per insert (where `to_id` is
+   * always NULL) and `resolveEdges()` doesn't re-maintain it on every `to_id`
+   * UPDATE. Recreate it with `ensureReverseTraversalIndex()` once, in bulk,
+   * before any reader-facing reverse traversal (callers/impact) runs. Both are
+   * idempotent. Only `idx_edges_to_id_kind_from` is touched — `idx_edges_from_to_kind`
+   * stays (it is keyed primarily on the non-NULL `from_id`).
+   */
+  dropReverseTraversalIndex(): void {
+    this.assertWritable();
+    this.db.exec('DROP INDEX IF EXISTS idx_edges_to_id_kind_from');
+  }
+
+  /** Recreate the reverse-traversal index dropped by `dropReverseTraversalIndex()`. */
+  ensureReverseTraversalIndex(): void {
+    this.assertWritable();
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_edges_to_id_kind_from ON edges(to_id, kind, from_id)');
+  }
+
   resolveEdges(): EdgeResolutionStats {
     const countUnresolved = (): number =>
       toNum((this.db.prepare(
@@ -671,6 +698,13 @@ export class Store {
       ).get() as Row).c);
 
     const before0 = countUnresolved();
+
+    // NOTE: a `UPDATE … FROM (… GROUP BY edge …) MIN(t.id)` rewrite of these
+    // three passes was implemented and proven byte-identical to this form on a
+    // 543k-edge real repo (MIN(t.id) equals the old `LIMIT 1`, which the name /
+    // (file_id,name) indexes already return in ascending-rowid order). It was
+    // NOT kept because it gave no measurable speedup: the cost here is the b-tree
+    // maintenance of writing `to_id` on ~440k rows, not the subquery evaluation.
 
     this.db.prepare(`
       UPDATE edges
@@ -2846,15 +2880,19 @@ export class Store {
     lastHistoryHeadSha: string | null;
     lastHistoryAt: number | null;
     lastHistoryFollow: boolean | null;
+    lastHistorySince: number | null;
   } | null {
     if (!this.hasV4Tables) return null;
+    // last_history_since is an additive column; an older DB that hasn't run the
+    // migration yet won't have it, so select it defensively.
+    const hasSince = hasColumn(this.db, 'git_index_state', 'last_history_since');
     const row = this.db.prepare(
       `SELECT repo_root AS repoRoot, last_head_sha AS lastHeadSha,
               last_processed_at AS lastProcessedAt, remote_url AS remoteUrl,
               algorithm_version AS algorithmVersion,
               last_history_head_sha AS lastHistoryHeadSha,
               last_history_at AS lastHistoryAt,
-              last_history_follow AS lastHistoryFollow
+              last_history_follow AS lastHistoryFollow${hasSince ? ',\n              last_history_since AS lastHistorySince' : ''}
        FROM git_index_state WHERE id = 1`
     ).get() as Row | undefined;
     if (!row) return null;
@@ -2867,6 +2905,7 @@ export class Store {
       lastHistoryHeadSha: toNullStr(row.lastHistoryHeadSha),
       lastHistoryAt: row.lastHistoryAt == null ? null : toNum(row.lastHistoryAt),
       lastHistoryFollow: row.lastHistoryFollow == null ? null : (toNum(row.lastHistoryFollow) === 1),
+      lastHistorySince: row.lastHistorySince == null ? null : toNum(row.lastHistorySince),
     };
   }
 
@@ -2898,14 +2937,33 @@ export class Store {
    */
   setHistoryHeadSha(
     repoRoot: string, lastHistoryHeadSha: string | null, remoteUrl: string | null,
-    follow?: boolean,
+    follow?: boolean, since?: number | null,
   ): void {
     // Upsert: insert a fresh row if churn hasn't run yet; otherwise just
     // update the history columns. repo_root + remote_url are kept in sync
     // either way so the row stays self-describing.
     // last_history_follow persists the --follow choice so incremental refreshes
     // can replicate it without scanning per-file watermarks (which may be mixed
-    // if scoped builds ran after the full build).
+    // if scoped builds ran after the full build). last_history_since persists
+    // the resolved horizon for the same reason — replicating the stored value
+    // keeps the options fingerprint stable across refreshes.
+    const hasSince = hasColumn(this.db, 'git_index_state', 'last_history_since');
+    if (hasSince) {
+      this.db.prepare(`
+        INSERT INTO git_index_state
+          (id, repo_root, last_processed_at, remote_url, algorithm_version,
+           last_history_head_sha, last_history_at, last_history_follow, last_history_since)
+        VALUES (1, ?, ?, ?, 1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          repo_root = excluded.repo_root,
+          remote_url = COALESCE(excluded.remote_url, git_index_state.remote_url),
+          last_history_head_sha = excluded.last_history_head_sha,
+          last_history_at = excluded.last_history_at,
+          last_history_follow = excluded.last_history_follow,
+          last_history_since = excluded.last_history_since
+      `).run(repoRoot, Date.now(), remoteUrl, lastHistoryHeadSha, Date.now(), follow ? 1 : 0, since ?? null);
+      return;
+    }
     this.db.prepare(`
       INSERT INTO git_index_state
         (id, repo_root, last_processed_at, remote_url, algorithm_version,

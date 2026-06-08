@@ -110,6 +110,9 @@
 //     symbol-history build used `git log --follow`, so incremental refreshes
 //     replicate the same matching without re-deriving it. Added via ALTER TABLE
 //     ADD COLUMN; NULL on older DBs is treated as false (the default).
+//   - git_index_state.last_history_since: records the resolved --since horizon
+//     used by the last full symbol-history build, so incremental refreshes keep
+//     the same options fingerprint instead of drifting with relative durations.
 export const CURRENT_SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
@@ -230,9 +233,13 @@ CREATE TABLE IF NOT EXISTS edges (
   scip_import_id INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_edges_from    ON edges(from_id);
-CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
-CREATE INDEX IF NOT EXISTS idx_edges_to_id   ON edges(to_id);
+-- Edge indexes. The composite (..._kind) indexes below each subsume a
+-- single-column prefix index, so we deliberately do NOT create standalone
+-- idx_edges_from / idx_edges_to_name / idx_edges_to_id: a from_id, to_name,
+-- or to_id lookup uses the leftmost prefix of the matching composite at
+-- identical cost (verified via EXPLAIN QUERY PLAN). Dropping the three
+-- redundant indexes cuts edge-insert b-tree maintenance from 7 indexes to 4 --
+-- edge insertion is the single largest DB cost in a fresh index.
 CREATE INDEX IF NOT EXISTS idx_edges_kind    ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_from_to_kind ON edges(from_id, to_id, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_to_name_kind ON edges(to_name, kind);

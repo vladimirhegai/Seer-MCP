@@ -11,7 +11,7 @@ import { gitHeadSha } from '../indexer/git.js';
 import { buildArchitecture } from '../indexer/architecture.js';
 import { detectChanges } from '../indexer/detectchanges.js';
 import { collectChurn } from '../indexer/churn.js';
-import { buildSymbolHistory } from '../indexer/symbolhistory.js';
+import { buildSymbolHistory, parseHistorySince } from '../indexer/symbolhistory.js';
 import { buildModules } from '../indexer/modules.js';
 import { rankedBehavior } from '../indexer/behavior.js';
 import { computeRisk } from '../indexer/risk.js';
@@ -2088,10 +2088,12 @@ export class SeerMcpServer {
         maxCommitsPerFile: z.number().int().positive().max(2000).optional(),
         maxFiles: z.number().int().positive().max(100000).optional(),
         maxSeconds: z.number().int().positive().max(600).optional(),
+        since: z.union([z.number().int(), z.string()]).optional()
+          .describe('History horizon for a full build: a duration ("2y", "18mo", "90d"), an ISO date, or unix seconds. Bounds each file\'s git-log walk so rarely-changed files do not force a full-DAG scan (~3x faster on large repos). 0/"all" = unbounded (default).'),
         gitCommandTimeoutMs: z.number().int().positive().max(60000).optional(),
         force: z.boolean().optional(),
       },
-    }, async ({ symbols, file, paths, follow, maxCommitsPerFile, maxFiles, maxSeconds, gitCommandTimeoutMs, force }) => {
+    }, async ({ symbols, file, paths, follow, maxCommitsPerFile, maxFiles, maxSeconds, since: sinceRaw, gitCommandTimeoutMs, force }) => {
       // Resolve a scoped file set from `symbols` and/or `paths`. A scoped build
       // is fast (one git walk per file), bounded, and does not stamp the global
       // history HEAD — so it never masquerades as a full build.
@@ -2123,12 +2125,25 @@ export class SeerMcpServer {
           note: 'Scoped symbol-history build did not run because no requested symbols/paths resolved to indexed source files. Check the symbol name or pass file/path to disambiguate.',
         });
       }
+      // Resolve the optional history horizon (scoped builds ignore it — they are
+      // already cheap and bounded to the requested files). An unparseable value
+      // is reported rather than silently treated as unbounded.
+      let since: number | undefined;
+      const effectiveSinceRaw = sinceRaw ?? process.env.SEER_HISTORY_SINCE;
+      if (!scoped && effectiveSinceRaw != null) {
+        const parsed = parseHistorySince(typeof effectiveSinceRaw === 'number' ? String(effectiveSinceRaw) : effectiveSinceRaw);
+        if (parsed === null) {
+          return this.text({ error: `Invalid "since" value: ${effectiveSinceRaw}`, historyIndex: this.historyIndexStatus() });
+        }
+        since = parsed;
+      }
       const r = await buildSymbolHistory(this.workspace, this.store, {
         ...(scoped ? { onlyPaths: Array.from(onlyPaths) } : {}),
         follow,
         maxCommitsPerFile: maxCommitsPerFile ?? 200,
         maxFiles,
         deadlineMs: (maxSeconds ?? DEFAULT_HISTORY_BUILD_SECONDS) * 1000,
+        ...(since !== undefined ? { since } : {}),
         gitCommandTimeoutMs: gitCommandTimeoutMs ?? DEFAULT_HISTORY_GIT_TIMEOUT_MS,
         skipIfHeadUnchanged: !force,
       });

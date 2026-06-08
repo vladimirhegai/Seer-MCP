@@ -2,10 +2,12 @@ import os from 'os';
 import path from 'path';
 import { Store } from '../db/store.js';
 import {
-  commitsWithDiffsForFile, isGitRepo, isShallowRepo, gitHeadSha, gitRemoteUrl,
+  commitsWithDiffsForFile, commitsWithDiffsForFileNoWalk, nameOnlyHistory,
+  normalizeRepoRelPath, isGitRepo, isShallowRepo, gitHeadSha, gitRemoteUrl,
   extractPrNumber, githubPrUrl,
 } from './git.js';
 import { buildContinuity } from './continuity.js';
+import { profileStart, profileReport, profileEnabled } from './profile.js';
 import type { SymbolHistoryInsert } from '../types.js';
 
 /**
@@ -64,8 +66,25 @@ import type { SymbolHistoryInsert } from '../types.js';
  *   - v2: `--follow` is opt-out (default off) and per-file writes are
  *     DELETE-then-INSERT. The default no-follow output differs from v1 at file
  *     renames, so this is a real semantic change, not just a refactor.
+ *
+ * v2 is the PER-FILE path's version (scoped builds, follow:true, and the
+ * legacy fallback). It uses `git log -- <file>`, which applies git's per-path
+ * history simplification.
  */
 export const HISTORY_ALGORITHM_VERSION = 2;
+
+/**
+ * The two-phase path's version (full, unscoped, follow:false builds). It learns
+ * each file's commits from ONE whole-repo `git log --name-only` walk, which does
+ * NOT apply per-path history simplification — so it attributes a few extra,
+ * legitimate commits that `git log -- <file>` simplifies away (measured ~+0.8%
+ * rows on Godot; strictly a superset-leaning, more-complete view). Because the
+ * rows differ from the per-file path, the watermark version is path-aware: a
+ * two-phase build only resume-skips files a prior two-phase build wrote, and a
+ * per-file build only skips per-file watermarks, so the two never cross-claim
+ * each other's rows as current.
+ */
+export const HISTORY_ALGORITHM_VERSION_TWOPHASE = 3;
 
 export interface SymbolHistoryProgress {
   /** Coarse phase of the build. */
@@ -132,6 +151,53 @@ export interface SymbolHistoryOptions {
   log?: (msg: string) => void;
   /** Per-file progress callback. The module never writes to stdout itself. */
   onProgress?: (p: SymbolHistoryProgress) => void;
+}
+
+/**
+ * Parse a `--since` history horizon into a unix-seconds lower bound, or
+ * `undefined` for "unbounded" (the default). Accepts, case-insensitively:
+ *   - `''` / `0` / `all` / `none` / `unbounded`            → undefined
+ *   - a bare integer                                       → unix seconds (absolute)
+ *   - an ISO date (`2024-01-01`, `2024-01-01T00:00:00Z`)   → that instant
+ *   - a relative duration: `<n><unit>` where unit ∈
+ *     y/yr/yrs/year(s), mo/month(s), w/week(s), d/day(s)   → now − n·unit
+ *
+ * Relative durations resolve against `now` AT CALL TIME and are quantized to
+ * UTC-midnight so repeated explicit builds within the same day produce an
+ * identical bound (and therefore an identical options fingerprint). The
+ * resolved absolute value is what gets persisted + replicated, so the horizon
+ * does not silently drift on every incremental refresh.
+ *
+ * Returns `null` when the input can't be parsed, so callers can warn rather
+ * than silently treat a typo as unbounded.
+ */
+export function parseHistorySince(
+  raw: string | undefined | null, now: number = Date.now(),
+): number | undefined | null {
+  if (raw == null) return undefined;
+  const s = raw.trim().toLowerCase();
+  if (s === '' || s === '0' || s === 'all' || s === 'none' || s === 'unbounded') return undefined;
+  const nowSec = Math.floor(now / 1000);
+  const DAY = 86400;
+  // Number, then an optional whitespace/dot separator, then a unit word. The
+  // dot separator also accepts git's own `2.years` spelling so a copied git
+  // `--since` value parses the same way.
+  const dur = /^(\d+(?:\.\d+)?)[\s.]*(y|yr|yrs|year|years|mo|month|months|w|week|weeks|d|day|days)$/.exec(s);
+  if (dur) {
+    const n = parseFloat(dur[1]);
+    const unit = dur[2];
+    const days = unit.startsWith('y') ? n * 365.25
+      : unit.startsWith('mo') || unit === 'month' || unit === 'months' ? n * 30.4375
+      : unit.startsWith('w') ? n * 7
+      : n;
+    // Quantize to UTC midnight so same-day reruns share a bound.
+    const bound = nowSec - Math.round(days * DAY);
+    return bound - (bound % DAY);
+  }
+  if (/^\d+$/.test(s)) return parseInt(s, 10); // bare unix seconds
+  const ms = Date.parse(raw.trim());
+  if (Number.isFinite(ms)) return Math.floor(ms / 1000);
+  return null; // unparseable
 }
 
 /** Resolve the effective per-file walk concurrency (B1). */
@@ -261,6 +327,16 @@ export async function buildSymbolHistory(
       ]))
     : [];
 
+  // Two-phase eligibility is a pure function of the request (full + follow:false
+  // + not forced legacy); whether it actually ACTIVATES also depends on phase-1
+  // succeeding, decided below. The watermark version is path-aware: the no-op
+  // fast path checks against the version the eligible path WOULD write, so an
+  // eligible rerun whose files already carry two-phase (v3) watermarks can skip
+  // without even running phase-1.
+  const twoPhaseEligible = !scoped && !follow && process.env.SEER_HISTORY_LEGACY !== '1';
+  const eligibleAlgoVersion = twoPhaseEligible
+    ? HISTORY_ALGORITHM_VERSION_TWOPHASE : HISTORY_ALGORITHM_VERSION;
+
   // `--force` (skipIfHeadUnchanged===false) disables resume too unless a caller
   // overrides explicitly; a forced rebuild then wipes stale watermarks so the
   // next interrupted run resumes against the fresh set. A scoped build never
@@ -301,7 +377,7 @@ export async function buildSymbolHistory(
       const wm = watermarks.get(filePath);
       const entry = byFile.get(filePath)!;
       if (!wm || wm.fileHash !== entry.fileHash || wm.optionsFingerprint !== fingerprint
-          || wm.algorithmVersion !== HISTORY_ALGORITHM_VERSION) { allCurrent = false; break; }
+          || wm.algorithmVersion !== eligibleAlgoVersion) { allCurrent = false; break; }
     }
     if (allCurrent) {
       log(`HEAD ${head.slice(0, 8)} unchanged and all ${byFile.size} files current; skipping`);
@@ -315,6 +391,49 @@ export async function buildSymbolHistory(
   let processedFiles = 0;
   let skippedResume = 0;
   let commitsProcessed = 0;
+
+  // ── Two-phase walk (Part 2 #B) ─────────────────────────────────────────────
+  // For a full (unscoped), follow:false build we replace F independent per-file
+  // DAG walks with ONE shared `git log --name-only` walk that tells us exactly
+  // which commits touched each file, then diff only those commits per file with
+  // `--no-walk` (no DAG traversal). Scoped builds stay on the per-file path (a
+  // handful of files — the shared walk wouldn't pay for itself), and follow:true
+  // stays on the per-file path because a whole-repo name-only pass cannot
+  // reproduce per-file `--follow` rename threading. `SEER_HISTORY_LEGACY=1`
+  // forces the per-file path as an escape hatch. A phase-1 failure (timeout)
+  // returns null and we transparently fall back to the per-file path, so history
+  // is never silently dropped. (`twoPhaseEligible` / `eligibleAlgoVersion` were
+  // computed earlier so the no-op fast path could use the right version.)
+  //
+  // Key an absolute indexed path to the same normalized repo-relative form git's
+  // --name-only output uses. path.relative (not a naive prefix strip) so mixed
+  // separators / drive-letter case between repoRoot and the stored absolute path
+  // don't cause a miss — the exact bug that made an early build emit 0 rows.
+  const relKey = (abs: string): string => normalizeRepoRelPath(path.relative(repoRoot, abs));
+  let fileToShas: Map<string, string[]> | null = null;
+  if (twoPhaseEligible) {
+    const fileFilter = new Set<string>();
+    for (const abs of fileOrder) fileFilter.add(relKey(abs));
+    fileToShas = await nameOnlyHistory(repoRoot, {
+      fileFilter,
+      maxCommitsPerFile: maxCommits,
+      since: options.since,
+      // Phase-1 is ONE whole-repo walk; give it a generous floor (the per-file
+      // git timeout is sized for a single file's history, not the whole DAG).
+      timeoutMs: Math.max(options.gitCommandTimeoutMs ?? 0, 120_000),
+      onTimeout: (cmd) => noteTimeout(cmd),
+    });
+    if (fileToShas === null) {
+      log('two-phase name-only walk failed; falling back to per-file walks');
+      stopReason = null; // a phase-1 timeout must NOT abort the build
+    }
+  }
+  // The version THIS run will stamp: two-phase only when it actually activated
+  // (eligible AND phase-1 produced a map). A fallback writes the per-file version
+  // so its (simplified) rows are never mistaken for two-phase output next run.
+  const twoPhaseActive = twoPhaseEligible && fileToShas !== null;
+  const runAlgoVersion = twoPhaseActive
+    ? HISTORY_ALGORITHM_VERSION_TWOPHASE : HISTORY_ALGORITHM_VERSION;
 
   const emit = (phase: SymbolHistoryProgress['phase'], currentFile: string): void => {
     options.onProgress?.({
@@ -408,7 +527,7 @@ export async function buildSymbolHistory(
       // symbol_history_progress schema comment for why HEAD is not the key.)
       const wm = watermarks.get(filePath);
       if (wm && wm.fileHash === fileHash && wm.optionsFingerprint === fingerprint
-          && wm.algorithmVersion === HISTORY_ALGORITHM_VERSION) {
+          && wm.algorithmVersion === runAlgoVersion) {
         skippedResume++;
         emit('history', relOf(repoRoot, filePath));
         continue;
@@ -433,23 +552,44 @@ export async function buildSymbolHistory(
       // Detect THIS file's git timeout locally: a sibling lane's stop (maxFiles
       // or its own deadline) must not be mistaken for this file failing.
       let timedOut = false;
-      const commits = await commitsWithDiffsForFile(repoRoot, job.filePath, {
-        limit: maxCommits,
-        since: options.since,
-        timeoutMs: options.gitCommandTimeoutMs,
-        onTimeout: (cmd) => { noteTimeout(cmd); timedOut = true; },
-        assumeRepo: true,
-        follow,
-      });
+      let commits;
+      if (fileToShas !== null) {
+        // Two-phase: diff only the commits phase-1 said touched this file — no
+        // DAG walk. A file with zero in-window commits gets an empty list, which
+        // computeFileRows turns into 0 rows + a 0-row watermark (so it is never
+        // reconsidered until its content changes).
+        const shas = fileToShas.get(relKey(job.filePath)) ?? [];
+        const endGit = profileStart('git log --no-walk diff (two-phase)');
+        commits = shas.length === 0 ? [] : await commitsWithDiffsForFileNoWalk(repoRoot, job.filePath, shas, {
+          timeoutMs: options.gitCommandTimeoutMs,
+          onTimeout: (cmd) => { noteTimeout(cmd); timedOut = true; },
+        });
+        endGit();
+      } else {
+        const endGit = profileStart('git log -p walk (subprocess)');
+        commits = await commitsWithDiffsForFile(repoRoot, job.filePath, {
+          limit: maxCommits,
+          since: options.since,
+          timeoutMs: options.gitCommandTimeoutMs,
+          onTimeout: (cmd) => { noteTimeout(cmd); timedOut = true; },
+          assumeRepo: true,
+          follow,
+        });
+        endGit();
+      }
       // This file's own walk timed out — leave it unwatermarked so the next run
       // reprocesses it. noteTimeout already set the global stopReason.
       if (timedOut) return;
+      const endCompute = profileStart('computeFileRows (overlap match)');
       const { rows, commitsCounted, complete } = computeFileRows(job.fileSymbols, commits);
+      endCompute();
       commitsProcessed += commitsCounted;
       // DELETE-then-INSERT in one transaction so a reprocess (option change,
       // algo bump, force) yields exactly the current set. Synchronous, so
       // concurrent lanes' writes serialize naturally.
+      const endWrite = profileStart('replaceSymbolHistory (db write)');
       const inserted = store.replaceSymbolHistoryForSymbols(job.fileSymbols.map(s => s.id), rows);
+      endWrite();
       totalInserts += inserted;
       // Stamp on PER-FILE completion, independent of the global stopReason: a
       // file that fully walked its commits is done even if a sibling lane has
@@ -457,7 +597,7 @@ export async function buildSymbolHistory(
       // commit loop was cut mid-way by the deadline.
       if (complete) {
         store.upsertSymbolHistoryWatermark(
-          repoRoot, job.filePath, job.fileHash, fingerprint, HISTORY_ALGORITHM_VERSION, head, inserted,
+          repoRoot, job.filePath, job.fileHash, fingerprint, runAlgoVersion, head, inserted,
         );
       }
       emit('history', relOf(repoRoot, job.filePath));
@@ -466,6 +606,8 @@ export async function buildSymbolHistory(
   };
 
   await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, filesTotal)) }, () => lane()));
+
+  if (profileEnabled()) profileReport('symbol-history');
 
   if (stopReason) {
     log(`partial: ${processedFiles}/${filesTotal} files (${skippedResume} resume-skipped), ${totalInserts} history rows (${stopReason})`);
@@ -496,7 +638,9 @@ export async function buildSymbolHistory(
 
   // Stamp the history-specific HEAD marker (not the generic one) so a future
   // run can skip this work without colliding with file-level churn's stamp.
-  store.setHistoryHeadSha(repoRoot, head, remote, options.follow ?? false);
+  // Persist the resolved --since horizon too so the incremental post-index
+  // refresh replicates the SAME absolute bound (stable options fingerprint).
+  store.setHistoryHeadSha(repoRoot, head, remote, options.follow ?? false, options.since ?? null);
   log(`done: ${processedFiles} files processed, ${skippedResume} resume-skipped, ${totalInserts} history rows`);
   return done(true, processedFiles, filesTotal, skippedResume, symbols.length, totalInserts, false);
 }

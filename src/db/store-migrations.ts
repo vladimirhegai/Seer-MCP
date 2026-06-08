@@ -145,6 +145,12 @@ export function runMigrations(db: DatabaseSync): void {
   // incremental refreshes can replicate it without scanning watermarks.
   // NULL = unknown (old DB) → treated as false (the B2 default).
   addColumnIfMissing(db, 'git_index_state', 'last_history_follow',   'INTEGER');
+  // Persist the resolved --since horizon (unix-seconds lower bound) used by the
+  // last full build, so an incremental post-index refresh replicates the SAME
+  // absolute bound. Replicating the stored value (not recomputing now-2y each
+  // run) is what keeps the per-file options fingerprint — and therefore resume
+  // watermarks — stable across refreshes. NULL = unbounded (the default).
+  addColumnIfMissing(db, 'git_index_state', 'last_history_since',    'INTEGER');
 
   // v5: symbol_role on symbols. The NOT NULL DEFAULT 'definition' on the
   // ALTER means every pre-v5 row gets a sane default without an explicit
@@ -402,6 +408,17 @@ export function runMigrations(db: DatabaseSync): void {
   // case where a v4 DB lost its FTS rows (e.g. a manual schema patch). The
   // check is constant-time (COUNT on empty FTS is instant).
   rebuildFtsIfStale(db);
+
+  // Prune redundant single-column edge indexes. Each is a leftmost-prefix
+  // duplicate of a composite (…_kind) index, so a `from_id=?` / `to_name=?` /
+  // `to_id=?` lookup is served identically by the composite (verified via
+  // EXPLAIN QUERY PLAN). Existing DBs created by an older base schema still
+  // carry these three; dropping them removes three b-tree updates per edge
+  // insert/resolve with zero query-plan regression. DROP … IF EXISTS is a
+  // cheap metadata op and a no-op on already-pruned DBs.
+  db.exec('DROP INDEX IF EXISTS idx_edges_from');
+  db.exec('DROP INDEX IF EXISTS idx_edges_to_name');
+  db.exec('DROP INDEX IF EXISTS idx_edges_to_id');
 
   db.prepare(
     "INSERT INTO _schema_meta (key, value) VALUES ('schema_version', ?) " +

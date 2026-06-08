@@ -480,8 +480,14 @@ export async function commitsWithDiffsForFile(
       options.onTimeout?.(`git log -p${options.follow ? ' --follow' : ''} -- ${rel}`);
       killProcess(proc);
     }, gitTimeoutMs(options.timeoutMs));
-    let buf = '';
-    proc.stdout.on('data', (c: Buffer) => { buf += c.toString('utf8'); });
+    // Collect raw Buffer chunks and decode ONCE at close. Per-chunk
+    // `c.toString('utf8')` is both (a) O(n^2) as the running string is
+    // reallocated on every chunk — material on deep-history files whose patch
+    // stream is multi-MB — and (b) subtly wrong: a chunk boundary can fall in
+    // the middle of a multi-byte UTF-8 sequence, corrupting that character.
+    // Buffer.concat + a single decode fixes both.
+    const chunks: Buffer[] = [];
+    proc.stdout.on('data', (c: Buffer) => { chunks.push(c); });
     proc.stderr.on('data', () => { /* */ });
     proc.on('error', () => {
       clearTimeout(timer);
@@ -489,7 +495,7 @@ export async function commitsWithDiffsForFile(
     });
     proc.on('close', () => {
       clearTimeout(timer);
-      resolve(timedOut ? [] : parseFollowLogWithPatches(buf));
+      resolve(timedOut ? [] : parseFollowLogWithPatches(Buffer.concat(chunks).toString('utf8')));
     });
   });
 }
@@ -556,6 +562,132 @@ export function parseFollowLogWithPatches(buf: string): CommitWithDiff[] {
     });
   }
   return out;
+}
+
+// ── Two-phase history (Part 2 #B): one shared DAG walk + per-file no-walk diffs ──
+//
+// The per-file `git log -p -- <file>` walk in commitsWithDiffsForFile re-walks
+// the whole commit DAG once PER FILE — even a file with 5 commits forces git to
+// scan the entire history to confirm there are no more. On a big repo that F×
+// redundancy dominates symbol-history time.
+//
+// Instead we do ONE cheap `git log --name-only` walk (no diffs) to learn, for
+// every file, exactly which commits touched it; then for each file we diff only
+// those exact commits with `--no-walk` (no DAG walk at all). Same hunks, same
+// `parseFollowLogWithPatches`, so the produced rows are identical to the per-file
+// path for follow:false — just far fewer wasted DAG traversals.
+
+/** Normalize a repo-relative path for case/separator-insensitive matching
+ *  against the indexed symbol paths (Windows is case-insensitive). */
+export function normalizeRepoRelPath(rel: string): string {
+  const fwd = rel.replace(/\\/g, '/').replace(/^\.?\/+/, '');
+  return process.platform === 'win32' ? fwd.toLowerCase() : fwd;
+}
+
+/**
+ * Phase 1: one whole-repo `git log --name-only` walk → a map from (normalized)
+ * repo-relative path to the SHAs that touched it, most-recent-first, capped at
+ * `maxCommitsPerFile`. Only paths in `fileFilter` (also normalized) are kept, so
+ * memory stays bounded to the indexed file set. No diffs are generated here, so
+ * this is cheap even over full history.
+ */
+export async function nameOnlyHistory(
+  repoRoot: string,
+  options: {
+    fileFilter: Set<string>;          // normalized repo-relative paths to keep
+    maxCommitsPerFile?: number;
+    since?: number;
+    timeoutMs?: number;
+    onTimeout?: (command: string) => void;
+  },
+): Promise<Map<string, string[]> | null> {
+  const cap = options.maxCommitsPerFile ?? 200;
+  const args = ['-C', repoRoot, 'log',
+    '--pretty=format:__C__%H',
+    '--no-merges',
+    '--name-only',
+  ];
+  if (options.since) args.push(`--since=${new Date(options.since * 1000).toISOString()}`);
+
+  // null = the walk failed (timed out / spawn error); the caller must fall back
+  // to the per-file path rather than treat "no data" as "no history".
+  const buf: string | null = await new Promise((resolve) => {
+    let timedOut = false;
+    const proc = spawn('git', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.('git log --name-only');
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
+    const chunks: Buffer[] = [];
+    proc.stdout.on('data', (c: Buffer) => { chunks.push(c); });
+    proc.stderr.on('data', () => { /* */ });
+    proc.on('error', () => { clearTimeout(timer); resolve(null); });
+    proc.on('close', () => { clearTimeout(timer); resolve(timedOut ? null : Buffer.concat(chunks).toString('utf8')); });
+  });
+  if (buf === null) return null;
+
+  const fileToShas = new Map<string, string[]>();
+  const lines = buf.replace(/\r\n/g, '\n').split('\n');
+  let curSha = '';
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (ln.startsWith('__C__')) { curSha = ln.slice('__C__'.length); continue; }
+    if (ln === '' || !curSha) continue;
+    // A file path line. Keep it only if it's an indexed file we care about.
+    const key = normalizeRepoRelPath(ln);
+    if (!options.fileFilter.has(key)) continue;
+    let list = fileToShas.get(key);
+    if (!list) { list = []; fileToShas.set(key, list); }
+    if (list.length < cap) list.push(curSha);
+  }
+  return fileToShas;
+}
+
+/**
+ * Phase 2: diff a known set of commits for one file WITHOUT walking the DAG.
+ * `git log --no-walk` restricts output to exactly the revisions we feed it (via
+ * stdin, so a large SHA list never hits a command-line length limit), each
+ * diffed against its first parent and path-filtered to `filePath`. Output is the
+ * same `__C__` envelope as commitsWithDiffsForFile, so parseFollowLogWithPatches
+ * yields byte-identical CommitWithDiff rows — just without the per-file DAG walk.
+ */
+export async function commitsWithDiffsForFileNoWalk(
+  repoRoot: string,
+  filePath: string,
+  shas: string[],
+  options: { timeoutMs?: number; onTimeout?: (command: string) => void } = {},
+): Promise<CommitWithDiff[]> {
+  if (shas.length === 0) return [];
+  const rel = path.relative(repoRoot, filePath);
+  const args = ['-C', repoRoot, 'log',
+    '--no-walk=unsorted',
+    '--pretty=format:__C__%H%x09%an%x09%ae%x09%aI%n%B%n__BODY_END__',
+    '-U0',
+    '-p',
+    '--stdin',
+    '--', rel,
+  ];
+  return new Promise((resolve) => {
+    let timedOut = false;
+    const proc = spawn('git', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      options.onTimeout?.(`git log --no-walk -- ${rel}`);
+      killProcess(proc);
+    }, gitTimeoutMs(options.timeoutMs));
+    const chunks: Buffer[] = [];
+    proc.stdout.on('data', (c: Buffer) => { chunks.push(c); });
+    proc.stderr.on('data', () => { /* */ });
+    proc.on('error', () => { clearTimeout(timer); resolve([]); });
+    proc.on('close', () => {
+      clearTimeout(timer);
+      resolve(timedOut ? [] : parseFollowLogWithPatches(Buffer.concat(chunks).toString('utf8')));
+    });
+    // Feed the revisions on stdin (one per line) so the arg vector stays small.
+    try { proc.stdin.write(shas.join('\n') + '\n'); proc.stdin.end(); }
+    catch { /* the close/error handlers resolve */ }
+  });
 }
 
 /**

@@ -225,6 +225,66 @@ async function run(): Promise<void> {
     }
   }
 
+  // ── Deferred reverse-traversal index: lifecycle + failure restore ──────────
+  // A bulk fresh index drops idx_edges_to_id_kind_from for the insert+resolve,
+  // then rebuilds it. It must end up present on BOTH a successful index AND a
+  // failed one (the finally/catch safety net), so reverse-traversal queries are
+  // never left to fall back to a full scan.
+  console.log('\n── Deferred reverse index is restored on success AND on failure ──');
+  {
+    const hasRevIndex = (db: string): boolean => {
+      const s = new Store(db);
+      const row = s.rawDb().prepare(
+        "SELECT 1 AS x FROM sqlite_master WHERE type='index' AND name='idx_edges_to_id_kind_from'",
+      ).get() as { x: number } | undefined;
+      s.close();
+      return !!row;
+    };
+    // A bulk fixture (>= the parallel/defer threshold) of trivial files that
+    // each define + call a function, so edges actually exist.
+    const root = path.join(os.tmpdir(), `seer-defer-idx-${Date.now()}`);
+    fs.mkdirSync(root, { recursive: true });
+    for (let i = 0; i < 130; i++) {
+      fs.writeFileSync(
+        path.join(root, `f${i}.ts`),
+        `export function f${i}(): number { return helper${i}(); }\nfunction helper${i}(): number { return ${i}; }\n`,
+        'utf8',
+      );
+    }
+    try {
+      // 1. Successful fresh bulk index → index present.
+      const dbOk = tmpDb('defer-ok');
+      const okStore = new Store(dbOk);
+      const okRes = await new Indexer(okStore).indexDirectory(root, { quiet: true });
+      okStore.close();
+      assert(okRes.filesIndexed >= 130, `bulk fixture indexed (${okRes.filesIndexed} files)`);
+      assert(hasRevIndex(dbOk), 'reverse index present after a successful deferred bulk index');
+      try { fs.unlinkSync(dbOk); } catch { /* */ }
+
+      // 2. Failed index (resolveEdges throws mid-pass, after the drop) → the
+      //    safety net must still restore the index.
+      const dbFail = tmpDb('defer-fail');
+      const failStore = new Store(dbFail);
+      const realResolve = failStore.resolveEdges.bind(failStore);
+      void realResolve;
+      (failStore as unknown as { resolveEdges: () => never }).resolveEdges = () => {
+        throw new Error('injected resolveEdges failure');
+      };
+      let threw = false;
+      try {
+        await new Indexer(failStore).indexDirectory(root, { quiet: true });
+      } catch {
+        threw = true;
+      }
+      failStore.close();
+      assert(threw, 'index attempt with a thrown resolveEdges rejects (as expected)');
+      assert(hasRevIndex(dbFail), 'reverse index RESTORED after a failed deferred bulk index');
+      try { fs.unlinkSync(dbFail); } catch { /* */ }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+
   console.log('\n══════════════════════════════════════════════════════════════');
   console.log(`  Parallel-recovery results: ${passed} passed, ${failed} failed`);
   if (failed > 0) {

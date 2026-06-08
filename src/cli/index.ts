@@ -177,9 +177,14 @@ async function performIndex(absRepo: string, dbPath: string, opts: PerformIndexO
         // here because scoped/partial builds can leave mixed follow=0/1 rows that
         // make watermark-scanning non-deterministic.
         const followFromState = histState.lastHistoryFollow ?? false;
+        // Replicate the same horizon the last full build used (persisted in
+        // last_history_since), so the per-file options fingerprint matches and
+        // unchanged files stay resume-skipped instead of being reprocessed.
+        const sinceFromState = histState.lastHistorySince ?? undefined;
         process.stdout.write(`\n  Refreshing symbol history (incremental)...`);
         const hr = await buildSymbolHistory(absRepo, store, {
           follow: followFromState,
+          ...(sinceFromState !== undefined ? { since: sinceFromState } : {}),
           log: () => {},
         });
         if (hr.skipped) console.log(` up to date.`);
@@ -197,10 +202,14 @@ async function performIndex(absRepo: string, dbPath: string, opts: PerformIndexO
 async function performSymbolHistory(absRepo: string, dbPath: string): Promise<void> {
   const store = new Store(dbPath);
   try {
-    const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+    const { buildSymbolHistory, parseHistorySince } = await import('../indexer/symbolhistory.js');
     const { writeProgress, clearProgress } = await import('../indexer/progress.js');
+    const sinceRaw = process.env.SEER_HISTORY_SINCE;
+    const since = parseHistorySince(sinceRaw);
+    if (since === null) throw new Error(`Invalid SEER_HISTORY_SINCE value: ${sinceRaw}`);
     console.log(`\n  Building per-symbol git history (this can take a while on large repos)...`);
     const r = await buildSymbolHistory(absRepo, store, {
+      ...(since !== undefined ? { since } : {}),
       log: (m) => { clearProgress(); console.log(`  ${m}`); },
       onProgress: (p) => {
         if (process.stdout.isTTY) writeProgress(p.filesHandled, p.filesTotal, p.currentFile || p.phase);
@@ -865,6 +874,7 @@ program
   .option('--max-commits <n>', 'Max commits per file', '200')
   .option('--max-files <n>', 'Stop after this many files (partial build)')
   .option('--max-seconds <n>', 'Wall-clock budget; partial builds resume next run')
+  .option('--since <horizon>', 'History horizon: a duration (e.g. 2y, 18mo, 90d), an ISO date, or unix seconds. Bounds each file\'s git-log walk so rarely-changed files don\'t force a full-DAG scan (~3x faster on big repos). 0/all = unbounded (default). Falls back to $SEER_HISTORY_SINCE.')
   .option('--paths <list>', 'Comma-separated files to build (scoped build of just these)')
   .option('--follow', 'Thread git --follow through file renames (slower; default off)')
   .option('--concurrency <n>', 'Parallel per-file git walks (default ~CPU count)')
@@ -872,7 +882,7 @@ program
   .option('--no-resume', 'Ignore per-file resume watermarks (reprocess every file)')
   .action(async (opts: {
     db?: string; workspace?: string; maxCommits: string;
-    maxFiles?: string; maxSeconds?: string; paths?: string; follow?: boolean;
+    maxFiles?: string; maxSeconds?: string; since?: string; paths?: string; follow?: boolean;
     concurrency?: string; force?: boolean; resume?: boolean;
   }) => {
     const workspace = path.resolve(opts.workspace ?? process.cwd());
@@ -880,18 +890,25 @@ program
     if (!fs.existsSync(dbPath)) { console.error(`No index at ${dbPath}`); process.exit(1); }
     const store = new Store(dbPath);
     try {
-      const { buildSymbolHistory } = await import('../indexer/symbolhistory.js');
+      const { buildSymbolHistory, parseHistorySince } = await import('../indexer/symbolhistory.js');
       const { writeProgress, clearProgress } = await import('../indexer/progress.js');
       // commander sets `resume` to false only when --no-resume is passed.
       const useResume = opts.resume === false ? false : (opts.force ? false : undefined);
       const onlyPaths = opts.paths
         ? opts.paths.split(',').map(p => p.trim()).filter(Boolean)
         : undefined;
+      // --since wins over $SEER_HISTORY_SINCE; either resolves to a unix-seconds
+      // lower bound (or undefined = unbounded). A typo parses to null → hard error
+      // rather than silently scanning all history.
+      const sinceRaw = opts.since ?? process.env.SEER_HISTORY_SINCE;
+      const since = parseHistorySince(sinceRaw);
+      if (since === null) { console.error(`Invalid --since value: ${sinceRaw}`); process.exit(1); }
       let lastLog = 0;
       const r = await buildSymbolHistory(workspace, store, {
         maxCommitsPerFile: parseInt(opts.maxCommits, 10) || 200,
         maxFiles: opts.maxFiles ? parseInt(opts.maxFiles, 10) : undefined,
         deadlineMs: opts.maxSeconds ? (parseInt(opts.maxSeconds, 10) || 0) * 1000 : undefined,
+        ...(since !== undefined ? { since } : {}),
         follow: opts.follow === true,
         concurrency: opts.concurrency ? parseInt(opts.concurrency, 10) || undefined : undefined,
         ...(onlyPaths ? { onlyPaths } : {}),

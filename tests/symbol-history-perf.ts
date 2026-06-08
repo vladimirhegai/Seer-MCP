@@ -25,7 +25,8 @@ import {
   parseFollowLogWithPatches, commitsForFile, commitsWithDiffsForFile, fileDiffInfo,
 } from '../src/indexer/git';
 import {
-  buildSymbolHistory, HISTORY_ALGORITHM_VERSION, SymbolHistoryProgress,
+  buildSymbolHistory, HISTORY_ALGORITHM_VERSION, HISTORY_ALGORITHM_VERSION_TWOPHASE,
+  SymbolHistoryProgress, parseHistorySince,
 } from '../src/indexer/symbolhistory';
 
 const TMP = path.join(os.tmpdir(), `seer-symhist-${Date.now()}`);
@@ -550,15 +551,28 @@ async function run(): Promise<void> {
     assert(store.getGitIndexState()?.lastHistoryHeadSha == null,
       'scoped build does NOT stamp the global history HEAD (index not falsely marked fully built)');
     assert(store.getSymbolHistoryWatermarks(REPO).has(alphaAbs),
-      'scoped build still writes the per-file watermark (a later full build reuses it)');
+      'scoped build still writes the per-file watermark');
     assert(store.getSymbolHistory(store.getDefinition('alphaOne')[0].id).length > 0,
       'scoped build populated alphaOne history');
-    // A subsequent FULL build skips the scoped file and finishes the rest.
+    // A SECOND scoped build of the same file resume-skips it: scoped uses the
+    // per-file path (v2), so its own watermark is reused.
+    const scoped2 = await buildSymbolHistory(REPO, store, { onlyPaths: [alphaAbs], log: () => {} });
+    assert(scoped2.filesSkippedResume === 1,
+      `repeat scoped build reuses the scoped (v2) watermark (skipped=${scoped2.filesSkippedResume})`);
+    // A subsequent FULL build does NOT reuse the scoped file's watermark: a full
+    // build uses the two-phase path (algorithm v3, non-simplified attribution),
+    // whose rows differ from the scoped per-file path (v2). The version-aware
+    // watermark deliberately forces the scoped file to be reprocessed rather
+    // than presenting v2 rows as if a full v3 build produced them.
     const full = await buildSymbolHistory(REPO, store, { log: () => {} });
-    assert(full.completed && full.filesSkippedResume === 1,
-      `full build after scoped reuses the scoped file's watermark (skipped=${full.filesSkippedResume})`);
+    assert(full.completed && full.filesSkippedResume === 0,
+      `full (two-phase v3) build reprocesses the scoped (v2) file rather than cross-claiming it (skipped=${full.filesSkippedResume})`);
     assert(store.getGitIndexState()?.lastHistoryHeadSha != null,
       'full build DOES stamp the global history HEAD');
+    // And the full build is now internally consistent at v3 for that file.
+    const wmAfterFull = store.getSymbolHistoryWatermarks(REPO).get(alphaAbs);
+    assert(wmAfterFull?.algorithmVersion === HISTORY_ALGORITHM_VERSION_TWOPHASE,
+      `after the full build the scoped file carries the two-phase version (got ${wmAfterFull?.algorithmVersion})`);
     store.close();
   }
 
@@ -633,6 +647,102 @@ async function run(): Promise<void> {
     assert(betaHist.some(h => h.commitSha === shaEdit4),
       'CLI auto-refresh also captured the new gamma.ts commit');
     verify.close();
+  }
+
+  // ── --since history horizon (Part 2 #A) ────────────────────────────────────
+  // parseHistorySince contract + the persist/replicate property that keeps the
+  // incremental post-index refresh from reprocessing every file when a horizon
+  // is in effect.
+  {
+    const NOW = Date.UTC(2026, 5, 7, 12, 0, 0);
+    assert(parseHistorySince(undefined, NOW) === undefined, 'parseHistorySince(undefined) = unbounded');
+    assert(parseHistorySince('0', NOW) === undefined, "parseHistorySince('0') = unbounded");
+    assert(parseHistorySince('all', NOW) === undefined, "parseHistorySince('all') = unbounded");
+    assert(parseHistorySince('garbage', NOW) === null, 'parseHistorySince(typo) = null (caller errors)');
+    const y2 = parseHistorySince('2y', NOW);
+    assert(y2 === parseHistorySince('2.years', NOW), '2y and git-style 2.years resolve identically');
+    assert(typeof y2 === 'number' && y2 % 86400 === 0, '2y is quantized to UTC midnight');
+    assert(parseHistorySince('2y', NOW) === parseHistorySince('2y', NOW + 5 * 3600_000),
+      'same-day relative horizon is stable (fingerprint does not drift intra-day)');
+    assert(parseHistorySince('2024-01-01', NOW) === Math.floor(Date.UTC(2024, 0, 1) / 1000),
+      'ISO date resolves to that instant');
+    assert(parseHistorySince('1700000000', NOW) === 1700000000, 'bare integer = unix seconds');
+
+    // Persist + replicate: a completed full build with a horizon stamps
+    // last_history_since; replicating it resume-skips everything, while NOT
+    // replicating it (old behavior) reprocesses — proving the replication
+    // is load-bearing for incremental refreshes.
+    const dbPath = path.join(TMP, `since-${Date.now()}.db`);
+    const seed = new Store(dbPath);
+    await indexInto(seed);
+    const since = parseHistorySince('2y') as number;
+    const b1 = await buildSymbolHistory(REPO, seed, { since, follow: false, log: () => {} });
+    assert(b1.completed && !b1.skipped, 'full build with --since completes');
+    const st = seed.getGitIndexState();
+    assert(st?.lastHistorySince === since,
+      `full build persists lastHistorySince (got ${String(st?.lastHistorySince)}, want ${since})`);
+    const b2 = await buildSymbolHistory(REPO, seed,
+      { since: st!.lastHistorySince ?? undefined, follow: st!.lastHistoryFollow ?? false, log: () => {} });
+    assert(b2.skipped && b2.filesProcessed === 0,
+      `replicating persisted since resume-skips all (skipped=${b2.skipped}, processed=${b2.filesProcessed})`);
+    const b3 = await buildSymbolHistory(REPO, seed,
+      { /* no since — mismatched fingerprint */ follow: false, skipIfHeadUnchanged: true, log: () => {} });
+    assert(b3.filesProcessed > 0,
+      'dropping the horizon reprocesses (confirms the fingerprint includes since)');
+    seed.close();
+  }
+
+  // ── Two-phase walk (Part 2 #B) ─────────────────────────────────────────────
+  // On a linear/shallow fixture history git's per-path simplification does not
+  // diverge from the whole-repo name-only attribution, so the two-phase path
+  // (default) and the legacy per-file path (SEER_HISTORY_LEGACY=1) must produce
+  // byte-identical rows. This is the gross-correctness guard for the new path;
+  // the measured ~0.8% divergence on Godot is real history-simplification, not
+  // a bug, and is why the watermark version is path-aware (v3 vs v2).
+  console.log('\n── two-phase vs legacy parity (linear history) ──');
+  {
+    const dump = (store: Store): string[] =>
+      (store.rawDb().prepare(
+        `SELECT s.symbol_key k, f.rel_path file, h.commit_sha sha, h.lines_added la,
+                h.lines_removed lr, h.match_strategy ms
+         FROM symbol_history h JOIN symbols s ON s.id = h.symbol_id JOIN files f ON f.id = s.file_id`,
+      ).all() as Array<Record<string, unknown>>)
+        .map(r => `${r.k}|${r.file}|${r.sha}|${r.la}|${r.lr}|${r.ms}`).sort();
+
+    const legacyStore = freshIndexedStore();
+    await indexInto(legacyStore);
+    process.env.SEER_HISTORY_LEGACY = '1';
+    const legacy = await buildSymbolHistory(REPO, legacyStore, { follow: false, log: () => {} });
+    const legacyRows = dump(legacyStore);
+    const legacyWmV = (legacyStore.rawDb().prepare(
+      'SELECT DISTINCT algorithm_version v FROM symbol_history_progress').all() as Array<{ v: number }>).map(x => x.v);
+    legacyStore.close();
+    delete process.env.SEER_HISTORY_LEGACY;
+
+    const twoStore = freshIndexedStore();
+    await indexInto(twoStore);
+    const two = await buildSymbolHistory(REPO, twoStore, { follow: false, log: () => {} });
+    const twoRows = dump(twoStore);
+    const twoWmV = (twoStore.rawDb().prepare(
+      'SELECT DISTINCT algorithm_version v FROM symbol_history_progress').all() as Array<{ v: number }>).map(x => x.v);
+    // Determinism: a second two-phase pass on a fresh store is identical.
+    const twoStore2 = freshIndexedStore();
+    await indexInto(twoStore2);
+    await buildSymbolHistory(REPO, twoStore2, { follow: false, log: () => {} });
+    const twoRows2 = dump(twoStore2);
+    twoStore2.close();
+    twoStore.close();
+
+    assert(legacyWmV.length === 1 && legacyWmV[0] === HISTORY_ALGORITHM_VERSION,
+      `SEER_HISTORY_LEGACY=1 forces the per-file path (watermark v${HISTORY_ALGORITHM_VERSION}, got ${legacyWmV})`);
+    assert(twoWmV.length === 1 && twoWmV[0] === HISTORY_ALGORITHM_VERSION_TWOPHASE,
+      `default full build uses two-phase (watermark v${HISTORY_ALGORITHM_VERSION_TWOPHASE}, got ${twoWmV})`);
+    assert(legacy.historyRowsInserted === two.historyRowsInserted,
+      `row counts match on linear history (legacy=${legacy.historyRowsInserted} two-phase=${two.historyRowsInserted})`);
+    assert(JSON.stringify(legacyRows) === JSON.stringify(twoRows),
+      'two-phase rows are byte-identical to legacy on linear-history fixture');
+    assert(JSON.stringify(twoRows) === JSON.stringify(twoRows2),
+      'two-phase is deterministic across runs');
   }
 
   console.log(`\n══════════════════════════════════════════════════════════════`);
