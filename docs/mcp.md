@@ -82,6 +82,19 @@ Instruction files:
 | `CLAUDE.md` | Small Claude import shim for `AGENTS.md`. |
 | `GEMINI.md` | Small Gemini/Antigravity import shim for `AGENTS.md`. |
 
+Seer treats these as shared user files, not owned files. On install it appends
+or refreshes only the managed region fenced by `<!-- seer:begin -->` and
+`<!-- seer:end -->`; any existing project instructions before or after that
+region are preserved. On uninstall it strips only complete Seer-managed regions.
+If a file has unmatched, nested, or out-of-order Seer markers, Seer reports the
+file as manual and leaves it unchanged so it cannot accidentally remove user
+workflow instructions.
+
+The same merge rule applies to MCP config files: existing servers are
+preserved, only the Seer server entry is added, refreshed, or removed. If a
+config file cannot be parsed safely, Seer prints a manual snippet rather than
+rewriting the file.
+
 ## Build The Index
 
 ```bash

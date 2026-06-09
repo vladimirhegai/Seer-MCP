@@ -272,9 +272,11 @@ program
     }
     if (result.agents) {
       console.log(`  ${mark[result.agents.action] ?? result.agents.action}  ${result.agents.label.padEnd(28)} ${result.agents.file}`);
+      if (result.agents.note) console.log(`             ${result.agents.note}`);
     }
     for (const cf of result.contextFiles ?? []) {
       console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(28)} ${cf.file}`);
+      if (cf.note) console.log(`             ${cf.note}`);
     }
 
     // Run the wizard's opt-in index/history now, after config is written.
@@ -336,8 +338,9 @@ program
       console.log(`  ${mark[e.action] ?? e.action}  ${e.label.padEnd(30)} ${e.file}`);
       if (e.note) console.log(`               ${e.note}`);
     }
-    for (const cf of [result.agents, ...(result.contextFiles ?? [])].filter(Boolean) as Array<{ label: string; file: string; action: string }>) {
+    for (const cf of [result.agents, ...(result.contextFiles ?? [])].filter(Boolean) as Array<{ label: string; file: string; action: string; note?: string }>) {
       console.log(`  ${mark[cf.action] ?? cf.action}  ${cf.label.padEnd(30)} ${cf.file}`);
+      if (cf.note) console.log(`               ${cf.note}`);
     }
 
     if (inferred.length === 0 && !result.agents && !(result.contextFiles ?? []).length) {

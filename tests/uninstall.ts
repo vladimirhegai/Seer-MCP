@@ -133,6 +133,67 @@ function main(): void {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
+  {
+    const ws = freshWs('ctx-native-preserve');
+    const userClaude = '# Claude rules\n\nNever rewrite the deploy notes.\n';
+    const userGemini = '# Gemini rules\n\nKeep local test commands as written.\n';
+    fs.writeFileSync(path.join(ws, 'CLAUDE.md'), userClaude);
+    fs.writeFileSync(path.join(ws, 'GEMINI.md'), userGemini);
+    runInit({ workspace: ws, clients: ['claude', 'gemini'] });
+
+    runUninstall({ workspace: ws, clients: [], agents: true });
+
+    const claudeAfter = fs.readFileSync(path.join(ws, 'CLAUDE.md'), 'utf8');
+    const geminiAfter = fs.readFileSync(path.join(ws, 'GEMINI.md'), 'utf8');
+    check(claudeAfter === userClaude.trimEnd() + '\n', '3b.CLAUDE.md user content survives Seer uninstall exactly');
+    check(geminiAfter === userGemini.trimEnd() + '\n', '3b.GEMINI.md user content survives Seer uninstall exactly');
+    check(!claudeAfter.includes('<!-- seer:begin -->') && !geminiAfter.includes('<!-- seer:begin -->'),
+      '3b.native guide Seer shims stripped only inside managed blocks');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('ctx-broken-marker');
+    const broken = '# My Project\n\n<!-- seer:begin -->\nUser content that must not be clipped.\n';
+    fs.writeFileSync(path.join(ws, 'AGENTS.md'), broken);
+
+    const r = runUninstall({ workspace: ws, clients: [], agents: true });
+    const agentsEntry = r.contextFiles.find((e) => e.file.endsWith('AGENTS.md'));
+    const after = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
+    check(agentsEntry?.action === 'manual', '3c.broken AGENTS.md markers are reported as manual', agentsEntry);
+    check(after === broken, '3c.broken AGENTS.md is left byte-for-byte unchanged');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('ctx-duplicate-blocks');
+    const file = path.join(ws, 'AGENTS.md');
+    fs.writeFileSync(file, [
+      '# My Project',
+      '',
+      '<!-- seer:begin -->',
+      'old Seer guidance',
+      '<!-- seer:end -->',
+      '',
+      'User instruction between blocks.',
+      '',
+      '<!-- seer:begin -->',
+      'duplicate Seer guidance',
+      '<!-- seer:end -->',
+      '',
+    ].join('\n'));
+
+    runUninstall({ workspace: ws, clients: [], agents: true });
+    const after = fs.readFileSync(file, 'utf8');
+    check(after.includes('User instruction between blocks.'), '3d.user content between duplicate blocks survives');
+    check(!after.includes('old Seer guidance') && !after.includes('duplicate Seer guidance'),
+      '3d.all complete Seer-managed blocks are removed');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
   // ── 4. Dry run: --print reports actions but writes nothing ────────────────
   {
     const ws = freshWs('dryrun');

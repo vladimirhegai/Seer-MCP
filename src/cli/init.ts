@@ -75,8 +75,9 @@ interface PlanEntry {
 
 interface ContextFileResult {
   file: string;
-  action: 'wrote' | 'updated' | 'skipped';
+  action: 'wrote' | 'updated' | 'skipped' | 'manual';
   label: string;
+  note?: string;
 }
 
 export interface InitResult {
@@ -777,6 +778,67 @@ function geminiImportBlock(): string {
   ].join('\n');
 }
 
+interface ManagedBlockRange {
+  start: number;
+  end: number;
+}
+
+function findAllIndexes(raw: string, needle: string): number[] {
+  const indexes: number[] = [];
+  let from = 0;
+  while (from <= raw.length) {
+    const idx = raw.indexOf(needle, from);
+    if (idx === -1) break;
+    indexes.push(idx);
+    from = idx + needle.length;
+  }
+  return indexes;
+}
+
+function findManagedBlocks(raw: string): { ok: true; ranges: ManagedBlockRange[] } | { ok: false; note: string } {
+  const begins = findAllIndexes(raw, AGENTS_BEGIN);
+  const ends = findAllIndexes(raw, AGENTS_END);
+  if (begins.length === 0 && ends.length === 0) return { ok: true, ranges: [] };
+  if (begins.length !== ends.length) {
+    return { ok: false, note: 'found unmatched Seer guidance markers; leaving file unchanged' };
+  }
+
+  const tokens = [
+    ...begins.map((idx) => ({ idx, kind: 'begin' as const })),
+    ...ends.map((idx) => ({ idx, kind: 'end' as const })),
+  ].sort((a, b) => a.idx - b.idx);
+
+  const ranges: ManagedBlockRange[] = [];
+  let open: number | null = null;
+  for (const token of tokens) {
+    if (token.kind === 'begin') {
+      if (open !== null) {
+        return { ok: false, note: 'found nested Seer guidance markers; leaving file unchanged' };
+      }
+      open = token.idx;
+      continue;
+    }
+    if (open === null) {
+      return { ok: false, note: 'found Seer guidance end marker before begin marker; leaving file unchanged' };
+    }
+    ranges.push({ start: open, end: token.idx + AGENTS_END.length });
+    open = null;
+  }
+  if (open !== null) {
+    return { ok: false, note: 'found unmatched Seer guidance markers; leaving file unchanged' };
+  }
+  return { ok: true, ranges };
+}
+
+function replaceManagedBlocks(raw: string, ranges: ManagedBlockRange[], block: string): string {
+  let next = raw;
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    const replacement = i === 0 ? block : '';
+    next = next.slice(0, ranges[i].start) + replacement + next.slice(ranges[i].end);
+  }
+  return next;
+}
+
 /**
  * Write (or idempotently update) the managed Seer guidance block into an
  * agent-instruction file. Used for AGENTS.md and client-native mirrors/imports
@@ -797,12 +859,11 @@ function writeContextFile(
 
   if (fs.existsSync(file)) {
     const raw = fs.readFileSync(file, 'utf8');
-    if (raw.includes(AGENTS_BEGIN) && raw.includes(AGENTS_END)) {
+    const managed = findManagedBlocks(raw);
+    if (!managed.ok) return { file, label, action: 'manual', note: managed.note };
+    if (managed.ranges.length > 0) {
       if (!opts.force) return { file, label, action: 'skipped' };
-      const replaced = raw.replace(
-        new RegExp(`${AGENTS_BEGIN}[\\s\\S]*?${AGENTS_END}`),
-        block,
-      );
+      const replaced = replaceManagedBlocks(raw, managed.ranges, block);
       fs.writeFileSync(file, replaced, 'utf8');
       return { file, label, action: 'updated' };
     }
@@ -1016,18 +1077,20 @@ function removeContextFile(
   if (!fs.existsSync(file)) return base;
 
   const raw = fs.readFileSync(file, 'utf8');
-  const beginIdx = raw.indexOf(AGENTS_BEGIN);
-  const endIdx = raw.indexOf(AGENTS_END);
-  if (beginIdx === -1 || endIdx === -1) return base;
+  const managed = findManagedBlocks(raw);
+  if (!managed.ok) return { ...base, action: 'manual', note: managed.note };
+  if (managed.ranges.length === 0) return base;
 
   if (opts.print) return { ...base, action: 'removed' };
 
-  // Splice out the block including both markers and any surrounding blank lines
-  // we added as separators. We want to leave the file clean, not with orphan
-  // blank lines where the block used to be.
-  const before = raw.slice(0, beginIdx).replace(/\n{2,}$/, '\n').trimEnd();
-  const after  = raw.slice(endIdx + AGENTS_END.length).replace(/^\n{1,2}/, '');
-  const result = (before + (before && after ? '\n' : '') + after).trimEnd();
+  let result = raw;
+  for (let i = managed.ranges.length - 1; i >= 0; i--) {
+    const range = managed.ranges[i];
+    const before = result.slice(0, range.start).replace(/\n{2,}$/, '\n').trimEnd();
+    const after = result.slice(range.end).replace(/^\n{1,2}/, '');
+    result = before + (before && after ? '\n' : '') + after;
+  }
+  result = result.trimEnd();
 
   if (!result.trim()) {
     fs.unlinkSync(file);

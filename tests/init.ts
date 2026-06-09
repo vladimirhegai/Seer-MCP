@@ -302,6 +302,37 @@ async function main(): Promise<void> {
     fs.rmSync(ws, { recursive: true, force: true });
   }
 
+  {
+    const ws = freshWs('native-guides-preserve');
+    const claudeContent = '# Claude rules\n\nKeep the release checklist intact.\n';
+    const geminiContent = '# Gemini rules\n\nUse the repo formatter before tests.\n';
+    fs.writeFileSync(path.join(ws, 'CLAUDE.md'), claudeContent);
+    fs.writeFileSync(path.join(ws, 'GEMINI.md'), geminiContent);
+
+    runInit({ workspace: ws, clients: ['claude', 'gemini'] });
+    const claudeAfter = fs.readFileSync(path.join(ws, 'CLAUDE.md'), 'utf8');
+    const geminiAfter = fs.readFileSync(path.join(ws, 'GEMINI.md'), 'utf8');
+    check(claudeAfter.startsWith(claudeContent), '8b.existing CLAUDE.md content preserved verbatim at the top');
+    check(geminiAfter.startsWith(geminiContent), '8b.existing GEMINI.md content preserved verbatim at the top');
+    check(claudeAfter.includes('@AGENTS.md') && geminiAfter.includes('@AGENTS.md'),
+      '8b.native guides get Seer import shims appended below user content');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
+  {
+    const ws = freshWs('broken-markers');
+    const broken = '# My Project Agents\n\n<!-- seer:begin -->\nUser text after a broken marker.\n';
+    fs.writeFileSync(path.join(ws, 'AGENTS.md'), broken);
+
+    const r = runInit({ workspace: ws, clients: ['claude'] });
+    const after = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
+    check(r.agents?.action === 'manual', '8c.broken AGENTS.md markers are reported as manual', r.agents);
+    check(after === broken, '8c.broken AGENTS.md is left byte-for-byte unchanged');
+
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+
   // 9. update refreshes existing MCP entries and converts GEMINI.md to a shim.
   {
     const ws = freshWs('update');

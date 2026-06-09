@@ -130,6 +130,13 @@ Some clients use user-level files:
 User-level entries include `--workspace <repo>` so Seer knows which repo to
 index.
 
+Seer merges these files instead of replacing them. Existing MCP servers stay in
+place, and existing `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md` content is
+preserved. Seer adds only a fenced block between `<!-- seer:begin -->` and
+`<!-- seer:end -->`; uninstall removes only that fenced block. If those markers
+are malformed, Seer leaves the instruction file untouched and reports a manual
+cleanup note instead of guessing.
+
 ## Common Fixes
 
 | Problem | Command |
