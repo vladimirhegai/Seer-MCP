@@ -15,9 +15,9 @@
 [Benchmarks](docs/benchmarks.md) |
 [Testing](docs/testing.md)
 
-<video src="Resources/claude-demo.mp4" width="800" autoplay loop muted playsinline></video>
-
 </div>
+
+https://github.com/vladimirhegai/Seer-MCP/blob/main/Resources/claude-demo.mp4
 
 > [!IMPORTANT]
 > Seer is for the moment **before** an agent edits. It gives the agent local,
