@@ -15,9 +15,9 @@
 [Benchmarks](docs/benchmarks.md) |
 [Testing](docs/testing.md)
 
-</div>
+<img src="Resources/claude-demo.gif" alt="Seer Demo" width="800" />
 
-https://github.com/vladimirhegai/Seer-MCP/blob/main/Resources/claude-demo.mp4
+</div>
 
 > [!IMPORTANT]
 > Seer is for the moment **before** an agent edits. It gives the agent local,
