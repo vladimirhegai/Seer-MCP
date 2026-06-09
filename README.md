@@ -15,7 +15,7 @@
 [Benchmarks](docs/benchmarks.md) |
 [Testing](docs/testing.md)
 
-[Insert hero GIF: Codex or Claude asks Seer for pre-edit context on a real function, receives callers, tests, route exposure, history, and risk, then edits with that context visible.]
+<video src="Resources/claude-demo.mp4" width="800" autoplay loop muted playsinline></video>
 
 </div>
 
